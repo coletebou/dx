@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# tmux-resurrect-claude-restore — runs on @resurrect-hook-post-restore-all
+#
+# Reads the Claude and Codex TSVs produced by tmux-resurrect-claude-save and
+# resumes each recorded conversation in its restored pane.
+#
+#   1. If an agent with that sessionId is ALREADY running (e.g. you
+#      restored over a live tmux server, or another window is still
+#      attached), do NOT try to --resume — it would either fail or steal
+#      the conversation. Spawn a fresh `claude` and prepend a comment with
+#      the orphan UUID so the user can manually pick it up.
+#   2. If the pane already shows its agent as the current command, skip —
+#      something else (the user, parallel-worktrees, etc.) already
+#      launched a session there.
+#   3. Otherwise launch the matching Claude or Codex resume command.
+#
+# TSV columns: session \t window_index \t pane_index \t cwd \t uuid \t source \t launcher \t bypass
+# Claude launcher is `claude` or `yuma`; bypass is 1 when the session ran with
+# permission checks off. Older rows omit them and resume with plain `claude`.
+# Codex rows carry two extra columns:              \t provider \t profile
+#
+# A Codex session started under a non-default provider is resumed with
+# `codex -p <profile> resume <uuid>`. Without the flag Codex would reload the
+# rollout against the base config's OpenAI endpoint — the session opens but
+# every subsequent turn goes to the wrong provider. Older TSVs lack both
+# columns; those rows resume with no -p, matching previous behavior.
+
+set -euo pipefail
+
+CLAUDE_IN="$HOME/.tmux/resurrect/claude-sessions.tsv"
+CODEX_IN="$HOME/.tmux/resurrect/codex-sessions.tsv"
+CODEX_STATE_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_SESSIONS_ROOT="$CODEX_STATE_HOME/sessions"
+if [[ ! -r "$CLAUDE_IN" && ! -r "$CODEX_IN" ]]; then
+    tmux display-message "resurrect: no agent TSVs"
+    exit 0
+fi
+
+# Snapshot live agents so we can tell which sessionIds are already running.
+AGENTS_JSON="$(mktemp)"
+CLAIMED_PANES="$(mktemp)"
+trap 'rm -f "$AGENTS_JSON" "$CLAIMED_PANES"' EXIT
+if command -v claude >/dev/null 2>&1; then
+    claude agents --json >"$AGENTS_JSON" 2>/dev/null || echo '[]' >"$AGENTS_JSON"
+else
+    echo '[]' >"$AGENTS_JSON"
+fi
+
+# Returns 0 if the given sessionId is currently in `claude agents --json`.
+session_is_live() {
+    local uuid="$1"
+    [[ -z "$uuid" ]] && return 1
+    jq -e --arg u "$uuid" '.[] | select(.sessionId == $u)' "$AGENTS_JSON" >/dev/null 2>&1
+}
+
+pane_command_is_agent() {
+    local command="$1"
+    [[ "$command" == "claude" || "$command" == "claude.exe" || "$command" == "codex" ||
+        "$command" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+children_of() {
+    local parent_pid="$1"
+    ps -axo pid=,ppid= 2>/dev/null | awk -v parent="$parent_pid" '$2 == parent { print $1 }'
+}
+
+pane_tree_has_agent() {
+    local root_pid="$1" pid comm
+    local frontier=("$root_pid") next=()
+    while (( ${#frontier[@]} )); do
+        for pid in "${frontier[@]}"; do
+            comm=$(ps -o comm= -p "$pid" 2>/dev/null | awk '{ print $1 }')
+            comm="${comm##*/}"
+            if [[ "$comm" == "claude" || "$comm" == "claude.exe" || "$comm" == "codex" ||
+                "$comm" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                return 0
+            fi
+            while read -r child; do
+                [[ -n "$child" ]] && next+=("$child")
+            done < <(children_of "$pid")
+        done
+        frontier=("${next[@]}")
+        next=()
+    done
+    return 1
+}
+
+pane_is_claimed() {
+    grep -Fqx "$1" "$CLAIMED_PANES"
+}
+
+claim_pane() {
+    printf '%s\n' "$1" >> "$CLAIMED_PANES"
+}
+
+# Bash 3.2-compatible shell quoting (macOS still ships Bash 3 by default).
+shell_quote() {
+    printf '%q' "$1"
+}
+
+resumed=0 fresh_orphan=0 skipped=0
+
+# TSV may have 5 columns (legacy), 6 (with source), 7 (with launcher) or 8
+# (with bypass). Tolerate all; only an explicit `yuma` marker selects Mantle,
+# and only an explicit bypass=1 turns permission checks off.
+while IFS=$'\t' read -r sess win pane cwd uuid source_col launcher_col bypass_col; do
+    [[ -n "$sess" && -n "$win" && -n "$pane" && -n "$uuid" ]] || continue
+    [[ -z "${source_col:-}" ]] && source_col="legacy"
+
+    case "${launcher_col:-claude}" in
+        yuma) claude_command="yuma" ;;
+        *)    claude_command="claude"
+              [[ "${bypass_col:-0}" == 1 ]] && claude_command="claude --dangerously-skip-permissions" ;;
+    esac
+
+    target="${sess}:${win}.${pane}"
+    quoted_cwd=$(shell_quote "$cwd")
+
+    # Pane gone? Nothing to do.
+    if ! tmux list-panes -t "$target" &>/dev/null; then
+        skipped=$((skipped+1))
+        continue
+    fi
+
+    if pane_is_claimed "$target"; then
+        skipped=$((skipped+1))
+        continue
+    fi
+
+    # Pane already running claude? Don't double-launch.
+    current_cmd=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || true)
+    pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null || true)
+    # `claude` OR a semver-looking proctitle (Claude renames itself to its
+    # version; e.g. `2.1.145`).
+    if pane_command_is_agent "$current_cmd" || pane_tree_has_agent "$pane_pid"; then
+        skipped=$((skipped+1))
+        continue
+    fi
+
+    claim_pane "$target"
+
+    # Clear any partial input the restored shell may have left at the prompt.
+    tmux send-keys -t "$target" C-u
+
+    if session_is_live "$uuid"; then
+        # Don't fight a live agent. Spawn fresh, but leave the orphan UUID
+        # in scrollback so the user can pick it up later if they want.
+        # Use shell echo (not tmux send-keys -l) so the comment lands in
+        # the shell's history as a real comment line, not literal keystrokes
+        # interpreted by claude.
+        tmux send-keys -t "$target" "# previous claude session ${uuid} is still live elsewhere — resume manually if desired:" C-m
+        tmux send-keys -t "$target" "#   ${claude_command} --resume ${uuid}" C-m
+        tmux send-keys -t "$target" "cd $quoted_cwd && ${claude_command}" C-m
+        fresh_orphan=$((fresh_orphan+1))
+    else
+        tmux send-keys -t "$target" "cd $quoted_cwd && ${claude_command} --resume ${uuid}" C-m
+        resumed=$((resumed+1))
+    fi
+done < <([[ -r "$CLAUDE_IN" ]] && cat "$CLAUDE_IN")
+
+# Snapshot root Codex session IDs that are already open. Subagent rollouts use
+# an object-valued metadata source, while resumable root TUIs use source=cli.
+CODEX_LIVE="$(mktemp)"
+CODEX_DUPLICATE_IDS="$(mktemp)"
+CODEX_CLAIMED="$(mktemp)"
+trap 'rm -f "$AGENTS_JSON" "$CLAIMED_PANES" "$CODEX_LIVE" "$CODEX_DUPLICATE_IDS" "$CODEX_CLAIMED"' EXIT
+CODEX_LIVE_SCAN_AVAILABLE=0
+if [[ -d /proc/self/fd ]] || command -v lsof >/dev/null 2>&1; then
+    codex_session_files_for_pid() {
+        local pid="$1" fd line path lsof_output saw_fd=0
+        if [[ -d "/proc/$pid/fd" ]]; then
+            for fd in "/proc/$pid/fd"/*; do
+                [[ -e "$fd" || -L "$fd" ]] || continue
+                saw_fd=1
+                path=$(readlink "$fd" 2>/dev/null || true)
+                [[ "$path" == "$CODEX_SESSIONS_ROOT"/*.jsonl ]] && printf '%s\n' "$path"
+            done
+            (( saw_fd )) || return 1
+            return 0
+        fi
+        command -v lsof >/dev/null 2>&1 || return 1
+        lsof_output=$(lsof -p "$pid" -Fn 2>/dev/null) || return 1
+        while IFS= read -r line; do
+            [[ "$line" == n"$CODEX_SESSIONS_ROOT"/*.jsonl ]] || continue
+            printf '%s\n' "${line#n}"
+        done <<< "$lsof_output"
+    }
+
+    scan_complete=0
+    if codex_pids=$(ps -axo pid=,comm= 2>/dev/null | awk '$2 ~ /(^|\/)codex$/ { print $1 }'); then
+        scan_complete=1
+        while read -r codex_pid; do
+            [[ -n "$codex_pid" ]] || continue
+            if ! session_paths=$(codex_session_files_for_pid "$codex_pid"); then
+                scan_complete=0
+                break
+            fi
+            while IFS= read -r path; do
+                [[ -n "$path" ]] || continue
+                head -n 1 "$path" 2>/dev/null | jq -r \
+                    'select(.type == "session_meta" and .payload.originator == "codex-tui" and .payload.source == "cli") | .payload.id // empty' \
+                    >> "$CODEX_LIVE"
+            done <<< "$session_paths"
+        done <<< "$codex_pids"
+    fi
+    if (( scan_complete )); then
+        CODEX_LIVE_SCAN_AVAILABLE=1
+    else
+        : > "$CODEX_LIVE"
+    fi
+fi
+sort -u -o "$CODEX_LIVE" "$CODEX_LIVE"
+
+if [[ -r "$CODEX_IN" ]]; then
+    cut -f5 "$CODEX_IN" | sort | uniq -d > "$CODEX_DUPLICATE_IDS"
+fi
+
+codex_session_is_live() {
+    local uuid="$1"
+    # Without procfs or lsof, ownership cannot be proven. Treat every row as
+    # potentially live so restore starts a fresh session instead of attaching
+    # a second TUI to an unknown active rollout.
+    (( CODEX_LIVE_SCAN_AVAILABLE )) || return 0
+    [[ -n "$uuid" ]] || return 1
+    grep -Fqx "$uuid" "$CODEX_LIVE" ||
+        grep -Fqx "$uuid" "$CODEX_DUPLICATE_IDS" ||
+        grep -Fqx "$uuid" "$CODEX_CLAIMED"
+}
+
+codex_resumed=0 codex_fresh_orphan=0 codex_skipped=0
+# provider_col is read for TSV alignment and human debugging only — the profile
+# column is what drives the command, so shellcheck's unused warning is expected.
+# shellcheck disable=SC2034
+while IFS=$'\t' read -r sess win pane cwd uuid source_col provider_col profile_col; do
+    [[ -n "$sess" && -n "$win" && -n "$pane" && -n "$uuid" ]] || continue
+    target="${sess}:${win}.${pane}"
+    quoted_cwd=$(shell_quote "$cwd")
+
+    # Profile flag for non-default providers (e.g. -p bedrock). Absent on
+    # legacy TSV rows and on sessions that ran under the base config.
+    # Validate against the actual profile file: a stale TSV naming a profile
+    # that no longer exists must not produce a command that fails to launch.
+    profile_flag=""
+    if [[ -n "${profile_col:-}" ]]; then
+        if [[ -f "$CODEX_STATE_HOME/${profile_col}.config.toml" ]]; then
+            profile_flag=" -p $(shell_quote "$profile_col")"
+        fi
+    fi
+
+    if ! tmux list-panes -t "$target" &>/dev/null; then
+        codex_skipped=$((codex_skipped+1))
+        continue
+    fi
+
+    if pane_is_claimed "$target"; then
+        codex_skipped=$((codex_skipped+1))
+        continue
+    fi
+
+    current_cmd=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || true)
+    pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null || true)
+    if pane_command_is_agent "$current_cmd" || pane_tree_has_agent "$pane_pid"; then
+        codex_skipped=$((codex_skipped+1))
+        continue
+    fi
+
+    claim_pane "$target"
+
+    tmux send-keys -t "$target" C-u
+    if codex_session_is_live "$uuid"; then
+        tmux send-keys -t "$target" "# previous codex session ${uuid} is still live elsewhere — resume manually if desired:" C-m
+        tmux send-keys -t "$target" "#   codex${profile_flag} resume ${uuid}" C-m
+        # Fresh session still honors the profile so the new TUI talks to the
+        # same provider the pane was using before the restart.
+        tmux send-keys -t "$target" "cd $quoted_cwd && codex${profile_flag}" C-m
+        codex_fresh_orphan=$((codex_fresh_orphan+1))
+    else
+        tmux send-keys -t "$target" "cd $quoted_cwd && codex${profile_flag} resume ${uuid}" C-m
+        printf '%s\n' "$uuid" >> "$CODEX_CLAIMED"
+        codex_resumed=$((codex_resumed+1))
+    fi
+done < <([[ -r "$CODEX_IN" ]] && cat "$CODEX_IN")
+
+# Resurrect's restore.sh emits "Tmux restore complete!" after this hook
+# returns, which would overwrite our message. Defer with a background
+# sleep so our flash lands *after* resurrect's final display-message.
+(
+    sleep 1
+    tmux display-message "resurrect agents: claude $resumed resumed; codex $codex_resumed resumed; skipped $((skipped+codex_skipped))" 2>/dev/null || true
+) </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null || true

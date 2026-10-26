@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# tmux-resurrect-autosave — periodic backstop for tmux-continuum's auto-save.
+#
+# WHY THIS EXISTS
+# ---------------
+# tmux-continuum schedules its saves by injecting
+#   #(…/scripts/continuum_save.sh)
+# into `status-right`, so a save only happens when the status bar REDRAWS.
+# tmux only redraws the status bar for an ATTACHED CLIENT. A detached server
+# therefore never auto-saves, no matter what @continuum-save-interval says.
+#
+# Verified (2026-07-30): with status-interval=1 and no client attached, a
+# `#(touch …)` in status-right never ran. A server had gone 4h+ without a
+# layout snapshot while holding 94 panes and 51 agent sessions — an unplanned
+# reboot would have restored 4-hour-stale state.
+#
+# This script closes that hole from the outside. It is deliberately a BACKSTOP,
+# not a replacement: when a client is attached, continuum is already saving on
+# its own cadence, so we stand down rather than double-write.
+#
+# Pairs with the resurrect hooks that persist agent session UUIDs:
+#   tmux-resurrect-claude-save  /  tmux-resurrect-claude-restore
+
+set -uo pipefail
+
+# ── Mutual exclusion ────────────────────────────────────────────────────
+# A save of a large server takes ~60s (94 panes ≈ 4MB of pane contents), which
+# is long enough to overlap another trigger — the timer firing while someone
+# runs this by hand, or continuum saving concurrently. The agent-session hooks
+# truncate-then-append their TSVs, so two concurrent saves interleave and emit
+# DUPLICATE pane rows. Observed 2026-07-30: 21 codex rows for 20
+# panes, 5 duplicated keys — which would make the restore hook fire two resume
+# commands into the same pane. Single non-blocking lock; if a save is already
+# running we skip rather than queue, since the running one is just as fresh.
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/tmux-resurrect-autosave.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec {lockfd}>"$LOCK" || true
+    if [[ -n "${lockfd:-}" ]] && ! flock -n "$lockfd"; then
+        printf '%s tmux-resurrect-autosave: another save is running; skipping\n' "$(date -u +%FT%TZ)"
+        exit 0
+    fi
+fi
+
+# Stand-down window. Slightly under continuum's 15min default so a healthy
+# attached server always wins the race and this never fires redundantly.
+FRESH_ENOUGH_SECS="${TMUX_AUTOSAVE_FRESH_SECS:-780}"
+
+SAVE_SCRIPT="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
+
+log() { printf '%s tmux-resurrect-autosave: %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# No server -> nothing to save. Not an error: most boxes idle without tmux.
+if ! tmux has-session 2>/dev/null; then
+    log "no tmux server; nothing to do"
+    exit 0
+fi
+
+[[ -x "$SAVE_SCRIPT" || -f "$SAVE_SCRIPT" ]] || { log "resurrect save.sh not found at $SAVE_SCRIPT"; exit 0; }
+
+# Freshness is measured from the SNAPSHOT ITSELF, not from
+# @continuum-save-last-timestamp. That variable is written only by continuum's
+# own continuum_save.sh; resurrect's save.sh (what we invoke) leaves it
+# untouched — so keying off it means this script can never observe its own
+# saves and would fire every interval forever. The mtime of resurrect/last is
+# true regardless of which of the two wrote it.
+SNAPSHOT="$HOME/.tmux/resurrect/last"
+now="$(date +%s)"
+if [[ -e "$SNAPSHOT" ]]; then
+    # -L: follow the symlink to the real snapshot. GNU stat first, BSD second.
+    mtime="$(stat -L -c %Y "$SNAPSHOT" 2>/dev/null || stat -L -f %m "$SNAPSHOT" 2>/dev/null || echo 0)"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+    age=$(( now - mtime ))
+    if (( mtime > 0 && age < FRESH_ENOUGH_SECS )); then
+        log "snapshot is ${age}s old (< ${FRESH_ENOUGH_SECS}s); standing down"
+        exit 0
+    fi
+    log "snapshot ${age}s old; saving"
+else
+    log "no snapshot yet; saving"
+fi
+
+# run-shell (NOT a bare `bash save.sh`): resurrect resolves its socket from the
+# tmux context. Invoked from cron/systemd with $TMUX unset it would expand to
+# `tmux -S '' …`, silently eating the next argument as the socket path.
+#
+# -E (tmux 3.6+) forwards the child's STDERR as well as stdout. It does not
+# change the child's exit status or validate the TSVs; the argv fallback in
+# tmux-resurrect-claude-save fixed the 2026-07-30 zero-row regression itself.
+# This closes the separate observability gap so future hook diagnostics reach
+# the journal instead of disappearing behind a misleadingly quiet save.
+run_resurrect_save() { tmux run-shell "$SAVE_SCRIPT"; }
+if tmux run-shell -E ':' >/dev/null 2>&1; then
+    run_resurrect_save() { tmux run-shell -E "$SAVE_SCRIPT"; }
+fi
+if run_resurrect_save 2>&1; then
+    log "save complete (panes=$(tmux list-panes -a -F x 2>/dev/null | wc -l | tr -d ' '), snapshot=$(readlink "$SNAPSHOT" 2>/dev/null || echo '?'))"
+else
+    log "save FAILED"
+    exit 1
+fi

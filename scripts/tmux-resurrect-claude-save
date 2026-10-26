@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# tmux-resurrect-claude-save — runs on @resurrect-hook-post-save-all
+#
+# Persist exact Claude and Codex session UUIDs for every agent pane so the
+# paired restore hook can resume the right conversation after tmux-resurrect
+# rebuilds the layout.
+#
+# Output:
+#   ~/.tmux/resurrect/claude-sessions.tsv
+#   ~/.tmux/resurrect/codex-sessions.tsv
+#   columns: session \t window_index \t pane_index \t cwd \t uuid \t source \t launcher
+#   Claude adds one more:                         \t bypass (1: it ran with permission checks off)
+#   Codex adds two more:                          \t provider \t profile
+#   Claude sources: argv | agents-json | cwd-mtime
+#   Claude launcher: claude | yuma
+#   Codex source:   open-file
+#
+# Codex panes additionally record which model provider the session ran under,
+# read from the rollout's session_meta.payload.model_provider. A session started
+# under a non-default provider (e.g. amazon-bedrock) must be resumed with the
+# matching `-p <profile>` or Codex reloads it against the default OpenAI
+# endpoint. The provider→profile mapping is derived from the
+# $CODEX_HOME/<name>.config.toml files themselves, not hardcoded.
+#
+# Paired with tmux-resurrect-claude-restore which reads both files on
+# @resurrect-hook-post-restore-all and sends the correct resume command
+# into each pane.
+
+set -euo pipefail
+
+CLAUDE_OUT="$HOME/.tmux/resurrect/claude-sessions.tsv"
+CODEX_OUT="$HOME/.tmux/resurrect/codex-sessions.tsv"
+CODEX_STATE_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_SESSIONS_ROOT="$CODEX_STATE_HOME/sessions"
+mkdir -p "$(dirname "$CLAUDE_OUT")"
+: > "$CLAUDE_OUT"
+: > "$CODEX_OUT"
+
+# Snapshot the live agent list once. Each row is {pid, cwd, sessionId, ...}.
+# Fall back to empty array if `claude` isn't on PATH or the call fails —
+# we still have the argv path and the cwd-mtime fallback below.
+AGENTS_JSON="$(mktemp)"
+trap 'rm -f "$AGENTS_JSON"' EXIT
+if command -v claude >/dev/null 2>&1; then
+    claude agents --json >"$AGENTS_JSON" 2>/dev/null || echo '[]' >"$AGENTS_JSON"
+else
+    echo '[]' >"$AGENTS_JSON"
+fi
+
+# Encode a cwd the way Claude Code's projects/ dir does: every character that is
+# not a letter or digit becomes "-" (~/.dotfiles → -home-you--dotfiles).
+encode_cwd() {
+    printf '%s' "$1" | sed 's|[^A-Za-z0-9]|-|g'
+}
+
+# Read a PID's full cmdline, portable across Linux (/proc) and macOS (ps).
+# Returns the argv joined by single spaces, or empty if the PID is gone.
+read_cmdline() {
+    local pid="$1"
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+        tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null
+    else
+        # macOS: `ps -ww -o args=` prints the full command line without
+        # truncating at the terminal width (-ww = unlimited width).
+        # Trailing space intentional so our word-boundary regex below works.
+        ps -ww -o args= -p "$pid" 2>/dev/null | sed 's/$/ /'
+    fi
+}
+
+# `pgrep -P` is not reliable on every build (the macOS implementation
+# can omit a foreground child even when ps reports the correct PPID). Parse the
+# portable ps table instead so wrapper shells and directly-exec'd agents behave
+# identically.
+children_of() {
+    local parent_pid="$1"
+    ps -axo pid=,ppid= 2>/dev/null | awk -v parent="$parent_pid" '$2 == parent { print $1 }'
+}
+
+# Walk the process tree below a PID looking for a claude cmdline. Returns
+# the argv line on the first match, empty string otherwise.
+claude_cmdline_for_tree() {
+    local root_pid="$1" pid cmdline
+    # breadth-first: root, then its direct children, then grandchildren, etc.
+    local frontier=("$root_pid") next=()
+    while (( ${#frontier[@]} )); do
+        for pid in "${frontier[@]}"; do
+            cmdline=$(read_cmdline "$pid")
+            [[ -n "$cmdline" ]] || continue
+            # Require literal `claude` as a word (guard against "claude-api"
+            # binary or similar). The `[ ]` space handles the trailing
+            # separator read_cmdline ensures.
+            if [[ " $cmdline " =~ ( |^)(/[^ ]+/)?claude( |$) ]]; then
+                printf '%s' "$cmdline"
+                return 0
+            fi
+            while read -r child; do
+                [[ -n "$child" ]] && next+=("$child")
+            done < <(children_of "$pid")
+        done
+        frontier=("${next[@]}")
+        next=()
+    done
+    return 1
+}
+
+# Extract --resume UUID from a cmdline, or "" if this is a fresh session.
+uuid_from_cmdline() {
+    local cmd="$1"
+    if [[ "$cmd" =~ --resume[[:space:]]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Record whether this pane was launched through the Bedrock Mantle wrapper.
+# Shell functions do not survive in the child argv, but `yuma` (base/aliases.sh)
+# always expands to Claude with mantle.settings.json, which is both stable and
+# sufficient to recreate the same route during restore. Treat a manually
+# equivalent launch as `yuma` too so it does not silently fall back to the
+# subscription endpoint.
+launcher_from_cmdline() {
+    local cmd="$1"
+    if [[ "$cmd" =~ --settings[[:space:]]+([^[:space:]]*/)?mantle\.settings\.json([[:space:]]|$) ]]; then
+        printf 'yuma'
+    else
+        printf 'claude'
+    fi
+}
+
+# 1 when the session ran with permission checks off, so restore replays exactly
+# that and never resumes a session with more permission than it had.
+bypass_from_cmdline() {
+    local cmd=" $1 "
+    if [[ "$cmd" =~ [[:space:]]--dangerously-skip-permissions[[:space:]] ||
+          "$cmd" =~ [[:space:]]--permission-mode([[:space:]]+|=)bypassPermissions[[:space:]] ]]; then
+        printf '1'
+    else
+        printf '0'
+    fi
+}
+
+# Walk the process subtree of $1 looking for a pid that's in the live
+# agents JSON. Echoes "<sessionId>" of the matching agent or empty.
+# This is the authoritative match — handles the common case where multiple
+# Claude sessions share a cwd (e.g. several panes in one repo).
+uuid_from_agents_json() {
+    local root_pid="$1"
+    [[ -z "$root_pid" ]] && return 0
+    # Build a regex of agent pids for fast match.
+    local agent_pids
+    agent_pids="$(jq -r '.[].pid' "$AGENTS_JSON" 2>/dev/null | tr '\n' ' ')"
+    [[ -z "$agent_pids" ]] && return 0
+    local frontier=("$root_pid") next=() visited=" "
+    while (( ${#frontier[@]} )); do
+        local pid
+        for pid in "${frontier[@]}"; do
+            case "$visited" in *" $pid "*) continue ;; esac
+            visited="$visited$pid "
+            local ap
+            for ap in $agent_pids; do
+                if [[ "$pid" == "$ap" ]]; then
+                    jq -r --argjson p "$pid" '.[] | select(.pid == $p) | .sessionId // ""' "$AGENTS_JSON"
+                    return 0
+                fi
+            done
+            local child
+            while read -r child; do
+                [[ -n "$child" ]] && next+=("$child")
+            done < <(children_of "$pid")
+        done
+        frontier=("${next[@]}")
+        next=()
+    done
+}
+
+# Guess the active UUID for a fresh claude session in the given cwd by
+# picking the most recently modified transcript in the corresponding
+# projects/<encoded-cwd>/ directory. Empty string if no transcripts.
+#
+# This is the LAST-RESORT fallback — only used when both --resume in argv
+# and process-tree match against `claude agents --json` came up empty.
+# Historically this was the primary fallback and caused every pane in a
+# shared cwd to point at the same UUID.
+uuid_by_cwd_mtime() {
+    local cwd="$1"
+    local proj
+    proj="$HOME/.claude/projects/$(encode_cwd "$cwd")"
+    [[ -d "$proj" ]] || return 0
+    local latest
+    latest=$(ls -1t "$proj"/*.jsonl 2>/dev/null | head -1 || true)
+    [[ -n "$latest" ]] || return 0
+    # UUID is the basename without .jsonl
+    basename "$latest" .jsonl
+}
+
+# Emit: session \t window_index \t pane_index \t cwd \t uuid \t source \t launcher
+tmux list-panes -a -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_pid}	#{pane_current_path}	#{pane_current_command}' |
+while IFS=$'\t' read -r sess win pane pid cwd cmd; do
+    # Pre-filter: skip panes that are obviously not claude (idle shells,
+    # editors, etc). The proctitle varies by build/state:
+    #   • "claude"            — stock Claude Code
+    #   • "claude.exe"        — the OpenClaw/Pi build (.exe suffix even on
+    #                           macOS/Linux); the real `claude` argv lives on
+    #                           a child process the subtree walk still finds
+    #   • "2.1.123" (semver)  — Claude Code renames its proctitle to its version
+    #   • "node" / "zsh"      — a wrapper shell or node launcher fronting claude
+    # The authoritative check is claude_cmdline_for_tree (walks the subtree);
+    # this pre-filter just trims obvious non-candidates, so admit anything that
+    # could plausibly front a claude process rather than rejecting valid ones.
+    case "$cmd" in
+        claude|claude.exe|node|zsh|bash|sh) : ;;        # plausible fronts — let the tree walk decide
+        *) [[ "$cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue ;;
+    esac
+
+    # Resolution order:
+    #   1. --resume <uuid> in argv (most reliable; survives across restarts)
+    #   2. process-tree match against `claude agents --json` (authoritative
+    #      when the agent is currently running but argv lacks --resume)
+    #   3. newest jsonl in cwd (last-resort heuristic — collides when
+    #      multiple Claude sessions share a cwd)
+    cmdline=$(claude_cmdline_for_tree "$pid" 2>/dev/null || true)
+    uuid=$(uuid_from_cmdline "$cmdline" || true)
+    source="argv"
+    if [[ -z "$uuid" ]]; then
+        uuid=$(uuid_from_agents_json "$pid" || true)
+        [[ -n "$uuid" ]] && source="agents-json"
+    fi
+    # cwd-mtime is the last-resort heuristic and collides when multiple Claude
+    # sessions share a cwd. Only trust it when this pane REALLY fronts a claude
+    # process — i.e. the subtree walk found a claude cmdline (`cmdline` non-empty)
+    # OR the proctitle is itself a claude proctitle. A bare idle shell (zsh/bash
+    # with no claude child) must NOT fall through to cwd-mtime: it would grab the
+    # newest jsonl in the cwd (often an UNRELATED live session) and "restore" a
+    # duplicate. Such panes are skipped entirely below.
+    if [[ -z "$uuid" ]]; then
+        if [[ -n "$cmdline" || "$cmd" == "claude" || "$cmd" == "claude.exe" || "$cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            uuid=$(uuid_by_cwd_mtime "$cwd" || true)
+            [[ -n "$uuid" ]] && source="cwd-mtime"
+        fi
+    fi
+
+    # Skip panes we can't identify at all — restore would spawn a fresh
+    # session which isn't useful here (user can always start claude manually).
+    [[ -n "$uuid" ]] || continue
+
+    launcher=$(launcher_from_cmdline "$cmdline")
+    bypass=$(bypass_from_cmdline "$cmdline")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sess" "$win" "$pane" "$cwd" "$uuid" "$source" "$launcher" "$bypass" >> "$CLAUDE_OUT"
+done
+
+# List rollout JSONLs held by one process. Linux exposes exact descriptor
+# targets through procfs; macOS uses lsof. If neither exists, callers fail
+# closed rather than guessing another pane's session from cwd alone.
+codex_session_files_for_pid() {
+    local pid="$1" fd line path lsof_output saw_fd=0
+    if [[ -d "/proc/$pid/fd" ]]; then
+        for fd in "/proc/$pid/fd"/*; do
+            [[ -e "$fd" || -L "$fd" ]] || continue
+            saw_fd=1
+            path=$(readlink "$fd" 2>/dev/null || true)
+            [[ "$path" == "$CODEX_SESSIONS_ROOT"/*.jsonl ]] && printf '%s\n' "$path"
+        done
+        (( saw_fd )) || return 1
+        return 0
+    fi
+    command -v lsof >/dev/null 2>&1 || return 1
+    lsof_output=$(lsof -p "$pid" -Fn 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        [[ "$line" == n"$CODEX_SESSIONS_ROOT"/*.jsonl ]] || continue
+        printf '%s\n' "${line#n}"
+    done <<< "$lsof_output"
+}
+
+# Return the first actual Codex executable in a pane's process tree. Matching
+# `comm` avoids mistaking a retaining wrapper like `bash -lc 'codex; cleanup'`
+# for the process that owns the rollout descriptor.
+codex_pid_for_tree() {
+    local root_pid="$1" pid comm pgid foreground_pgid
+    foreground_pgid=$(ps -o tpgid= -p "$root_pid" 2>/dev/null | awk '{ print $1 }')
+    [[ "$foreground_pgid" =~ ^[1-9][0-9]*$ ]] || return 1
+    local frontier=("$root_pid") next=()
+    while (( ${#frontier[@]} )); do
+        for pid in "${frontier[@]}"; do
+            comm=$(ps -o comm= -p "$pid" 2>/dev/null | awk '{ print $1 }')
+            pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | awk '{ print $1 }')
+            if [[ "${comm##*/}" == "codex" && "$pgid" == "$foreground_pgid" ]]; then
+                printf '%s' "$pid"
+                return 0
+            fi
+            while read -r child; do
+                [[ -n "$child" ]] && next+=("$child")
+            done < <(children_of "$pid")
+        done
+        frontier=("${next[@]}")
+        next=()
+    done
+    return 1
+}
+
+codex_uuid_from_open_files() {
+    local pid="$1" path
+    while IFS= read -r path; do
+        if head -n 1 "$path" 2>/dev/null | jq -e \
+            '.type == "session_meta" and .payload.originator == "codex-tui" and .payload.source == "cli"' \
+            >/dev/null 2>&1; then
+            # Emit "<uuid>\t<model_provider>". model_provider is absent on
+            # sessions recorded by older Codex builds; empty means "assume the
+            # base config default" and the restore side omits -p entirely.
+            head -n 1 "$path" | jq -r '[(.payload.id // ""), (.payload.model_provider // "")] | @tsv'
+            return 0
+        fi
+    done < <(codex_session_files_for_pid "$pid" 2>/dev/null || true)
+}
+
+# Fallback for a RESUMED codex, which carries its session id in argv as
+# `codex resume <uuid>`. Needed because codex opens its rollout file lazily:
+# a freshly resumed session idling at a prompt holds no rollout fd at all, so
+# codex_uuid_from_open_files sees nothing. Seen 2026-07-30 right after a
+# resurrect restore: all 10 codex panes were live with correct ids in argv
+# while open-file detection recorded ZERO,
+# leaving codex unrecoverable across a reboot until the first turn was typed.
+codex_uuid_from_argv() {
+    local pid="$1" argv tok prev=""
+    argv="$(read_cmdline "$pid")" || return 1
+    for tok in $argv; do
+        # UUIDs here are hex+dashes; length guard avoids matching the literal
+        # subcommand or a bare flag that happens to follow `resume`.
+        if [[ "$prev" == "resume" && "$tok" =~ ^[0-9a-fA-F-]{32,}$ ]]; then
+            printf '%s' "$tok"
+            return 0
+        fi
+        prev="$tok"
+    done
+    return 1
+}
+
+# Read model_provider straight out of a rollout, located by session id. Needed
+# on the argv path: codex_uuid_from_argv recovers the uuid from `codex resume
+# <uuid>` when no rollout fd is open, but carries no provider with it. Without
+# this the post-restore case — precisely the one argv detection exists for —
+# would save an empty provider and resume Bedrock sessions on the default
+# endpoint. Rollouts live at sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl.
+codex_provider_for_uuid() {
+    local uuid="$1" file
+    [[ -n "$uuid" ]] || return 0
+    # Newest first: a uuid is unique, but -newer ordering costs nothing and
+    # guards against an id reused across an archived and a live rollout.
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        head -n 1 "$file" 2>/dev/null |
+            jq -r 'select(.type == "session_meta") | .payload.model_provider // empty'
+        return 0
+    done < <(find "$CODEX_SESSIONS_ROOT" -name "rollout-*-${uuid}.jsonl" 2>/dev/null | sort -r)
+}
+
+# Provider for a still-running codex, read from the profile flag in its own
+# argv (`codex -p bedrock ...`). Last resort when the rollout is unreadable or
+# predates model_provider: the flag the process was launched with is by
+# definition the flag that reproduces it.
+codex_profile_from_argv() {
+    local pid="$1" argv tok prev=""
+    argv="$(read_cmdline "$pid")" || return 1
+    for tok in $argv; do
+        if [[ "$prev" == "-p" || "$prev" == "--profile" ]]; then
+            printf '%s' "$tok"
+            return 0
+        fi
+        prev="$tok"
+    done
+    return 1
+}
+
+# Map a model_provider id (e.g. amazon-bedrock) to the `codex -p <name>` profile
+# that selects it. `--profile <name>` layers $CODEX_HOME/<name>.config.toml over
+# the base config, so the authoritative mapping is simply "which profile file
+# declares this provider" — derived at save time rather than hardcoded, so a new
+# profile file starts working without editing this script.
+#
+# Prints the profile name, or nothing when the provider is the base-config
+# default (no profile needed) or no profile file claims it.
+codex_profile_for_provider() {
+    local want="$1" file name file_provider
+    [[ -n "$want" ]] || return 0
+
+    # A provider matching the BASE config needs no -p at all.
+    local base_provider
+    base_provider=$(grep -m1 -E '^[[:space:]]*model_provider[[:space:]]*=' \
+        "$CODEX_STATE_HOME/config.toml" 2>/dev/null |
+        sed -E 's/[^"]*"([^"]*)".*/\1/' || true)
+    # An absent model_provider in the base config means Codex's built-in default.
+    [[ -z "$base_provider" ]] && base_provider="openai"
+    [[ "$want" == "$base_provider" ]] && return 0
+
+    for file in "$CODEX_STATE_HOME"/*.config.toml; do
+        [[ -f "$file" ]] || continue
+        name=$(basename "$file" .config.toml)
+        file_provider=$(grep -m1 -E '^[[:space:]]*model_provider[[:space:]]*=' "$file" 2>/dev/null |
+            sed -E 's/[^"]*"([^"]*)".*/\1/' || true)
+        if [[ -n "$file_provider" && "$file_provider" == "$want" ]]; then
+            printf '%s' "$name"
+            return 0
+        fi
+    done
+
+    # Fallback for retired provider ids that no longer own a profile file — e.g.
+    # `bedrock-token`, written by an earlier auth setup. The provider block is
+    # gone but those rollouts still need the bedrock profile to resume, so match
+    # a profile whose name is a substring of the provider id (or vice versa).
+    for file in "$CODEX_STATE_HOME"/*.config.toml; do
+        [[ -f "$file" ]] || continue
+        name=$(basename "$file" .config.toml)
+        if [[ "$want" == *"$name"* ]]; then
+            printf '%s' "$name"
+            return 0
+        fi
+    done
+}
+
+tmux list-panes -a -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_pid}	#{pane_current_path}	#{pane_current_command}' |
+while IFS=$'\t' read -r sess win pane pid cwd cmd; do
+    codex_pid=$(codex_pid_for_tree "$pid" 2>/dev/null || true)
+    [[ -n "$codex_pid" ]] || continue
+    # codex_uuid_from_open_files emits "<uuid>\t<provider>"; provider may be empty.
+    uuid_row=$(codex_uuid_from_open_files "$codex_pid" || true)
+    IFS=$'\t' read -r uuid provider <<< "$uuid_row"
+    source="open-file"
+    if [[ -z "$uuid" ]]; then
+        uuid=$(codex_uuid_from_argv "$codex_pid" || true)
+        source="argv"
+    fi
+    [[ -n "$uuid" ]] || continue
+
+    # The argv path yields no provider, so recover it from the rollout on disk.
+    if [[ -z "${provider:-}" ]]; then
+        provider=$(codex_provider_for_uuid "$uuid" || true)
+    fi
+
+    profile=$(codex_profile_for_provider "${provider:-}" || true)
+    # Still nothing (rollout unreadable, or written before model_provider
+    # existed)? Trust the -p flag the live process was launched with.
+    if [[ -z "${profile:-}" && -z "${provider:-}" ]]; then
+        profile=$(codex_profile_from_argv "$codex_pid" || true)
+        # Only honor a profile that still has a config file behind it.
+        [[ -n "$profile" && ! -f "$CODEX_STATE_HOME/${profile}.config.toml" ]] && profile=""
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$sess" "$win" "$pane" "$cwd" "$uuid" "$source" "${provider:-}" "${profile:-}" >> "$CODEX_OUT"
+done
+
+claude_count=$(wc -l < "$CLAUDE_OUT" 2>/dev/null || echo 0)
+codex_count=$(wc -l < "$CODEX_OUT" 2>/dev/null || echo 0)
+# Tmux display-message truncates at ~100 chars; keep this terse.
+# Resurrect's save.sh emits "Tmux environment saved!" after this hook
+# returns, which would overwrite our message. Defer with a background
+# sleep so our flash lands *after* resurrect's final display-message.
+# nohup + & + redirect so we don't wedge resurrect if tmux is slow.
+(
+    sleep 1
+    tmux display-message "resurrect agents: saved $claude_count claude, $codex_count codex" 2>/dev/null || true
+) </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null || true
