@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dream</string>
+    <!-- macOS twin of systemd/user/dream.timer: at 03:00, dream-prep stages this
+         machine's .analysis, then `dream sweep` runs light -> REM -> deep for the
+         repos claude/dreaming.conf enables (a host outside dream_machines only
+         stages). Nothing runs until a repo is enabled. Missed runs (the Mac was
+         asleep) run at the next wake. Add any model-route environment the sweep
+         needs (CLAUDE_CONSOLIDATE_MODEL, CLAUDE_CONSOLIDATE_ENV_FILE) below. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>"$HOME/.dotfiles/scripts/dream-prep" --days 14; exec "$HOME/.dotfiles/scripts/dream" sweep</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/logs/dream.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/logs/dream.log</string>
+</dict>
+</plist>

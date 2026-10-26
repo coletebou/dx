@@ -1,0 +1,13 @@
+[Unit]
+Description=Run tmux-resurrect backstop save every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+# A safety floor: a monotonic timer can be stranded at NextElapse=infinity by a
+# daemon-reexec; the calendar trigger un-wedges it.
+OnCalendar=*:0/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

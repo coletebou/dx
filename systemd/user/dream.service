@@ -1,0 +1,24 @@
+[Unit]
+Description=Dream sweep — three-phase memory consolidation (light/REM/deep)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Feed the Light phase first: dream-prep regenerates this machine's .analysis/*
+# inputs (unfinished / workflow-tips / memory-candidates). It is dreamer-gated:
+# only a host in dream_machines analyzes, labeled by host, so machines sharing a
+# synced memory home never clobber each other's files. `-` prefix: an analyzer
+# failure must not block the sweep (REM and Deep read MEMORY.md directly).
+ExecStartPre=-%h/.dotfiles/scripts/dream-prep --days 14
+ExecStart=%h/.dotfiles/scripts/dream sweep
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Model route for the sweep and the analyzer (an alias needs no extra setup):
+# Environment=CLAUDE_CONSOLIDATE_MODEL=haiku
+# A service manager does not read your shell's secrets; name a file holding only
+# AWS_BEARER_TOKEN_BEDROCK / ANTHROPIC_API_KEY if the route needs one. Never use
+# EnvironmentFile= for a file with `export K=V` lines: systemd cannot parse them
+# and logs the whole line, value included, to the journal.
+# Environment=CLAUDE_CONSOLIDATE_ENV_FILE=%h/.config/claude-consolidate.env
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=1800

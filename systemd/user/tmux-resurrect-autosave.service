@@ -1,0 +1,6 @@
+[Unit]
+Description=Backstop tmux-resurrect save (continuum cannot save while detached)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.dotfiles/scripts/tmux-resurrect-autosave

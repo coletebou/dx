@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tmux-resurrect-autosave</string>
+    <!-- macOS twin of systemd/user/tmux-resurrect-autosave.timer. Continuum
+         only saves when an attached client redraws the status bar, so a Mac
+         whose tmux sits detached (or whose status-right lost continuum's hook)
+         never snapshots, and a server that dies then loses a day of layout.
+         Every 15 minutes the script saves the layout plus the agent-session
+         map, and stands down when a snapshot is already fresh, so it never
+         doubles up with a working continuum. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.dotfiles/scripts/tmux-resurrect-autosave</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- launchd does NOT inherit shell env. tmux is in Homebrew, which lives
+         in /opt/homebrew or, on a user-local install, ~/homebrew. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/homebrew/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/logs/tmux-resurrect-autosave.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/logs/tmux-resurrect-autosave.log</string>
+</dict>
+</plist>
