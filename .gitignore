@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+.DS_Store
+# Machine-local overrides the installer merges last (never committed).
+claude/settings.local.json
+claude/mcp.local.json
+# Claude Code's own per-checkout state, worktrees included.
+.claude/
