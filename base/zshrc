@@ -1,0 +1,363 @@
+# base/zshrc — universal zsh skeleton
+#
+# Sourced by every profile's zshrc variant. Contains only identity-free,
+# role-free shell ergonomics: history, completion, key bindings, prompt,
+# plugin sourcing, tool inits (fnm, fzf, zoxide, starship, rust).
+#
+# Machine-specific or identity-specific config belongs in the role and
+# identity layers that ~/.aliases sources, or in ~/.zshrc_machine.
+
+# Non-interactive shells: bail out
+[[ $- != *i* ]] && return
+
+# ── History ──────────────────────────────────────────────────────────
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=20000
+setopt APPEND_HISTORY
+setopt HIST_IGNORE_DUPS
+setopt HIST_IGNORE_SPACE
+setopt HIST_REDUCE_BLANKS
+setopt SHARE_HISTORY
+setopt INC_APPEND_HISTORY
+
+# ── Shell Options ────────────────────────────────────────────────────
+setopt AUTO_CD
+setopt EXTENDED_GLOB
+setopt NO_BEEP
+setopt INTERACTIVE_COMMENTS
+setopt PROMPT_SUBST
+
+# ── Completion ───────────────────────────────────────────────────────
+# Custom completions shipped with dotfiles (e.g. _ai for the ai-cli tool), plus
+# the dirs Docker Desktop and the grok installer drop under ~. All must be on
+# fpath BEFORE compinit, which runs once here: the installer blocks in ~/.zshrc
+# used to run it twice more (~18 ms a shell). -U because brew shellenv exports
+# FPATH, so each nested shell re-prepended these dirs to its parent's copy. -g
+# because ds and df-switch source this inside a function, where a bare typeset
+# makes an empty local fpath and compinit can no longer find itself.
+typeset -gU fpath
+fpath=("$HOME/.dotfiles/base/completions" $fpath)
+for _cdir in "$HOME/.docker/completions" "$HOME/.grok/completions/zsh"; do
+    [[ -d "$_cdir" ]] && fpath=("$_cdir" $fpath)
+done
+unset _cdir
+autoload -Uz compinit
+# -C skips the scan for new completion files and the security audit. Do the
+# full check once a day, so a newly installed tool's completions still appear.
+# An array glob, not [[ $f(#q...) ]]: zsh before 5.0.6 cannot glob in [[ ]].
+_zcd_stale=(${ZDOTDIR:-$HOME}/.zcompdump(N.mh+24))
+if (( $#_zcd_stale )); then
+    compinit && touch "${ZDOTDIR:-$HOME}/.zcompdump"
+else
+    compinit -C
+fi
+unset _zcd_stale
+
+zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
+zstyle ':completion:*' menu select
+zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
+zstyle ':completion:*' group-name ''
+zstyle ':completion:*:descriptions' format '%F{yellow}── %d ──%f'
+
+# ── Key Bindings ─────────────────────────────────────────────────────
+bindkey -e                          # emacs mode (same as bash default)
+bindkey '^[[A' up-line-or-search    # up arrow: history search
+bindkey '^[[B' down-line-or-search  # down arrow: history search
+bindkey '^[[3~' delete-char         # delete key
+bindkey '^[[H' beginning-of-line    # home
+bindkey '^[[F' end-of-line          # end
+
+# ── Color Support ────────────────────────────────────────────────────
+if [[ -x /usr/bin/dircolors ]]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias grep='grep --color=auto'
+    alias fgrep='fgrep --color=auto'
+    alias egrep='egrep --color=auto'
+elif [[ "$(uname)" == "Darwin" ]]; then
+    alias grep='grep --color=auto'
+fi
+export COLORTERM=truecolor
+export LS_COLORS="$LS_COLORS:ow=1;34"  # WSL directory color fix (harmless elsewhere)
+
+# ── PATH (universal additions) ───────────────────────────────────────
+# Personal bin dirs and package manager global bins, in priority order.
+# Machine-specific PATH (e.g. /opt/whatever, cross-compile toolchains) goes
+# in the wrapping zshrc variant.
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.dotfiles/scripts:$PATH"
+# `go env GOPATH` costs ~10 ms a shell. It is $GOPATH, else what `go env -w`
+# saved in Go's env file, else ~/go; only that middle case needs go itself.
+if (( $+commands[go] )); then
+    _goenv="${GOENV:-${XDG_CONFIG_HOME:-$HOME/.config}/go/env}"
+    [[ "$OSTYPE" == darwin* && -z "${GOENV:-}" ]] && _goenv="$HOME/Library/Application Support/go/env"
+    if [[ -z "${GOPATH:-}" && -f "$_goenv" ]]; then
+        export PATH="$PATH:$(go env GOPATH)/bin"
+    else
+        export PATH="$PATH:${GOPATH:-$HOME/go}/bin"
+    fi
+    unset _goenv
+fi
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+export PNPM_HOME="$HOME/.local/share/pnpm"
+[[ -d "$PNPM_HOME" ]] && export PATH="$PNPM_HOME:$PATH"
+
+# ── Terminal tab title ───────────────────────────────────────────────
+# Set the emulator tab/window title to the hostname before each prompt.
+# Skipped when $TMUX is set — tmux owns the title in that case via
+# set-titles-string in base/tmux.conf, which uses #H (the tmux server's
+# host). This handles the bare-shell case: ssh'd into a remote box with
+# no tmux, or local shell before attaching. OSC 2 = window title; most
+# emulators (Ghostty, iTerm2, Windows Terminal) also use it for the tab.
+_df_set_title_hostname() {
+  [[ -n $TMUX ]] && return
+  print -Pn "\e]2;%m\a"
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _df_set_title_hostname
+
+# ── OSC 7: report cwd (host + path) to the terminal / tmux ───────────
+# Consumed by base/tmux-ssh-inherit.sh (prefix+c), which opens a new window
+# already ssh'd to the same box as the current pane. tmux knows a pane is
+# running ssh, but #{pane_current_path} is the pane shell's LOCAL cwd — during
+# ssh that is wherever you were before connecting, so it cannot supply the
+# REMOTE directory. OSC 7 is the only channel that can: tmux parses it into
+# #{pane_path} verbatim, and it rides the ssh data stream, so a sequence emitted
+# on a remote box arrives at the LOCAL tmux (verified: `file://box/etc`).
+#
+# Unconditional, unlike the OSC 2 title hook above: OSC 7 is data (which cwd)
+# rather than presentation (what the tab reads), and tmux stores it per pane
+# instead of letting it fight set-titles-string. Emitting it inside tmux is what
+# makes the REMOTE half work, since the remote shell always has $TMUX unset
+# whether or not a local tmux is listening.
+#
+# %-escape everything outside the unreserved URI set, since the path becomes a
+# URI: a space or '#' in a directory name would otherwise truncate or corrupt it.
+#
+# `no_multibyte` makes the loop iterate BYTES rather than characters, which is
+# what RFC 3986 wants — a UTF-8 path must be escaped per byte (é -> %C3%A9). With
+# multibyte on, zsh yields the CODEPOINT and you emit %E9, which no consumer
+# decodes back to é. Arithmetic `##$c` + ${(l:2::0:)} zero-padding does the hex
+# conversion inside the shell, so this adds no fork per prompt.
+_report_cwd_osc7() {
+  emulate -L zsh
+  setopt localoptions no_multibyte
+  local h="${HOST:-${HOSTNAME:-localhost}}" enc="" c i
+  for (( i = 1; i <= ${#PWD}; i++ )); do
+    c="${PWD[i]}"
+    case "$c" in
+      ([A-Za-z0-9/._~-]) enc+="$c" ;;
+      (*) enc+="%${(l:2::0:)$(([##16] ##$c ))}" ;;
+    esac
+  done
+  print -n "\e]7;file://${h%%.*}${enc}\e\\"
+}
+add-zsh-hook precmd _report_cwd_osc7
+
+# ── Starship prompt ──────────────────────────────────────────────────
+# base/starship.toml reads its host label and identity badge from these
+# variables, so drawing a prompt forks nothing (custom modules forked bash on
+# every prompt and made starship scan the directory first).
+#
+# Host label: computed once per shell, from the same hosts file the tmux bar and
+# the Claude Code statusline read (your identity's identities/<id>/hosts, see
+# base/host-label.sh): DF_HOST_LABEL wins, then the first matching glob, then
+# the short hostname. zsh builtins on $HOST (gethostname, as `hostname -s`
+# reads it), so a shell forks nothing.
+() {
+    local h=${(L)HOST%%.*} glob label rest
+    local f=${DF_HOSTS_FILE:-${DOTFILES_DIR:-$HOME/.dotfiles}/identities/${DF_IDENTITY:-none}/hosts}
+    if [[ -n ${DF_HOST_LABEL:-} ]]; then
+        h=$DF_HOST_LABEL
+    elif [[ -r $f ]]; then
+        while read -r glob label rest; do
+            [[ -z $glob || $glob == \#* || -z $label ]] && continue
+            if [[ $h == ${~glob} ]]; then h=$label; break; fi
+        done < $f
+    fi
+    export DF_PROMPT_HOST=$h
+}
+# Identity badge: refreshed before every prompt so df-switch shows at once. It
+# names a work identity (one of DF_WORK_IDENTITIES, default "work") and is unset
+# for every other identity, which hides it.
+_df_prompt_badge() {
+    # A real array: on a single-word scalar, (Ie) would match substrings.
+    local -a work=(${=DF_WORK_IDENTITIES:-work})
+    if [[ -n ${DF_IDENTITY:-} ]] && (( ${work[(Ie)$DF_IDENTITY]} )); then
+        export DF_PROMPT_BADGE="$DF_IDENTITY"
+    else
+        unset DF_PROMPT_BADGE
+    fi
+}
+add-zsh-hook precmd _df_prompt_badge
+eval "$(starship init zsh)"
+# starship.toml has no right_format: skip the second starship process (~4 ms,
+# empty output) that the init runs for RPROMPT before every prompt.
+unset RPROMPT
+
+# ── Slow-prompt log ──────────────────────────────────────────────────
+# One line in ~/.local/state/logs/prompt-latency.log for each prompt that takes
+# DF_PROMPT_LOG_MS (default 100) or more to draw, timed from the first precmd
+# hook to the line editor starting (hooks + starship), and for a shell that
+# takes DF_SHELL_LOG_MS (default 1000) or more from the top of ~/.zshrc to its
+# first prompt. Costs two clock reads per prompt, no fork; it writes only when
+# something was slow. Rotates to .1 past 256 KB. `starship timings` in the logged directory says which
+# module was slow.
+zmodload zsh/datetime
+_df_prompt_t0() { _df_prompt_started=$EPOCHREALTIME }
+precmd_functions=(_df_prompt_t0 ${precmd_functions:#_df_prompt_t0})
+_df_slow_log() {
+    emulate -L zsh
+    setopt extended_glob
+    local log=~/.local/state/logs/prompt-latency.log ts
+    [[ -d ${log:h} ]] || mkdir -p ${log:h}
+    [[ -n $log(#qNLk+256) ]] && mv -f $log $log.1
+    strftime -s ts '%Y-%m-%dT%H:%M:%S' $EPOCHSECONDS
+    print -r -- "$ts $1 $PWD" >>$log
+}
+_df_prompt_drawn() {
+    local -F now=$EPOCHREALTIME
+    local -i ms
+    if [[ -n "${_df_prompt_started:-}" ]]; then
+        ms=$(( (now - _df_prompt_started) * 1000 ))
+        (( ms < ${DF_PROMPT_LOG_MS:-100} )) || _df_slow_log "prompt ${ms}ms"
+        unset _df_prompt_started
+    fi
+    if [[ -n "${_df_shell_started:-}" ]]; then
+        ms=$(( (now - _df_shell_started) * 1000 ))
+        (( ms < ${DF_SHELL_LOG_MS:-1000} )) || _df_slow_log "shell-init ${ms}ms"
+        unset _df_shell_started
+    fi
+}
+# add-zle-hook-widget ships with zsh 5.3+; an older zsh (Amazon Linux 2 has
+# 5.0.2) just goes without the log.
+autoload -Uz is-at-least add-zle-hook-widget
+if is-at-least 5.3; then
+    add-zle-hook-widget line-init _df_prompt_drawn
+fi
+
+# ── fnm (fast node manager) ──────────────────────────────────────────
+FNM_PATH="$HOME/.local/share/fnm"
+if [[ -d "$FNM_PATH" ]]; then
+    export PATH="$FNM_PATH:$PATH"
+    eval "$(fnm env --use-on-cd --shell zsh)"
+fi
+# fnm prepends the active Node installation, which may contain an obsolete
+# global Codex. Restore the committed Node tool bundle as the final authority.
+[[ -d "$HOME/.npm-global/bin" ]] && export PATH="$HOME/.npm-global/bin:$PATH"
+
+# ── Rust ─────────────────────────────────────────────────────────────
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+
+# ── Zsh plugins (autosuggestions, syntax-highlighting) ───────────────
+# Self-heal: the loader is intentionally silent (the [[ -f ]] guards let the
+# same file run on Linux /usr/share + mac /opt/homebrew/share). But that hides
+# a missing package — e.g. a `brew bundle` that bailed early on a cask
+# signature failure never reaches these brews, and you get no green/red command
+# highlighting with zero error anywhere. Track misses and warn once, only on an
+# interactive TTY, so the next gap is visible instead of silent.
+# Search order adds ~/.local/share: a ROOTLESS install (any box without sudo)
+# git-clones the plugins there — /usr/share + homebrew are the packaged
+# locations, ~/.local/share is the no-root one. Checking all three means the
+# plugins load AND the "not installed" warning stays accurate everywhere.
+# Autosuggest binds its widgets once, at the first prompt (every plugin has
+# loaded by then), instead of re-binding them before every prompt (~6 ms each).
+ZSH_AUTOSUGGEST_MANUAL_REBIND=1
+_missing_zsh_plugins=()
+for plugin in zsh-autosuggestions/zsh-autosuggestions.zsh \
+              zsh-syntax-highlighting/zsh-syntax-highlighting.zsh; do
+    if [[ -f /usr/share/$plugin ]]; then
+        source /usr/share/$plugin 2>/dev/null
+    elif [[ -f /opt/homebrew/share/$plugin ]]; then
+        source /opt/homebrew/share/$plugin 2>/dev/null
+    elif [[ -n "$HOMEBREW_PREFIX" && -f "$HOMEBREW_PREFIX/share/$plugin" ]]; then
+        source "$HOMEBREW_PREFIX/share/$plugin" 2>/dev/null
+    elif [[ -f "$HOME/.local/share/$plugin" ]]; then
+        source "$HOME/.local/share/$plugin" 2>/dev/null
+    else
+        _missing_zsh_plugins+=("${plugin%%/*}")
+    fi
+done
+if [[ -n "$_missing_zsh_plugins" && -o interactive && -t 2 ]]; then
+    print -u2 "⚠ zsh plugins not installed: ${_missing_zsh_plugins[*]}"
+    if [[ "$OSTYPE" == darwin* ]]; then
+        print -u2 "  fix: brew install ${_missing_zsh_plugins[*]}"
+    else
+        print -u2 "  fix: sudo apt install ${_missing_zsh_plugins[*]} (or clone into ~/.local/share for a no-root box)"
+    fi
+fi
+unset _missing_zsh_plugins plugin
+
+# ── fzf (Ctrl+R history, Ctrl+T file finder) ─────────────────────────
+[[ -f ~/.fzf.zsh ]] && source ~/.fzf.zsh
+eval "$(fzf --zsh 2>/dev/null)"
+
+# ── zoxide (smart cd: z <partial>) ───────────────────────────────────
+eval "$(zoxide init zsh 2>/dev/null)"
+
+# ── SSH terminal-state restore ───────────────────────────────────────
+# A dead SSH session (laptop sleep, dropped Tailscale/SSM tunnel) kills the
+# connection before remote tmux can switch the LOCAL terminal back out of
+# the modes it enabled. Leftover mouse-tracking mode then spams SGR reports
+# ("35;140;1M...") into the prompt on every mouse move, and Ctrl-C can't
+# stop it. `reset` works but destroys scrollback. Instead, wrap ssh so the
+# matching mode-off sequences are emitted whenever ssh exits — cleanly or
+# via "Bad packet length / Connection corrupted".
+#
+# Chaining: Ghostty's shell integration defines its own ssh() wrapper
+# (terminfo install + COLORTERM forwarding), but LAZILY — inside
+# _ghostty_deferred_init at the first precmd, i.e. AFTER zshrc finishes.
+# Defining ssh() here directly would be silently clobbered at the first
+# prompt. So we install via a one-shot precmd hook registered after
+# Ghostty's: by the time it runs, Ghostty's ssh() exists (if it's going
+# to), and we rename it to _ssh_upstream and chain. On boxes without
+# Ghostty, we chain straight to command ssh.
+_ssh_restore_modes() {
+  # Only when stdout is a terminal — otherwise $(ssh host cmd), pipes, and
+  # scp-over-ssh batch calls would get escape bytes appended to their output.
+  [[ -t 1 ]] || return 0
+  # 1000/1002/1003 mouse variants, 1006 SGR mouse encoding, 2004 bracketed
+  # paste, 1049 alt screen, 25h show cursor, 0m reset colors
+  printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?2004l\e[?1049l\e[?25h\e[0m'
+  stty sane 2>/dev/null
+}
+
+_ssh_wrap_init() {
+  # Capture whatever ssh() already exists (Ghostty's wrapper) as the
+  # upstream we chain to — UNLESS it's already OUR wrapper. `source
+  # ~/.zshrc` re-registers this hook, and without the marker check the
+  # re-run would capture our own wrapper as _ssh_upstream, making the
+  # next ssh recurse forever ("maximum nested function level reached").
+  if (( $+functions[ssh] )) && [[ "${functions[ssh]}" != *_ssh_restore_modes* ]]; then
+    functions[_ssh_upstream]="${functions[ssh]}"
+  fi
+  ssh() {
+    if (( $+functions[_ssh_upstream] )); then
+      _ssh_upstream "$@"
+    else
+      command ssh "$@"
+    fi
+    local rc=$?
+    _ssh_restore_modes
+    return $rc
+  }
+  precmd_functions=(${precmd_functions:#_ssh_wrap_init})
+  unfunction _ssh_wrap_init
+}
+add-zsh-hook precmd _ssh_wrap_init
+
+# ── Locale guard (interactive self-heal) ─────────────────────────────
+# zshenv already forces a UTF-8 LANG on the way in, but a session reached by
+# a path that clobbers it AFTER zshenv (an old tmux server started pre-guard,
+# a transport that re-sets LANG late) can still land in C/ASCII and garble
+# tmux + Claude Code glyphs. If we detect a non-UTF-8 charmap on an interactive
+# shell, auto-apply the fix to THIS shell + the tmux server and print one
+# warning so the cause is visible (it is the locale, not TERM). Silent when fine.
+# zsh/langinfo reads this shell's charmap without the script's two forks (~8 ms):
+# the script runs only when that is not UTF-8, or the module is missing.
+zmodload zsh/langinfo 2>/dev/null
+if [[ ${langinfo[CODESET]:-} != (UTF-8|utf-8|utf8|UTF8) && -x "$HOME/.dotfiles/scripts/locale-guard" ]]; then
+  if ! "$HOME/.dotfiles/scripts/locale-guard" --quiet; then
+    eval "$("$HOME/.dotfiles/scripts/locale-guard" --fix 2>/dev/null)"
+  fi
+fi

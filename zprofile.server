@@ -1,0 +1,25 @@
+# ~/.zprofile: executed by zsh for login shells.
+# zsh reads .zprofile before .zshrc for login shells.
+
+# Add user bin directories to PATH
+if [[ -d "$HOME/bin" ]]; then
+    PATH="$HOME/bin:$PATH"
+fi
+if [[ -d "$HOME/.local/bin" ]]; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+if [[ -d "$HOME/.npm-global/bin" ]]; then
+    PATH="$HOME/.npm-global/bin:$PATH"
+fi
+
+# Rust
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+
+# Auto-cd into the main working checkout on an interactive login (a server is
+# often a dev box with one repo that is the work). Set DF_LOGIN_DIR in
+# ~/.zshenv.local (zshenv runs before this file; the identity's server.sh runs
+# after it). Skips non-interactive `ssh host 'cmd'` runs and machines without
+# that directory, so it stays harmless everywhere.
+if [[ -o interactive ]] && [[ "$PWD" == "$HOME" ]] && [[ -n "${DF_LOGIN_DIR:-}" ]] && [[ -d "$DF_LOGIN_DIR" ]]; then
+    cd "$DF_LOGIN_DIR"
+fi

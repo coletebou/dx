@@ -1,0 +1,15 @@
+# Minimal profile for non-zsh login shells (cron, sh, etc.)
+# Homebrew ahead of the system dirs that /etc/profile's path_helper (macOS) puts
+# first, so `bash -l` (the Drover daemon's LaunchAgent and the agents it starts,
+# scripts) finds Homebrew bash 5, not /bin/bash 3.2. Same prefixes as zshenv.
+for _brew_prefix in /home/linuxbrew/.linuxbrew "$HOME/homebrew" /opt/homebrew; do
+  # /home is an autofs mount on macOS: ~10 ms per lookup, even for a missing path.
+  case "${OSTYPE:-}:$_brew_prefix" in darwin*:/home/*) continue ;; esac
+  if [ -d "$_brew_prefix/bin" ]; then PATH="$_brew_prefix/bin:$_brew_prefix/sbin:$PATH"; fi
+done
+unset _brew_prefix
+if [ -d "$HOME/bin" ]; then PATH="$HOME/bin:$PATH"; fi
+if [ -d "$HOME/.local/bin" ]; then PATH="$HOME/.local/bin:$PATH"; fi
+if [ -d "$HOME/.npm-global/bin" ]; then PATH="$HOME/.npm-global/bin:$PATH"; fi
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+if [ -f "$HOME/.rokit/env" ]; then . "$HOME/.rokit/env"; fi

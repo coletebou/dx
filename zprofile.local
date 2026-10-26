@@ -1,0 +1,47 @@
+# ~/.zprofile: executed by zsh for login shells.
+# zsh reads .zprofile before .zshrc for login shells.
+
+# Add user bin directories to PATH
+if [[ -d "$HOME/bin" ]]; then
+    PATH="$HOME/bin:$PATH"
+fi
+if [[ -d "$HOME/.local/bin" ]]; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+
+# Rust
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+
+# npm global binaries
+export PATH="$HOME/.npm-global/bin:$PATH"
+
+# Homebrew
+export PATH="/opt/homebrew/bin:$PATH"
+
+# GNU coreutils + findutils (Mac only) — several dotfiles scripts use GNU-isms
+# like `xargs -d` and `date -d` that the BSD versions don't support. Brew
+# installs these as `gxargs`/`gdate`, but the gnubin paths expose them as plain
+# `xargs`/`date`. Must come AFTER macOS's path_helper in /etc/zprofile, which
+# re-orders PATH.
+if [[ -d /opt/homebrew/opt/coreutils/libexec/gnubin ]]; then
+    export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
+fi
+if [[ -d /opt/homebrew/opt/findutils/libexec/gnubin ]]; then
+    export PATH="/opt/homebrew/opt/findutils/libexec/gnubin:$PATH"
+fi
+
+# Homebrew lives in different places per machine: /opt/homebrew (Apple Silicon
+# with admin), /usr/local (Intel), or ~/homebrew (a user-local install on a
+# locked-down Mac with no sudo). This file is shared by every machine, so a
+# hardcoded prefix breaks whichever machine differs.
+for _brew in /opt/homebrew/bin/brew /usr/local/bin/brew "$HOME/homebrew/bin/brew"; do
+    if [[ -x "$_brew" ]]; then
+        eval "$("$_brew" shellenv)"
+        break
+    fi
+done
+unset _brew
+
+# The committed Node tool bundle is authoritative over Homebrew, fnm globals,
+# and standalone Codex launchers.
+export PATH="$HOME/.npm-global/bin:$PATH"

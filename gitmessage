@@ -1,0 +1,4 @@
+
+
+# Conventional Commits: <type>(<scope>): <summary>, e.g. "fix(tmux): keep the session row on reload".
+# Types: feat fix docs test refactor perf build ci chore. Lines starting with # are dropped.

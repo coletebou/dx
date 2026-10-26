@@ -1,0 +1,23 @@
+# ~/.aliases — profile-aware composer
+#
+# Sources base (universal) + role + identity layers in order of ascending
+# specificity. Later files override earlier ones on name collision.
+
+: "${DF_IDENTITY:=example}" "${DF_ROLE:=local}"
+
+# ── Base (universal ergonomics) ──────────────────────────────────────
+source ~/.dotfiles/base/aliases.sh
+
+# ── Role ─────────────────────────────────────────────────────────────
+source ~/.dotfiles/roles/$DF_ROLE/aliases.sh 2>/dev/null
+
+# OS-specific local bits (only meaningful for local role)
+if [[ "$DF_ROLE" == "local" ]]; then
+    [[ "$OSTYPE" == darwin* ]] && source ~/.dotfiles/roles/local/macos.sh 2>/dev/null
+    [[ "$OSTYPE" == linux*  ]] && source ~/.dotfiles/roles/local/linux.sh 2>/dev/null
+    [[ -d /mnt/c/Windows    ]] && source ~/.dotfiles/roles/local/wsl.sh 2>/dev/null
+fi
+
+# ── Identity ─────────────────────────────────────────────────────────
+source ~/.dotfiles/identities/$DF_IDENTITY/common.sh 2>/dev/null
+source ~/.dotfiles/identities/$DF_IDENTITY/$DF_ROLE.sh 2>/dev/null
