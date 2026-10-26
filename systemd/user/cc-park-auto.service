@@ -1,0 +1,9 @@
+[Unit]
+Description=Park idle Claude Code sessions in tmux (cc-park auto)
+
+[Service]
+Type=oneshot
+# Same log as the macOS LaunchAgent, so `cc-park auto status` reads it on both.
+ExecStart=/bin/sh -c 'mkdir -p "$HOME/.local/state/logs" && exec "$HOME/.dotfiles/plugins/session/skills/cc-park/bin/cc-park" auto >>"$HOME/.local/state/logs/cc-park-auto.log" 2>&1'
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Environment=CC_PARK_OWNER=YourName

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cc-park-auto</string>
+    <!-- Autopark: every 30 minutes, park the Claude Code sessions in tmux that
+         have been idle for 6 hours or more (IDLE_HOURS in cc-park). Each parked
+         pane keeps the session's last screen as text and its resume command; a
+         finished session's window is closed instead, its resume command kept in
+         `cc-park status`. `cc-park auto off` pauses this on one machine (it
+         survives reinstalls), `cc-park auto status` shows the last runs.
+         install.sh renders __HOME__ (launchd expands neither ~ nor $HOME). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.dotfiles/plugins/session/skills/cc-park/bin/cc-park</string>
+        <string>auto</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <!-- launchd does NOT inherit shell env: tmux and python3 live in Homebrew.
+         Add CC_PARK_OWNER here too if you set it in your shell. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/logs/cc-park-auto.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/logs/cc-park-auto.log</string>
+</dict>
+</plist>

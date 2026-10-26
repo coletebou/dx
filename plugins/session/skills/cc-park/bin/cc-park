@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+"""Park idle Claude Code sessions that live in tmux panes.
+
+A parked session keeps its tmux window, name and scrollback. Claude exits
+through its own /exit, which also stops its MCP and language servers. The pane
+then shows the session's last screen as plain text, with a shell prompt below
+it holding the exact resume command, typed but not run. Press Enter in the pane
+to bring the conversation back.
+
+  cc-park list   [--idle H] [--only PID|PANE,...] [--no-close]              what would be parked or closed, and why the rest are skipped
+  cc-park park   [--idle H] [--only PID|PANE,...] [--limit N] [--no-close]  park them
+  cc-park status                                                            parked and closed sessions, and whether each was resumed
+  cc-park auto   [--idle H] [--no-close]                                    the scheduled run: park sessions idle 6 h or more
+  cc-park auto   off | on | status                                          pause or unpause the scheduled run on this machine
+
+A session is left alone when stopping it could lose something: it is busy or
+was active within --idle hours (default 6), it has a live schedule (cron,
+pending wakeup, recent monitor), it has child processes other than its MCP and
+language-server helpers, its pane shows a dialog or a half-typed prompt, it is
+the pane on screen in an attached client, its pane is in copy mode, its pane or
+window sets @cc-park-keep (unless it is named with --only), or its launch flags
+are ones this tool does not know how to replay.
+
+A finished session's window is closed instead of parked in place. Finished means its
+last turn ended with a reply that asks nothing and waits on nothing, and Drover reads
+it the same way; without the drover CLI, or when anything is unclear, the session is
+parked in place as before. The window must be its pane alone, shown in no other tmux
+session, not the last window of its session, with no other process in the pane.
+The last screen and the resume command are kept either way, and `cc-park status`
+lists closed sessions with their resume command. --no-close, or @cc-park-close off
+on a pane or window (-gw for every window), keeps the window.
+"""
+
+import argparse
+import calendar
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or HOME / '.claude')
+SESSIONS_DIR = CONFIG_DIR / 'sessions'
+PROJECTS_DIR = CONFIG_DIR / 'projects'
+STATE_DIR = Path(os.environ.get('XDG_STATE_HOME') or HOME / '.local' / 'state') / 'cc-park'
+LEDGER = STATE_DIR / 'parked.jsonl'
+SCREENS_DIR = STATE_DIR / 'screens'
+# One park run at a time: two runs that gathered the same session would both
+# type /exit, and the second would land at the shell prompt.
+LOCK = STATE_DIR / 'park.lock'
+# The scheduled run (launchagents/com.cc-park-auto.plist on macOS, systemd/user/cc-park-auto.timer
+# on Linux). The flag file pauses it on one machine and survives reinstalls; the log path matches
+# both templates.
+AUTO_OFF = STATE_DIR / 'auto.off'
+AUTO_LABEL = 'com.cc-park-auto'
+AUTO_TIMER = 'cc-park-auto.timer'
+AUTO_LOG = HOME / '.local' / 'state' / 'logs' / 'cc-park-auto.log'
+# Hours idle before a session is parked: the default for list, park and the scheduled run.
+IDLE_HOURS = 6.0
+# Set on a pane or window (tmux set -p|-w @cc-park-keep on) to keep its session
+# out of bulk parking, scheduled or not. Naming it with --only still parks it.
+KEEP_OPTION = '@cc-park-keep'
+# Set to off on a pane or window (tmux set -p|-w @cc-park-close off; -gw for every
+# window) to park its finished session in place instead of closing the window.
+CLOSE_OPTION = '@cc-park-close'
+# How long to wait for `drover op sessions.lastReply` (about 0.3 s on a Mac, 2026-10-26).
+DROVER_TIMEOUT = 20
+# How much of a transcript's end is read to find its last turn.
+TURN_TAIL = 1 << 20
+# Words a reply uses while it still waits on someone, or hands them something to do. A
+# window closes only when its session's final reply has none of them and no question mark,
+# so a session waiting on an answer stays where it can be seen. Drover counts a reply as
+# finished unless its last line ends in "?", which let "Waiting on <the owner>. Everything
+# left needs his yes: ..." through; missing a finished session costs only a window.
+# Read by hand against 484 real transcripts: the 83 that pass are handoffs, reports and
+# answers; none asks or waits on anything, though a few leave the owner a step.
+WAITING = re.compile(r"""
+    \bwait(?:s|ing|ed)?\b | \bawait(?:s|ing|ed)?\b | \bon\s+hold\b | \bblocked\b | \bcheck\s+back\b
+  | \bneeds?\s+(?:from\s+)?(?:you|your|his|her|their|approval|review|sign-?off|an?\s+(?:answer|decision|reply|review))\b
+  | \bfrom\s+you\b | \byours\b | \b(?:is|are)\s+(?:his|hers|theirs)\b
+  | \bup\s+to\s+you\b | \bfor\s+you\s+to\b
+  | \b(?:your|his|her|their)\s+(?:yes|go|ok|okay|answers?|call|choice|decisions?|approval|word|input|
+        confirmation|go-ahead|reply|review|read|thoughts|feedback|steps?|turn|side|move|part)\b
+  | \b(?:your|his|her|their)\s+[\w-]+\s+(?:yes|answers?|decisions?|approval|confirmation|go-ahead|reply|feedback)\b
+  | \blet\s+me\s+know\b | \bsay\s+(?:so|yes|the\s+word|which)\b | \btell\s+me\s+(?:if|whether|which|when)\b
+  | \b(?:if|when|once)\s+you(?:['’]d|['’]re|\s+are)?\s+(?:want|like|prefer|agree|approve|confirm|decide|reply|
+        answer|say|ready|back)\b
+  | \byou(?:['’]ll|\s+will)?\s+(?:need|have)\s+to\b
+  | \b(?:has|have|is|are)(?:\s+not|n['’]t)\s+(?:yet\s+)?(?:arrived|answered|replied|landed|merged|come)\b
+  | \b(?:should|shall)\s+I\b | \bwant\s+me\s+to\b | \bI['’]ll\b | \bI\s+will\b
+  | \bstill\s+(?:pending|open|needs?|needed|to\s+do|left)\b | \bnext\s+steps?\b
+""", re.I | re.X)
+# Your own name(s), comma-separated (CC_PARK_OWNER="Alex,Al"). A final reply that names you
+# ("Waiting on Alex", "Alex's call") most likely waits on you, so its window stays.
+_OWNER_NAMES = [n.strip() for n in os.environ.get('CC_PARK_OWNER', '').split(',') if n.strip()]
+OWNER = re.compile(r'\b(?:' + '|'.join(map(re.escape, _OWNER_NAMES)) + r')\b', re.I) if _OWNER_NAMES else None
+
+# Child processes a session may have that die with it and hold no work: MCP
+# servers (and the npm wrapper npx leaves around them) and language servers.
+HELPER_MARKERS = (
+    'pyright-langserver', 'typescript-language-server', 'tsserver.js', 'typingsInstaller.js',
+    '@playwright/mcp', 'playwright-mcp', 'drover mcp', 'apxw mcp', 'sourcekit-lsp', 'context7',
+)
+# Claude Code starts `caffeinate -i -t 300` after each turn to keep the Mac awake for five
+# minutes (seen 2026-10-22). Only that exact form: a command the session runs sits under a
+# shell, and `caffeinate -i -t 900 make` keeps its trailing command, so both still count.
+CLAUDE_CAFFEINATE = re.compile(r'^(/usr/bin/)?caffeinate -i -t \d+$')
+
+# Launch flags replayed on resume, flags dropped because --resume replaces them,
+# and nothing else: an unknown flag means the session is skipped, not guessed at.
+KEEP_BARE = {'--dangerously-skip-permissions', '--allow-dangerously-skip-permissions',
+             '--strict-mcp-config', '--verbose', '--ide', '--chrome', '--no-chrome'}
+KEEP_VALUE = {'--model', '--effort', '--settings', '--permission-mode', '--fallback-model',
+              '--plugin-dir', '--agent', '-n', '--name'}
+DROP_BARE = {'-c', '--continue', '--fork-session'}
+DROP_VALUE = {'--session-id'}
+RESUME_FLAGS = {'-r', '--resume'}
+SESSION_REF = re.compile(r'^[0-9a-f]{8}-[0-9a-f-]{27,}$|^[0-9a-f]{5,}$', re.I)
+
+# Screen classification, ported from Drover (formerly apx-web) web/core/tmux.js classifyScreen so the
+# two tools agree on what a dialog is.
+OPTION_LIST = re.compile(r'^\s*(❯|>|›)?\s*\d\.\s+\S', re.M)
+DIALOG_PATTERNS = [re.compile(p, re.I) for p in (
+    r'Do you want to (proceed|allow|run|make this edit|create|continue)', r'Run a dynamic workflow\?',
+    r'Allow .{1,80} to (run|read|write|edit)', r'\(y/n\)', r'\[Y/n\]', r'\[y/N\]', r'Enter to confirm',
+    r'Select an option', r'Press Enter to continue', r'Would you like to')]
+YES_NO = re.compile(r'\(y/n\)|\[Y/n\]|\[y/N\]', re.I)
+HELD = re.compile(r'Held message from another session|Another Claude session sent a message', re.I)
+CLAUDE_IDLE = re.compile(r'\? for shortcuts|bypass permissions on|accept edits on|plan mode on', re.I)
+# The input box's borders; a named session shows its name in the top one ("─── name ─").
+RULE = re.compile(r'^\s*─{20,}(\s+\S.*\s+─+)?\s*$')
+PROMPT_ENDS = ('❯', '$', '%', '#', '>')
+WRAPPER_SHELL = re.compile(r'^-?\S*\b(zsh|bash|sh)\s+(-\w+\s+)*-\w*c\w*\s')
+# Claude's own lines above its input box (the /clear hint, the effort indicator): interface, not conversation.
+BOX_HINT = re.compile(r'new task\? /clear to save|Restart to update|· /effort$')
+
+
+@dataclass
+class Session:
+    pid: int
+    session_id: str
+    cwd: str
+    name: str
+    status: str
+    args: str
+    last_active: float
+    pane_id: str = ''
+    target: str = ''
+    window: str = ''
+    auto_rename: bool = False
+    named: bool = False  # picked with --only, which overrides @cc-park-keep
+    dies_with_claude: bool = False
+    mem_mb: float = 0.0
+    resume: str = ''
+    notes: list = field(default_factory=list)
+    skip: str = ''
+    close: bool = False   # finished, so its window closes once it is parked
+    close_why: str = ''   # why its window stays instead ('' when closing is off for this run)
+    closed: bool = False  # park() closed its window
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def tmux(*args):
+    return run(['tmux', *args])
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def process_table():
+    table = {}
+    for line in run(['ps', '-ww', '-Ao', 'pid=,ppid=,args=']).stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            table[int(parts[0])] = (int(parts[1]), parts[2])
+    return table
+
+
+def descendants(pid, table):
+    kids = {}
+    for p, (pp, _) in table.items():
+        kids.setdefault(pp, []).append(p)
+    out, stack = [], list(kids.get(pid, []))
+    while stack:
+        p = stack.pop()
+        out.append(p)
+        stack.extend(kids.get(p, []))
+    return out
+
+
+def linux_footprints(proc=Path('/proc')):
+    """VmRSS + VmSwap per pid in MB: resident plus swapped-out pages, the closest
+    Linux match for macOS's physical footprint. Kernel threads have neither (0)."""
+    out = {}
+    for status in proc.glob('[0-9]*/status'):
+        kb = 0
+        try:
+            for line in status.read_text().splitlines():
+                if line.startswith(('VmRSS:', 'VmSwap:')):
+                    kb += int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        out[int(status.parent.name)] = kb / 1024
+    return out
+
+
+def footprints():
+    """Memory per pid in MB. macOS: top's MEM column (physical footprint, compressed
+    pages included). Linux has no `top -l`, so read /proc instead."""
+    if sys.platform.startswith('linux'):
+        return linux_footprints()
+    out = {}
+    for line in run(['top', '-l', '1', '-n', '5000', '-stats', 'pid,mem']).stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        raw = parts[1].rstrip('+-')
+        num, unit = float(re.sub(r'[^0-9.]', '', raw) or 0), raw[-1:].upper()
+        out[int(parts[0])] = {'G': num * 1024, 'M': num, 'K': num / 1024}.get(unit, num / 1048576)
+    return out
+
+
+def parse_launch(args):
+    """Split a claude command line into (flags to replay, notes); ValueError when unsure.
+
+    `ps` loses quoting, so only simple flags are trusted. A positional prompt is
+    dropped (replaying it would send it again) and must come after every flag.
+    """
+    tokens = args.split()
+    if not tokens or not re.search(r'(^|/)claude$|/claude/versions/[^/]+$', tokens[0]):
+        raise ValueError('not a claude command line')
+    kept, notes, i = [], [], 1
+    while i < len(tokens):
+        tok = tokens[i]
+        flag, eq, inline = tok.partition('=')
+        if not tok.startswith('-'):
+            if any(t.partition('=')[0] in KEEP_BARE | KEEP_VALUE | RESUME_FLAGS for t in tokens[i:]):
+                raise ValueError('a flag follows the initial prompt; resume this one by hand')
+            notes.append('initial prompt dropped')
+            break
+        if flag in KEEP_BARE and not eq:
+            kept.append(flag)
+        elif flag in KEEP_VALUE:
+            value = inline if eq else (tokens[i + 1] if i + 1 < len(tokens) else None)
+            if not value or (not eq and value.startswith('-')):
+                raise ValueError(f'{flag} has no value')
+            kept += [flag, value]
+            i += 0 if eq else 1
+        elif flag in DROP_BARE and not eq:
+            notes.append(f'{flag} dropped')
+        elif flag in DROP_VALUE:
+            i += 0 if eq else 1
+            notes.append(f'{flag} dropped')
+        elif flag in RESUME_FLAGS:
+            if not eq and i + 1 < len(tokens) and SESSION_REF.match(tokens[i + 1]):
+                i += 1
+            notes.append('old --resume dropped')
+        else:
+            raise ValueError(f'unrecognised flag {flag}')
+        i += 1
+    return kept, notes
+
+
+def settings_problem(value, cwd):
+    """Why a --settings value can't be replayed, or '' when it can.
+
+    Claude takes a file path or inline JSON. Some launchers pass inline JSON such
+    as {"env":{"CLAUDE_CODE_USE_MANTLE":"1"}}, which survives `ps` as one token and
+    replays quoted. JSON with spaces arrives split, so a fragment that does not
+    parse is refused rather than guessed at. A relative path resolves against the
+    session's own directory, where the resume command runs.
+    """
+    if value.startswith('{'):
+        try:
+            json.loads(value)
+        except ValueError:
+            return 'its inline --settings is not one JSON object (ps may have split it)'
+        return ''
+    return '' if (Path(cwd) / value).exists() else 'its --settings file no longer exists'
+
+
+def resume_command(kept, session_id, cwd):
+    argv = ['claude', *kept, '--resume', session_id]
+    return f'cd {shlex.quote(cwd)} && ' + ' '.join(shlex.quote(a) for a in argv)
+
+
+def input_box(lines):
+    rules = [i for i, line in enumerate(lines) if RULE.match(line)]
+    if len(rules) < 2:
+        return None
+    return lines[rules[-2] + 1:rules[-1]]
+
+
+def screen_state(text):
+    """('idle-empty' | 'dialog' | 'busy' | 'typed' | 'unknown', reason) for a captured pane."""
+    lines = [line.rstrip() for line in text.split('\n')][-40:]
+    tail = '\n'.join(lines)
+    question = any(p.search(tail) for p in DIALOG_PATTERNS)
+    options = bool(OPTION_LIST.search(tail)) and bool(re.search(r'❯|Esc to cancel|Enter to (select|confirm)', tail, re.I))
+    if YES_NO.search(tail) or HELD.search(tail) or (question and options) \
+            or (options and re.search(r'Esc to cancel', tail, re.I)):
+        return 'dialog', 'a dialog or permission prompt is on screen'
+    if re.search(r'esc to interrupt', tail, re.I):
+        return 'busy', 'the session is working'
+    # A turn can end while an agent it backgrounded keeps working, and the main
+    # transcript then goes quiet. /exit on such a session only moves it to the
+    # background, so it would leave the pane without a resume command.
+    if re.search(r'waiting for \d+ background (?:agent|task)s?', tail, re.I):
+        return 'busy', 'a background agent is still running'
+    if not CLAUDE_IDLE.search(tail):
+        return 'unknown', 'no Claude prompt footer on screen'
+    box = input_box(lines)
+    if box is None:
+        return 'unknown', 'no input box on screen'
+    if [b.strip() for b in box] != ['❯']:
+        return 'typed', 'the prompt has unsent text'
+    return 'idle-empty', 'idle at an empty prompt'
+
+
+def typed_at_prompt(text, command):
+    """True when the prompt ends with `command`, even if the shell wrapped it over lines.
+    Whitespace is ignored on both sides: zsh breaks a long line itself, so tmux does not join
+    it back, and a break that falls on a space leaves that space as trailing blank."""
+    lines = [line.rstrip() for line in text.split('\n') if line.strip()]
+    return re.sub(r'\s+', '', ''.join(lines[-8:])).endswith(re.sub(r'\s+', '', command))
+
+
+def shell_ready(text):
+    """True once a shell prompt sits below Claude's last frame, not inside its input box."""
+    lines = [line.rstrip() for line in text.split('\n') if line.strip()]
+    if not lines or not lines[-1].endswith(PROMPT_ENDS):
+        return False
+    return len(lines) < 2 or not RULE.match(lines[-2])
+
+
+def screen_body(text):
+    """The conversation part of a captured Claude screen: what sits above its input box,
+    without Claude's hint lines, blank edges, or the blank rows that pad a short one."""
+    lines = [line.rstrip() for line in text.split('\n')]
+    rules = [i for i, line in enumerate(lines) if RULE.match(line)]
+    if len(rules) >= 2:
+        lines = lines[:rules[-2]]
+    while lines and (not lines[-1] or BOX_HINT.search(lines[-1])):
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return [line for i, line in enumerate(lines) if line or (i and lines[i - 1])]
+
+
+def rows(line, width):
+    """Terminal rows `line` takes at `width` columns (wide characters count twice)."""
+    cells = sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in line if not unicodedata.combining(c))
+    return max(1, -(-cells // max(width, 1)))
+
+
+def fit(lines, height, width):
+    """The last lines of `lines` that fit in `height` rows."""
+    kept, used = [], 0
+    for line in reversed(lines):
+        used += rows(line, width)
+        if used > height:
+            break
+        kept.append(line)
+    return kept[::-1]
+
+
+def parked_screen(lines, last_active, width, height, command='', now=None):
+    """What the pane shows once its session is parked: the last screen as plain text between
+    two markers, sized so the prompt and the typed `command` still fit below it. It starts by
+    clearing the pane (tmux's scroll-on-clear moves Claude's final frame into the history),
+    joins lines with CR LF so they land right whatever the tty's output modes are, and ends
+    without one: the shell's own newline after Ctrl-C puts its prompt on the next line. The
+    markers never look like Claude's input-box rules or a shell prompt."""
+    parked, active = (time.strftime('%a %H:%M', time.localtime(ts))
+                      for ts in (time.time() if now is None else now, last_active))
+    head = '── last screen before cc-park parked this session ──'
+    foot = f'── parked {parked}, last active {active} · press Enter to resume ──'
+    # Two markers, the prompt's blank and info lines, and the prompt line holding the command.
+    reserve = 2 + 2 + rows('❯ ' + command, width)
+    body = fit(lines, max(1, height - reserve), width)
+    return '\x1b[H\x1b[2J' + '\r\n'.join([head, *body, foot])
+
+
+def show_screen(pane_id, lines, last_active, command=''):
+    """Print `lines` in the pane as plain text, then Ctrl-C so the shell draws a fresh prompt
+    below them. Writes to the pane's tty (output, not keystrokes), so nothing reaches the
+    shell's input or history. Returns False when there was nothing to show or no tty."""
+    info = tmux('display', '-p', '-t', pane_id, '#{pane_tty}\t#{pane_width}\t#{pane_height}').stdout.strip().split('\t')
+    if not lines or len(info) != 3:
+        return False
+    tty, width, height = info
+    if not tty.startswith('/dev/') or not width.isdigit() or not height.isdigit():
+        return False
+    data = parked_screen(lines, last_active, int(width), int(height), command).encode()
+    try:
+        fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
+        try:
+            while data:
+                data = data[os.write(fd, data):]
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    tmux('send-keys', '-t', pane_id, 'C-c')
+    return True
+
+
+def transcript_paths(session_id):
+    if not session_id:
+        return [], []
+    return list(PROJECTS_DIR.glob(f'*/{session_id}.jsonl')), list(PROJECTS_DIR.glob(f'*/{session_id}/subagents/*.jsonl'))
+
+
+def parse_ts(value):
+    try:
+        return float(calendar.timegm(time.strptime(value[:19], '%Y-%m-%dT%H:%M:%S')))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def last_entry_ts(path, window=65536):
+    """Timestamp of the newest transcript entry. File mtime is not used: live
+    sessions' transcripts get their mtime bumped with no new entries."""
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - window))
+            lines = handle.read().decode(errors='ignore').split('\n')
+    except OSError:
+        return 0.0
+    for line in reversed(lines):
+        try:
+            ts = parse_ts(json.loads(line).get('timestamp'))
+        except (ValueError, AttributeError):
+            continue
+        if ts:
+            return ts
+    return 0.0
+
+
+def last_activity(session_id, status_updated_ms):
+    """When a session last did anything: its newest transcript entry (main or subagent) or its
+    last status change (statusUpdatedAt, in ms), whichever is later."""
+    main, subs = transcript_paths(session_id)
+    return max([(status_updated_ms or 0) / 1000, *map(last_entry_ts, main + subs)])
+
+
+def turn_pending(path, window=TURN_TAIL):
+    """Why a session's last turn may still want something, or '' when it ended with a reply that
+    asks nothing and waits on nothing. The last user or assistant entry has to be an assistant
+    reply that ended normally (stop_reason end_turn, not an API error), so an interrupted turn, a
+    tool call or AskUserQuestion with no result, a slash command's output and a stop hook's
+    feedback all count as not finished. The reply read is the turn's final one, everything after
+    its last tool result: the narration before that ("Let me wait for CI", "Why did it fail?")
+    asks the user nothing."""
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            start = max(0, handle.tell() - window)
+            handle.seek(start)
+            lines = handle.read().decode(errors='ignore').split('\n')[1 if start else 0:]
+    except OSError:
+        return 'its transcript could not be read'
+    turn = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get('type') in ('user', 'assistant'):
+            turn.append(entry)
+    last = turn[-1] if turn else {}
+    if last.get('type') != 'assistant' or last.get('isApiErrorMessage') \
+            or (last.get('message') or {}).get('stop_reason') != 'end_turn':
+        return 'its last turn did not end with a finished reply'
+    texts = []
+    for entry in reversed(turn):
+        if entry['type'] != 'assistant':
+            break  # a tool result or the prompt: the final reply starts after it
+        content = (entry.get('message') or {}).get('content')
+        if isinstance(content, str):
+            texts.append(content)
+        else:
+            texts += [str(b.get('text') or '') for b in content or [] if isinstance(b, dict) and b.get('type') == 'text']
+    return reply_pending(texts[::-1])
+
+
+def reply_pending(texts):
+    """Why a final reply looks unfinished (a question mark, or a word from WAITING), or ''. Code,
+    inline code and links are left out: a ternary or a query string asks nothing."""
+    prose = re.sub(r'```.*?```', ' ', '\n'.join(texts), flags=re.S)
+    prose = re.sub(r'https?://\S+', ' ', re.sub(r'`[^`\n]*`', ' ', prose))
+    if not prose.strip():
+        return 'its last reply has no text'
+    if '?' in prose or '？' in prose:
+        return 'its last reply asks something'
+    match = WAITING.search(prose) or (OWNER.search(prose) if OWNER else None)
+    return f'its last reply waits on something ("{" ".join(match.group(0).split())}")' if match else ''
+
+
+def drover_pending(session_id):
+    """'' when Drover also reads the session as finished, else why not. Drover looks at the same
+    transcript and at the pane (a dialog, a held peer message, an unanswered AskUserQuestion).
+    No drover CLI, a failed call, or a reply about any other session all count as not finished."""
+    exe = shutil.which('drover')
+    if not exe:
+        return 'drover is not installed, so nothing confirms it finished'
+    try:
+        out = subprocess.run([exe, 'op', 'sessions.lastReply', json.dumps({'id': session_id})],
+                             capture_output=True, text=True, timeout=DROVER_TIMEOUT)
+        reply = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        reply = None
+    if not isinstance(reply, dict) or reply.get('id') != session_id or reply.get('engine') != 'claude' \
+            or not str(reply.get('text') or '').strip() or not isinstance(reply.get('ask'), dict):
+        return 'drover could not read its last reply'
+    ask = reply['ask']
+    return '' if ask.get('kind') == 'finished' else f"drover says it {ask.get('label') or ask.get('kind') or 'is not finished'}"
+
+
+def live_schedule(paths, now):
+    """Why the session's own scheduler still matters, or '' when nothing is pending."""
+    crons, wake_until, last_monitor = 0, 0.0, 0.0
+    for path in paths:
+        try:
+            handle = open(path, errors='ignore')
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                if '"tool_use"' not in line or not re.search(r'"(ScheduleWakeup|CronCreate|CronDelete|Monitor)"', line):
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                ts = parse_ts(entry.get('timestamp'))
+                for block in (entry.get('message') or {}).get('content') or []:
+                    if not isinstance(block, dict) or block.get('type') != 'tool_use':
+                        continue
+                    name, args = block.get('name'), block.get('input') or {}
+                    if name == 'CronCreate':
+                        crons += 1
+                    elif name == 'CronDelete':
+                        crons = max(0, crons - 1)
+                    elif name == 'ScheduleWakeup':
+                        wake_until = 0.0 if args.get('stop') else max(wake_until, ts + float(args.get('delaySeconds') or 0))
+                    elif name == 'Monitor':
+                        last_monitor = max(last_monitor, ts)
+    if crons:
+        return 'it has a cron job'
+    if wake_until > now:
+        return 'it has a pending wakeup'
+    if last_monitor > now - 48 * 3600:
+        return 'it ran a monitor in the last 48 h'
+    return ''
+
+
+# One format for the gather snapshot and for the re-read just before a pane gets keys.
+PANE_FORMAT = '\t'.join((
+    '#{pane_pid}', '#{pane_id}', '#{session_name}:#{window_index}.#{pane_index}', '#{window_name}',
+    '#{automatic-rename}', '#{pane_active}#{window_active}', '#{session_attached}', '#{pane_in_mode}',
+    '#{pane_synchronized}', '#{' + KEEP_OPTION + '}', '#{window_panes}', '#{window_linked}', '#{session_windows}',
+    '#{' + CLOSE_OPTION + '}'))
+
+
+def pane_fields(line):
+    pid, pane_id, target, window, auto, active, attached, in_mode, synced, keep, panes, linked, windows, close = \
+        line.split('\t')
+    # A dead pane (remain-on-exit) has an empty #{pane_pid} (tmux 3.8); no session lives in it.
+    return int(pid or 0), dict(pane_id=pane_id, target=target, window=window, auto=auto == '1',
+                          on_screen=active == '11' and int(attached or 0) > 0, in_mode=in_mode == '1',
+                          synchronized=synced == '1', keep=keep.strip().lower() not in ('', '0', 'off', 'no', 'false'),
+                          panes=int(panes or 0), linked=linked == '1', session_windows=int(windows or 0),
+                          close_off=close.strip().lower() in ('0', 'off', 'no', 'false'))
+
+
+def tmux_panes():
+    return dict(pane_fields(line) for line in tmux('list-panes', '-a', '-F', PANE_FORMAT).stdout.splitlines())
+
+
+def pane_now(pane_id):
+    """One pane's fields as they are now, or None when it is gone. tmux 3.8 answers `display -t`
+    for a pane that no longer exists with exit 0 and empty fields, so its id has to come back."""
+    out = tmux('display', '-p', '-t', pane_id, PANE_FORMAT)
+    try:
+        pane = pane_fields(out.stdout.rstrip('\n'))[1] if out.returncode == 0 else None
+    except ValueError:
+        return None
+    return pane if pane and pane['pane_id'] == pane_id else None
+
+
+def pane_skip(pane, named):
+    """Why a pane must not get keys, or ''. park() asks again just before sending any: during a
+    long run the user can switch to a queued pane, scroll it into copy mode or mark it kept."""
+    if pane['keep'] and not named:
+        return f'kept: {KEEP_OPTION} is set on its pane or window'
+    if pane['on_screen']:
+        return 'its pane is on screen right now'
+    if pane['in_mode']:
+        # Keys sent to a pane in copy mode drive copy mode: "/exit" would start a search.
+        return 'its pane is in copy mode'
+    if pane['synchronized']:
+        # tmux copies every key sent to such a pane to the other panes of its window.
+        return 'its window has synchronize-panes on, so keys would reach every pane in it'
+    return ''
+
+
+def window_problem(pane):
+    """Why a pane's window must stay open once its session is parked, or ''. Closing kills the pane,
+    which closes the window only when the pane is all it holds. A window linked into another
+    session would vanish from that one too, and the last window of a session would end the
+    session, which other tools open new windows in."""
+    if pane['close_off']:
+        return f'{CLOSE_OPTION} is off on its pane or window'
+    if pane['keep']:
+        return f'{KEEP_OPTION} is set on its pane or window'
+    if pane['panes'] != 1:
+        return 'its window has other panes'
+    if pane['linked']:
+        return 'its window is also in another tmux session'
+    if pane['session_windows'] < 2:
+        return 'it is the last window of its tmux session'
+    return ''
+
+
+def close_verdict(s, pane, others, main):
+    """'' when a parkable session is finished and its window can close, else why the window stays.
+    The cheap checks go first, so Drover is only asked about a session that passed the rest."""
+    why = window_problem(pane)
+    if not why and others:
+        why = 'its pane runs other processes'
+    if not why and len(main) != 1:
+        why = 'more than one transcript has its id'
+    return why or turn_pending(main[0]) or drover_pending(s.session_id)
+
+
+def pane_processes(pane_id):
+    """What killing a pane would also stop: the processes under its own one (its shell) and any other
+    process on its terminal. A dead pane has none: when its process exited, its terminal was hung up."""
+    info = tmux('display', '-p', '-t', pane_id, '#{pane_dead}\t#{pane_pid}\t#{pane_tty}').stdout.rstrip('\n').split('\t')
+    if len(info) != 3:
+        return ['unknown']
+    dead, pid, tty = info
+    if dead == '1':
+        return []
+    if not pid.isdigit() or not tty.startswith('/dev/'):
+        return ['unknown']
+    on_tty = {int(p) for p in run(['ps', '-t', tty[len('/dev/'):], '-o', 'pid=']).stdout.split() if p.isdigit()}
+    return sorted((set(descendants(int(pid), process_table())) | on_tty) - {int(pid)})
+
+
+def close_window(s):
+    """Kill a parked session's pane, which closes its window, once claude has exited. Returns '' when
+    it closed, else why it stays. Checked again first: the user may have switched to the window,
+    and the pane must hold nothing but its shell (or be dead)."""
+    pane = pane_now(s.pane_id)
+    if pane is None:
+        return 'its pane is gone'
+    why = pane_skip(pane, s.named) or window_problem(pane)
+    if why:
+        return why
+    # A shell drawing its prompt runs short-lived helpers (git, the prompt itself); let them finish.
+    if not wait(lambda: not pane_processes(s.pane_id), 5):
+        return 'its pane still runs other processes'
+    tmux('kill-pane', '-t', s.pane_id)
+    return '' if pane_now(s.pane_id) is None else 'tmux did not close it'
+
+
+def capture(pane_id, history=0, join=False):
+    args = ['capture-pane', '-p', '-t', pane_id] + (['-J'] if join else []) + (['-S', f'-{history}'] if history else [])
+    return tmux(*args).stdout
+
+
+def gather(idle_hours, only, close=True):
+    now = time.time()
+    table, panes, mem = process_table(), tmux_panes(), footprints()
+    sessions = []
+    for path in sorted(SESSIONS_DIR.glob('*.json')):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        pid = data.get('pid')
+        if pid not in table or 'claude' not in table[pid][1] or data.get('kind', 'interactive') != 'interactive':
+            continue
+        main, _ = transcript_paths(data.get('sessionId', ''))
+        s = Session(pid=pid, session_id=data.get('sessionId', ''), cwd=data.get('cwd', ''), name=data.get('name') or '',
+                    status=data.get('status', '?'), args=table[pid][1],
+                    last_active=last_activity(data.get('sessionId', ''), data.get('statusUpdatedAt')))
+        tree = descendants(pid, table)
+        s.mem_mb = mem.get(pid, 0) + sum(mem.get(p, 0) for p in tree)
+        walker, hops, chain = pid, 0, []
+        while walker and walker > 1 and walker not in panes and hops < 25:
+            chain.append(walker)
+            walker, hops = table.get(walker, (0, ''))[0], hops + 1
+        pane = panes.get(walker)
+        if pane:
+            s.pane_id, s.target, s.window, s.auto_rename = pane['pane_id'], pane['target'], pane['window'], pane['auto']
+            # The pane closes (or goes dead) when claude exits if claude is the pane's
+            # own process or its shell was only a `zsh -c "..."` wrapper.
+            s.dies_with_claude = walker == pid or bool(WRAPPER_SHELL.match(table.get(walker, (0, ''))[1]))
+        if only and not ({str(pid), s.target, s.pane_id} & only):
+            continue
+        s.named = bool(only)
+        pane_why = pane_skip(pane, s.named) if pane else ''
+        idle = (now - s.last_active) / 3600
+        workers = [table[p][1] for p in tree
+                   if not any(m in table[p][1] for m in HELPER_MARKERS) and not CLAUDE_CAFFEINATE.match(table[p][1])]
+        if s.status != 'idle':
+            s.skip = f'status is {s.status}'
+        elif idle < idle_hours:
+            s.skip = f'active {idle:.1f} h ago'
+        elif not main:
+            # A session that never got a prompt has no <id>.jsonl (at most its
+            # SessionStart hook output under <id>/tool-results/), so `--resume`
+            # would only print "No conversation found" (seen 2026-10-15).
+            s.skip = 'nothing to resume: it never saved a conversation'
+        elif not s.pane_id:
+            s.skip = 'not in a tmux pane'
+        elif pane_why:
+            s.skip = pane_why
+        elif workers:
+            s.skip = 'has a running child: ' + os.path.basename(workers[0].split()[0])
+        else:
+            s.skip = live_schedule(main, now)
+        if not s.skip:
+            try:
+                kept, s.notes = parse_launch(s.args)
+                s.resume = resume_command(kept, s.session_id, s.cwd)
+                problems = [settings_problem(kept[i + 1], s.cwd) for i, f in enumerate(kept) if f == '--settings']
+                s.skip = next((p for p in problems if p), '')
+            except ValueError as exc:
+                s.skip = str(exc)
+        if not s.skip:
+            state, why = screen_state(capture(s.pane_id))
+            s.skip = '' if state == 'idle-empty' else 'screen: ' + why
+        if not s.skip and close:
+            # Everything else under the pane's own process (not this claude, its helpers or the
+            # wrappers between them): closing the window would stop that too.
+            mine = {pid, *tree, *chain}
+            others = [p for p in descendants(walker, table) if p not in mine]
+            s.close_why = close_verdict(s, pane, others, main)
+            s.close = not s.close_why
+        sessions.append(s)
+    return sessions
+
+
+def wait(predicate, seconds, step=0.25):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(step)
+    return predicate()
+
+
+def typed_exit(pane_id):
+    box = input_box([line.rstrip() for line in capture(pane_id).split('\n')])
+    return bool(box) and box[0].strip().startswith('❯ /exit')
+
+
+def stop_leftovers(pids):
+    """SIGTERM helpers that outlived their session (then SIGKILL); returns how many there were."""
+    leftovers = [p for p in pids if alive(p)]
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for p in leftovers:
+            try:
+                os.kill(p, sig)
+            except ProcessLookupError:
+                pass
+        if wait(lambda: not any(alive(p) for p in leftovers), 3):
+            break
+    return len(leftovers)
+
+
+def status_updated(pid):
+    """A session's statusUpdatedAt (ms) from its sessions/<pid>.json, or None."""
+    try:
+        return json.loads((SESSIONS_DIR / f'{pid}.json').read_text()).get('statusUpdatedAt')
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def park(s, table):
+    """Exit one session, show its last screen in the pane and leave its resume command at the
+    prompt below, or close its window when gather() found it finished (s.close). Returns
+    (ok, detail) and sets s.closed when the window was closed."""
+    # The pane may have changed since gather(): capture-pane reads the base screen, so the
+    # screen check below cannot see copy mode or which pane is on screen.
+    pane = pane_now(s.pane_id)
+    if pane is None:
+        return False, 'its pane is gone'
+    why = pane_skip(pane, s.named)
+    if why:
+        return False, 'pane changed: ' + why
+    screen = capture(s.pane_id)
+    state, why = screen_state(screen)
+    if state != 'idle-empty':
+        return False, 'screen changed: ' + why
+    # A run that parks several sessions takes minutes. One the user went back to meanwhile is no
+    # longer idle, and what gather() read about its last turn may no longer hold.
+    if last_activity(s.session_id, status_updated(s.pid)) > s.last_active:
+        return False, 'it was active again after this run started'
+    SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+    (SCREENS_DIR / f'{s.session_id}.txt').write_text(capture(s.pane_id, history=400))
+    tree = descendants(s.pid, table)
+    if s.dies_with_claude:
+        tmux('set-option', '-p', '-t', s.pane_id, 'remain-on-exit', 'on')
+    tmux('send-keys', '-t', s.pane_id, '-l', '/exit')
+    time.sleep(0.6)
+    tmux('send-keys', '-t', s.pane_id, 'Enter')
+    if not wait(lambda: not alive(s.pid), 4) and typed_exit(s.pane_id):
+        tmux('send-keys', '-t', s.pane_id, 'Enter')
+    if not wait(lambda: not alive(s.pid), 16):
+        if typed_exit(s.pane_id):
+            tmux('send-keys', '-t', s.pane_id, *['BSpace'] * 5)
+        if s.dies_with_claude:
+            tmux('set-option', '-p', '-t', s.pane_id, '-u', 'remain-on-exit')
+        return False, 'claude did not exit after /exit; left running'
+    time.sleep(1.0)
+    stopped = stop_leftovers(tree)
+    dead = tmux('display', '-p', '-t', s.pane_id, '#{pane_dead}').stdout.strip()
+    if not dead:
+        return False, 'the pane closed with claude; resume it from a new window: ' + s.resume
+    detail = f'stopped {stopped} leftover helper(s)' if stopped else 'its helpers exited with it'
+    if s.close:
+        # The screen file is written and the ledger gets the resume command, as for a parked
+        # pane, so `cc-park status` can still resume it. Anything unexpected parks it in place.
+        why = close_window(s)
+        if not why:
+            s.closed = True
+            return True, detail + '; closed its window, as it had finished'
+        s.close_why = why
+        detail += '; window kept: ' + why
+    if s.dies_with_claude or dead == '1':
+        # Name the shell explicitly: respawn-pane with no command re-runs the
+        # pane's original command, which here is the claude launch itself, initial
+        # prompt included (that started a fresh session once, 2026-10-14).
+        tmux('respawn-pane', '-t', s.pane_id, '-c', s.cwd, f"exec {shlex.quote(os.environ.get('SHELL') or '/bin/zsh')} -l")
+        if s.dies_with_claude:
+            tmux('set-option', '-p', '-t', s.pane_id, '-u', 'remain-on-exit')
+    if not wait(lambda: shell_ready(capture(s.pane_id)), 15):
+        return False, 'exited, but no shell prompt appeared; type this to resume: ' + s.resume
+    # The last screen goes above a fresh prompt, so the parked pane still shows what the
+    # session was doing. Ctrl-C (sent by show_screen) makes the shell redraw its prompt below.
+    shown = show_screen(s.pane_id, screen_body(screen), s.last_active, s.resume)
+    if shown:
+        wait(lambda: shell_ready(capture(s.pane_id)), 15)
+    if s.auto_rename:
+        tmux('rename-window', '-t', s.pane_id, s.name or os.path.basename(s.cwd) or 'parked')
+    tmux('send-keys', '-t', s.pane_id, '-l', s.resume)
+    # The prompt must end with the whole command: Claude's own exit hint also
+    # prints the session id, so finding the id on screen proves nothing.
+    typed = wait(lambda: typed_at_prompt(capture(s.pane_id, join=True), s.resume), 6)
+    detail += '' if shown else '; its last screen could not be shown'
+    return True, detail + ('' if typed else '; check the pane, the resume command may not have been typed')
+
+
+def ledger_append(record):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LEDGER, 'a') as handle:
+        handle.write(json.dumps(record) + '\n')
+
+
+def print_table(sessions):
+    now = time.time()
+    print(f"{'pid':>6}  {'tmux':32} {'idle h':>6} {'MB':>6}  result")
+    for s in sorted(sessions, key=lambda x: (bool(x.skip), x.target)):
+        where = f'{s.target} {s.window}'[:32] if s.target else '-'
+        if s.skip:
+            result = 'skip: ' + s.skip
+        else:
+            result = 'park' + (f" ({', '.join(s.notes)})" if s.notes else '')
+            result += ', then close its window: finished' if s.close else (f'; window stays: {s.close_why}' if s.close_why else '')
+        print(f'{s.pid:6}  {where:32} {(now - s.last_active) / 3600:6.1f} {s.mem_mb:6.0f}  {result}')
+    todo = [s for s in sessions if not s.skip]
+    print(f'\n{len(todo)} to park ({sum(s.close for s in todo)} of them closing their windows), '
+          f'about {sum(s.mem_mb for s in todo) / 1024:.1f} GB; {len(sessions) - len(todo)} skipped')
+
+
+def cmd_list(opts):
+    print_table(gather(opts.idle, opts.only, opts.close))
+    return 0
+
+
+def park_lock():
+    """This machine's park lock, held until the returned file is closed; None when another run holds it."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(LOCK, 'a')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def cmd_park(opts):
+    lock = park_lock()
+    if lock is None:
+        print('another cc-park park is running; try again when it finishes', file=sys.stderr)
+        return 75
+    with lock:
+        sessions = [s for s in gather(opts.idle, opts.only, opts.close) if not s.skip]
+        if opts.limit:
+            sessions = sessions[:opts.limit]
+        if not sessions:
+            print('nothing to park')
+            return 0
+        parked, closed, failed, freed = 0, 0, 0, 0.0
+        for s in sessions:
+            ok, detail = park(s, process_table())
+            ledger_append(dict(ts=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), ok=ok, detail=detail, pid=s.pid,
+                               sessionId=s.session_id, name=s.name, cwd=s.cwd, pane=s.pane_id, target=s.target,
+                               window=s.window, resume=s.resume, notes=s.notes, mb=round(s.mem_mb), closed=s.closed))
+            print(f"{'closed' if s.closed else 'parked' if ok else 'FAILED'}  {s.target:16} {s.window[:24]:24} "
+                  f"{s.mem_mb:6.0f} MB  {detail}")
+            parked, closed, failed = parked + ok, closed + s.closed, failed + (not ok)
+            freed += s.mem_mb if ok else 0
+        print(f'\nparked {parked} ({closed} of them closed), failed {failed}, freed about {freed / 1024:.1f} GB. '
+              f'Ledger: {LEDGER}')
+        return 1 if failed else 0
+
+
+def cmd_auto(opts):
+    """The scheduled run, and the switch that pauses it on this machine."""
+    if opts.action == 'off':
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        AUTO_OFF.touch()
+        print('autopark is paused on this machine; `cc-park auto on` turns it back on')
+        return 0
+    if opts.action == 'on':
+        if AUTO_OFF.exists():
+            AUTO_OFF.unlink()
+        print('autopark is on')
+        return 0
+    if opts.action == 'status':
+        if sys.platform == 'darwin':
+            loaded = run(['launchctl', 'print', f'gui/{os.getuid()}/{AUTO_LABEL}']).returncode == 0
+            print(f"schedule: {AUTO_LABEL} is {'loaded' if loaded else 'NOT loaded (install.sh --with schedules loads it)'}")
+        elif shutil.which('systemctl'):
+            active = run(['systemctl', '--user', 'is-active', AUTO_TIMER]).stdout.strip() == 'active'
+            print(f"schedule: {AUTO_TIMER} is {'active' if active else 'NOT active (install.sh --with schedules enables it)'}")
+        else:
+            print('schedule: none (no launchd or systemd here; run `cc-park park` by hand or from cron)')
+        print(f"autopark: {'paused (`cc-park auto on` unpauses)' if AUTO_OFF.exists() else 'on'}")
+        if AUTO_LOG.exists():
+            print(f'last runs ({AUTO_LOG}):')
+            runs = [line for line in AUTO_LOG.read_text(errors='replace').splitlines() if line.startswith('== ')]
+            for line in runs[-3:]:
+                print('  ' + line)
+        return 0
+    stamp = time.strftime('%Y-%m-%d %H:%M %Z')
+    if AUTO_OFF.exists():
+        print(f'== {stamp}: paused (`cc-park auto on` unpauses)')
+        return 0
+    print(f'== {stamp}: parking sessions idle {opts.idle:g} h or more' + ('' if opts.close else ', windows kept'))
+    if tmux('list-sessions').returncode != 0:
+        print('no tmux server')
+        return 0
+    opts.only, opts.limit = None, 0
+    return cmd_park(opts)
+
+
+def cmd_status(_opts):
+    if not LEDGER.exists():
+        print('nothing parked yet')
+        return 0
+    live = set()
+    for path in SESSIONS_DIR.glob('*.json'):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if data.get('pid') and alive(data['pid']):
+            live.add(data.get('sessionId'))
+    panes = {p['pane_id'] for p in tmux_panes().values()}
+    latest = {}
+    for line in LEDGER.read_text().splitlines():
+        rec = json.loads(line)
+        latest[rec['sessionId']] = rec
+    for rec in sorted((r for r in latest.values() if r.get('ok')), key=lambda r: r['target']):
+        if rec['sessionId'] in live:
+            state = 'resumed'
+        elif rec.get('closed'):
+            state = 'closed (done)'
+        else:
+            state = 'parked' if rec['pane'] in panes else 'pane gone'
+        print(f"{state:13} {rec['target']:16} {rec['window'][:26]:26} {rec['ts']}  {rec['resume']}")
+        if state == 'closed (done)':
+            # Its window is gone; the screen it showed before parking is kept here.
+            print(f"{'':13} last screen: {SCREENS_DIR / (rec['sessionId'] + '.txt')}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='cc-park', description=__doc__.split('\n\n')[0])
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    idle_help = f'hours since last activity (default {IDLE_HOURS:g})'
+    close_help = 'park finished sessions in place too, instead of closing their windows'
+    for name in ('list', 'park'):
+        p = sub.add_parser(name)
+        p.add_argument('--idle', type=float, default=IDLE_HOURS, help=idle_help)
+        p.add_argument('--only', type=lambda v: set(v.split(',')), default=None, help='pids, tmux targets or pane ids')
+        p.add_argument('--no-close', dest='close', action='store_false', help=close_help)
+        if name == 'park':
+            p.add_argument('--limit', type=int, default=0, help='park at most N sessions')
+    sub.add_parser('status')
+    p = sub.add_parser('auto', help='the scheduled run, or pause/unpause it')
+    p.add_argument('action', nargs='?', choices=('run', 'on', 'off', 'status'), default='run')
+    p.add_argument('--idle', type=float, default=IDLE_HOURS, help=idle_help)
+    p.add_argument('--no-close', dest='close', action='store_false', help=close_help)
+    opts = parser.parse_args(argv)
+    if opts.cmd == 'auto':
+        return cmd_auto(opts)
+    if tmux('list-sessions').returncode != 0:
+        print('no tmux server', file=sys.stderr)
+        return 1
+    return {'list': cmd_list, 'park': cmd_park, 'status': cmd_status}[opts.cmd](opts)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
