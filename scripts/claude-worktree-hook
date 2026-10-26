@@ -1,0 +1,1561 @@
+#!/usr/bin/env bash
+# claude-worktree-hook: Claude Code WorktreeCreate / WorktreeRemove hooks that put Claude
+# Code's own worktrees (--worktree, EnterWorktree, Agent and workflow isolation) where the
+# repo's worktree.baseDirectory setting says, as wt-helper does for `wt` and pw.
+#
+# Usage:
+#   claude-worktree-hook create          WorktreeCreate hook (hook JSON on stdin)
+#   claude-worktree-hook remove          WorktreeRemove hook (hook JSON on stdin)
+#   claude-worktree-hook enable  [REPO]  register both hooks in REPO's .claude/settings.local.json
+#   claude-worktree-hook disable [REPO]  take them out again
+#   claude-worktree-hook prune [--dry-run] [REPO]
+#                                        remove REPO's idle worktrees that create made (below)
+#
+# Claude Code reads worktree.baseDirectory nowhere; it always makes worktrees in
+# <repo>/.claude/worktrees/<name>. The only lever is a WorktreeCreate hook, and a configured
+# one replaces Claude Code's creation for every worktree of every repo it applies to: a hook
+# that succeeds without printing a path is an error, so it cannot hand back to the default.
+# Claude Code also treats every worktree a hook made differently from its own (2.1.306, read
+# in the docs and the binary): it keeps Agent and workflow worktrees when the agent finishes,
+# even unchanged ones, never sweeps them, never deletes their branch, always asks on exit,
+# and skips .worktreeinclude, worktree.symlinkDirectories, worktree.sparsePaths and the
+# pull-request fetch. So the hooks are registered per repo, next to the setting (`enable`),
+# not in the user settings, and the hook does all of Claude Code's creation steps itself.
+#
+# Hook contract (hooks reference + Claude Code 2.1.306):
+#   WorktreeCreate stdin: session_id, transcript_path, cwd, hook_event_name and name. name is
+#     a slug Claude Code has already validated (at most 64 characters, "/"-separated segments
+#     of [A-Za-z0-9._-]); `--worktree "#123"` arrives as pr-123. No branch and no path.
+#   WorktreeCreate output: the last non-empty stdout line is the worktree path. It must be an
+#     existing directory, absolute with no . or .. segments, and pass through no symlink below
+#     the repo root. Any non-zero exit fails the creation; nothing else on stdout counts.
+#   WorktreeRemove stdin: the common fields and worktree_path, the path create printed. Exit 0
+#     means removed (the directory must be gone); non-zero fails it if the directory remains.
+#   Both run with no controlling terminal and a 600 s default timeout. A child that outlives
+#     the hook while holding its stdout or stderr makes Claude Code distrust the output, so
+#     every git command that can leave children runs with its output in a temp file.
+#
+# create, for a repo whose setting resolves elsewhere (wt-helper --print-base-dir, with the
+# WT_BASE_DIR/WT_LAYOUT/WT_NESTED_SUBDIR levers cleared so only the repo setting counts):
+#   <baseDirectory>/<name with "/" as "+">. A setting that cannot be used (a volume that is not
+#   mounted, an unreadable file, a directory that cannot be created) gets a warning on stderr
+#   and the default location below; it never fails the creation.
+# Otherwise, and as that fallback, exactly Claude Code's own layout:
+#   <main checkout>/.claude/worktrees/<name with "/" as "+">, refused if .claude or
+#   .claude/worktrees is a symlink. Inside a linked worktree the main checkout is still used.
+# In both cases, as Claude Code does:
+#   - branch worktree-<slug>, `git worktree add --no-track -B` at <base>^{commit};
+#   - base: worktree.baseRef "head" is HEAD of the hook's cwd; otherwise origin/<default>
+#     (the target of origin/HEAD, else main, else master), fetched (5 s cap) when FETCH_HEAD is
+#     older than a day, fetched once when there is no local copy, and local HEAD when that
+#     fails; pr-<N> fetches refs/pull/<N>/head or refs/merge-requests/<N>/head from origin, and
+#     the creation fails when it cannot;
+#   - repo-local filter drivers off for the checkout (read in the new worktree before its
+#     checkout when git copies the main checkout's worktree config into it, under
+#     extensions.worktreeConfig), checkout.workers when unset, sparse paths, a relative
+#     core.hooksPath made absolute, symlinkDirectories, .worktreeinclude, and
+#     the CLAUDE_BASE marker (the base commit) in the worktree's git dir; a conditional include
+#     (includeIf) in the repo's git config fails the creation, since it can load drivers in the
+#     new worktree that the hook cannot see to switch off, and so does a key there that names a
+#     program git-lfs runs on checkout (a custom or standalone transfer agent, an extension);
+#   - an existing worktree of the same name is reused, and moved up to the current base (with
+#     those drivers off, and not at all past either of those) when it is clean, on its branch
+#     and has no commits of its own;
+#   - the git the hook runs on its own account (reading and moving a reopened worktree,
+#     removing a worktree and its branch, listing .worktreeinclude files) runs none of the
+#     repo's hooks or its fsmonitor command, as Claude Code's does not; the checkout runs the
+#     hooks, as Claude Code's does.
+# Two departures keep unpushed work: a worktree-<slug> branch with commits the base lacks is
+# attached rather than reset, and remove keeps a branch that has commits nothing else has.
+#
+# remove deletes only a linked worktree of a repo that has the CLAUDE_BASE marker (made by
+# create or by Claude Code); anything else stays and the hook fails, as Claude Code's own git
+# fallback leaves alone what git does not know. It unlocks only Claude Code's own locks. A
+# worktree whose directory is already gone loses its record only when its parent directory is
+# there and the setting's volume is mounted, since on a volume that is not it only looks gone.
+#
+# prune clears out the worktrees create left in the repo's worktree.baseDirectory, since
+# Claude Code never asks for them to be removed. It takes only a registered linked worktree
+# directly in that directory whose git dir has CLAUDE_BASE, and only when nothing can be lost:
+# no lock but a Claude Code one whose pid is gone; no process working in it (lsof, else /proc;
+# when neither can tell, nothing goes); nothing about it (its directory, its git dir and the
+# files in it, its branch's reflog) changed for CLAUDE_WORKTREE_PRUNE_DAYS (7) days; no commit
+# that its base, a remote or another branch lacks; no merge, rebase or other operation under
+# way; and `git status` empty (ignored files and create's own symlinkDirectories links aside).
+# It removes with `git worktree remove`, no --force, deletes the branch under remove's rule,
+# never runs `git worktree prune`, and does nothing while the setting cannot be used (a volume
+# that is not mounted), so worktrees that only look missing keep their records. Its git status
+# and git worktree remove run with the repo's filter drivers off (read in each worktree) and
+# none of its hooks or fsmonitor; a worktree whose drivers cannot be switched off stays, as does
+# one with a submodule checked out, and past such a config in the main checkout nothing goes,
+# as for create. --dry-run lists what would go. create starts prune in the background at most
+# once a day per repo (claude-worktree-prune.stamp and .log in the git common dir;
+# CLAUDE_WORKTREE_AUTO_PRUNE=0 turns it off), and reopening a worktree counts as a change, so
+# that run spares it.
+#
+# Requires git and jq.
+
+set -uo pipefail
+
+PROG="claude-worktree-hook"
+
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  self_dir="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  [[ "$self" == /* ]] || self="$self_dir/$self"
+done
+SELF_DIR="$(cd -P "$(dirname "$self")" && pwd)"
+SELF="$SELF_DIR/${self##*/}"
+WT_HELPER="$SELF_DIR/wt-helper"
+# What enable registers: this script where it is (as ~/... under HOME), so the command reaches
+# it from any checkout. A WorktreeCreate command that fails fails every worktree creation.
+home_p="$(cd -P "${HOME:-/nonexistent}" 2>/dev/null && pwd -P)"
+if [[ -n "$home_p" && "$SELF" == "$home_p"/* ]]; then
+  HOOK_CMD_PREFIX="bash ~/$(printf '%q' "${SELF#"$home_p"/}")"
+else
+  HOOK_CMD_PREFIX="bash $(printf '%q' "$SELF")"
+fi
+
+log() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: claude-worktree-hook create|remove           (run by Claude Code; hook JSON on stdin)
+       claude-worktree-hook enable|disable [REPO]   (REPO defaults to the current directory)
+       claude-worktree-hook prune [--dry-run] [REPO]
+
+create and remove are Claude Code's WorktreeCreate and WorktreeRemove hooks. They put the
+repo's Claude Code worktrees in its worktree.baseDirectory, read like wt-helper reads it.
+enable writes both hooks into the main checkout's .claude/settings.local.json (the repo needs
+worktree.baseDirectory set first); disable takes them out.
+prune removes the worktrees create put there that are clean, have no commits of their own,
+are not in use and have not changed for CLAUDE_WORKTREE_PRUNE_DAYS (default 7) days, with
+their worktree-<name> branches; --dry-run lists what it would remove and why the rest stay.
+create runs it in the background once a day (CLAUDE_WORKTREE_AUTO_PRUNE=0 turns that off).
+EOF
+}
+
+TMP_FILES=()
+cleanup_tmp() {
+  local f
+  for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do rm -f "$f"; done
+}
+trap cleanup_tmp EXIT
+# Sets NEW_TMP (not printed: a $(...) subshell would lose the cleanup record).
+NEW_TMP=""
+new_tmp() {
+  NEW_TMP="$(mktemp "${TMPDIR:-/tmp}/$PROG.XXXXXX")" || die "cannot create a temp file"
+  TMP_FILES+=("$NEW_TMP")
+}
+
+# ── paths ─────────────────────────────────────────────────────────────
+# $1 with the symlinks in its existing part resolved and the rest kept as written.
+phys() {
+  local head="$1" tail="" p
+  while [[ ! -d "$head" && "$head" == /?* ]]; do
+    tail="/${head##*/}$tail"
+    head="${head%/*}"
+    [[ -n "$head" ]] || head=/
+  done
+  p="$(cd -P "$head" 2>/dev/null && pwd -P)" || p="$head"
+  [[ "$p" == / ]] && p=""
+  printf '%s' "$p$tail"
+}
+same_path() { [[ "$(phys "$1")" == "$(phys "$2")" ]]; }
+
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+
+# ── git ───────────────────────────────────────────────────────────────
+# The main checkout of the repo containing $1. Fails outside a repo, and in a bare repo, where
+# Claude Code refuses to make worktrees too. The first `git worktree list` entry names the git
+# dir, not the checkout, when that is not <checkout>/.git (a submodule's git dir is the
+# superproject's .git/modules/<name>; a separate git dir is anywhere), so in the main worktree
+# it is the toplevel, and from a linked one the checkout core.worktree names (a submodule's).
+# A separate git dir seen from a linked worktree names its checkout nowhere: the git dir then.
+main_worktree() {
+  local out first bare gd common top wt
+  out="$(git -C "$1" worktree list --porcelain 2>/dev/null)" || return 1
+  first="$(printf '%s\n' "$out" | sed -n '1s/^worktree //p')"
+  bare="$(printf '%s\n' "$out" | awk 'NR > 1 && /^$/ { exit } /^bare$/ { print "bare" }')"
+  [[ -n "$first" && -z "$bare" ]] || return 1
+  if gd="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" && common="$(common_dir "$1")"; then
+    if same_path "$gd" "$common"; then
+      top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" && [[ -n "$top" ]] && first="$top"
+    elif [[ "${common##*/}" != .git ]] && wt="$(git config --file "$common/config" --get core.worktree 2>/dev/null)" &&
+      [[ -n "$wt" ]] && wt="$(cd "$common" && cd "$wt" 2>/dev/null && pwd -P)"; then
+      first="$wt"
+    fi
+  fi
+  printf '%s' "$first"
+}
+
+common_dir() {
+  local d
+  d="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" && [[ "$d" == /* ]] && {
+    printf '%s' "$d"
+    return 0
+  }
+  d="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$d" in
+    /*) printf '%s' "$d" ;;
+    *) (cd "$1" && cd "$d" && pwd -P) ;;
+  esac
+}
+
+# Run "$@" with a time limit of $1 seconds when a tool for it exists.
+run_timeout() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm(shift @ARGV); exec @ARGV or die "exec failed: $!\n"' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# git fetch in the main checkout as Claude Code runs it: no prompts, the repo's own
+# remote.*.uploadpack ignored, output in a file so a straggling ssh holds none of the hook's.
+# A failure's last fatal: or error: line goes in FETCH_ERR.
+FETCH_ERR=""
+git_fetch() {
+  local secs="$1" out rc
+  shift
+  new_tmp
+  out="$NEW_TMP"
+  FETCH_ERR=""
+  GIT_TERMINAL_PROMPT=0 run_timeout "$secs" git -C "$MAIN" fetch --quiet --upload-pack=git-upload-pack "$@" \
+    </dev/null >"$out" 2>&1 3>&-
+  rc=$?
+  if ((rc != 0)); then
+    log "git fetch $* failed (exit $rc): $(tail -n 2 "$out" | tr '\n' ' ')"
+    FETCH_ERR="$(sed -n -E 's/^(fatal|error): //p' "$out" | tail -n 1)"
+  fi
+  return "$rc"
+}
+
+# A git command whose output is replayed on stderr afterwards (see git_fetch). Sets GIT_OUT.
+GIT_OUT=""
+git_quiet() {
+  local out rc
+  new_tmp
+  out="$NEW_TMP"
+  git "$@" </dev/null >"$out" 2>&1 3>&-
+  rc=$?
+  GIT_OUT="$(cat "$out")"
+  [[ -n "$GIT_OUT" ]] && printf '%s\n' "$GIT_OUT" >&2
+  return "$rc"
+}
+
+# -c pairs that keep the repo's hooks and fsmonitor command out of the git the hook runs on its
+# own account (reading a tree, moving it up, removing a worktree or a branch), as Claude Code
+# keeps them out of its own (core.hooksPath=/dev/null, core.fsmonitor=). Every hook event is
+# switched off too, which newer git applies to hooks set in config (hook.<name>.command) as
+# well. Not for the checkout itself: Claude Code runs the repo's hooks there, as git does.
+QUIET_GIT=(-c core.hooksPath=/dev/null -c core.fsmonitor=)
+for e in applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg \
+  commit-msg post-commit pre-rebase post-checkout post-merge pre-push pre-receive update proc-receive \
+  post-receive post-update reference-transaction push-to-checkout pre-auto-gc post-rewrite \
+  sendemail-validate fsmonitor-watchman p4-changelist p4-prepare-changelist p4-post-changelist \
+  p4-pre-submit post-index-change; do
+  QUIET_GIT+=(-c "hook.$e.enabled=false")
+done
+unset e
+
+# Config keys that name a program git-lfs runs for any LFS path, on checkout and on status
+# alike, which no -c here can switch off for it: a custom transfer agent's path, a standalone
+# transfer agent (for any URL) and any LFS extension. Claude Code 2.1.306's list, matched as
+# it matches it; git-lfs lowercases keys, so case does not count.
+LFS_PROGRAM_KEY_RE='lfs.customtransfer..+.path|^lfs\.(.*\.)?standalonetransferagent$|^lfs\.extension\.'
+lfs_program_key() {
+  local was=0 rc=1
+  shopt -q nocasematch && was=1
+  shopt -s nocasematch
+  [[ "$1" =~ $LFS_PROGRAM_KEY_RE ]] && rc=0
+  ((was)) || shopt -u nocasematch
+  return "$rc"
+}
+
+# Whether the config entry $1 ("key" or "key<newline>value", as `git config -z --list` gives
+# it) sets one of those keys, which then goes in LFS_KEY: the key itself, or a key on a line of
+# its own in the value. git-lfs reads `git config -l` a "key=value" line at a time, so a value
+# with newlines in it adds lines (the value's first one shares the key's line).
+LFS_KEY=""
+lfs_program_entry() {
+  local rest line
+  LFS_KEY="${1%%$'\n'*}"
+  lfs_program_key "$LFS_KEY" && return 0
+  if [[ "$1" == *$'\n'*$'\n'* ]]; then
+    rest="${1#*$'\n'}"
+    while IFS= read -r line; do
+      [[ "$line" == *=* ]] || continue
+      LFS_KEY="${line%%=*}"
+      LFS_KEY="${LFS_KEY#"${LFS_KEY%%[![:space:]]*}"}"
+      LFS_KEY="${LFS_KEY%"${LFS_KEY##*[![:space:]]}"}"
+      lfs_program_key "$LFS_KEY" && return 0
+    done <<<"${rest#*$'\n'}"
+  fi
+  LFS_KEY=""
+  return 1
+}
+
+# -c pairs that switch off the filter drivers in the repo's own config for git run in $1
+# (Claude Code does this: a filter driver is a command anything that writes to the repo could
+# have planted). Fails, with the reason in FILTER_REFUSAL, where Claude Code refuses too: a
+# driver whose name has "=" cannot be switched off with -c, a conditional include (includeIf)
+# can load drivers this listing does not show (gitdir: matches each worktree's own git dir, so
+# the new worktree's can differ from the main checkout's), and a key above names a program
+# git-lfs runs that -c cannot switch off.
+FILTER_ARGS=()
+FILTER_REFUSAL=""
+filter_args() {
+  local entry key name lfs seen=" "
+  FILTER_ARGS=()
+  FILTER_REFUSAL=""
+  while IFS= read -r -d '' entry; do
+    key="${entry%%$'\n'*}"
+    case "$key" in
+      includeif.*.path)
+        FILTER_REFUSAL="the repository git config has a conditional include (includeIf), so the filter drivers a checkout would load cannot be determined"
+        return 1
+        ;;
+    esac
+    if lfs_program_entry "$entry"; then
+      lfs=""
+      [[ "$LFS_KEY" == "$key" ]] || lfs=", an entry git-lfs reads as $LFS_KEY"
+      FILTER_REFUSAL="the repository git config sets $key$lfs, which names a program git-lfs would run for any LFS path, on checkout and on status alike (if that setting is yours, move it to your global git config; if you don't recognize it, remove it from the repository's config, since a tool or checkout you don't trust may have written it)"
+      return 1
+    fi
+    [[ "$key" == filter.*.* ]] || continue
+    name="${key#filter.}"
+    name="${name%.*}"
+    [[ -n "$name" ]] || continue
+    if [[ "$name" == *=* ]]; then
+      FILTER_REFUSAL="the repository git config defines a filter driver whose name has \"=\" in it ($name), so it cannot be switched off for the checkout"
+      return 1
+    fi
+    case "$seen" in *" $name "*) continue ;; esac
+    seen="$seen$name "
+    FILTER_ARGS+=(-c "filter.$name.clean=" -c "filter.$name.smudge=" -c "filter.$name.process=" -c "filter.$name.required=false")
+  done < <(
+    git -C "$1" config --local --includes -z --list 2>/dev/null
+    git -C "$1" config --worktree --includes -z --list 2>/dev/null
+  )
+  return 0
+}
+
+WORKER_ARGS=()
+worker_args() {
+  local n
+  WORKER_ARGS=()
+  git -C "$1" config --get-all checkout.workers >/dev/null 2>&1 && return 0
+  n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=1
+  ((n < 1)) && n=1
+  ((n > 16)) && n=16
+  WORKER_ARGS=(-c "checkout.workers=$n")
+}
+
+# Claude Code's own `git worktree lock` reason (pid, optional process start).
+is_claude_lock() {
+  local re='^claude (agent|session) .{1,255} \(pid [0-9]{1,10}( start .{1,255})?\)$'
+  [[ "$1" =~ $re ]]
+}
+
+# ── hook input and settings ───────────────────────────────────────────
+HOOK_INPUT=""
+read_hook_input() {
+  command -v jq >/dev/null 2>&1 || die "jq is required to read the hook input"
+  HOOK_INPUT="$(cat)"
+  printf '%s' "$HOOK_INPUT" | jq -e 'type == "object"' >/dev/null 2>&1 || die "the hook input on stdin is not a JSON object"
+}
+hook_field() { printf '%s' "$HOOK_INPUT" | jq -r --arg k "$1" '.[$k] // empty | strings'; }
+
+# Claude Code settings files that can hold worktree.* keys, highest precedence first.
+SETTINGS_FILES=()
+settings_files() {
+  SETTINGS_FILES=("$MAIN/.claude/settings.local.json" "$TOP/.claude/settings.json")
+  same_path "$TOP" "$MAIN" || SETTINGS_FILES+=("$MAIN/.claude/settings.json")
+  SETTINGS_FILES+=("$HOME/.claude/settings.json")
+}
+# A worktree.<key> string from the first file that sets one.
+worktree_setting() {
+  local f v
+  for f in "${SETTINGS_FILES[@]}"; do
+    [[ -f "$f" ]] || continue
+    v="$(jq -r --arg k "$1" 'try .worktree[$k] catch null | strings' "$f" 2>/dev/null)" || continue
+    [[ -n "$v" ]] && {
+      printf '%s' "$v"
+      return 0
+    }
+  done
+  return 1
+}
+# The strings of a worktree.<key> list across every file, once each.
+worktree_setting_list() {
+  local f
+  for f in "${SETTINGS_FILES[@]}"; do
+    [[ -f "$f" ]] || continue
+    jq -r --arg k "$1" 'try (.worktree[$k] | arrays | .[] | strings) catch empty' "$f" 2>/dev/null
+  done | awk 'NF && !seen[$0]++'
+}
+
+# Claude Code's worktree name rules (validated before the hook runs; checked again here
+# because the name becomes a path).
+valid_name() {
+  local rest="$1" seg low re='^[A-Za-z0-9._-]+$'
+  [[ -n "$rest" && ${#rest} -le 64 ]] || return 1
+  while :; do
+    seg="${rest%%/*}"
+    [[ -n "$seg" && "$seg" != "." && "$seg" != ".." && "$seg" =~ $re ]] || return 1
+    low="$(printf '%s' "$seg" | tr '[:upper:]' '[:lower:]')"
+    while [[ "$low" == *. ]]; do low="${low%.}"; done
+    [[ "$low" != ".git" ]] || return 1
+    [[ "$rest" == */* ]] || return 0
+    rest="${rest#*/}"
+  done
+}
+
+# ── where the worktree goes ───────────────────────────────────────────
+# Sets BASE (directory for new worktrees) and RELOCATED (1 when the repo setting moved it).
+# SETTING_STATE says what was found: none, used, unmounted (its volume is not mounted) or
+# unusable (anything else; wt-helper's reason goes to stderr).
+BASE=""
+RELOCATED=0
+SETTING_STATE="none"
+resolve_base() {
+  local out err rc errf helper_default
+  BASE="$MAIN/.claude/worktrees"
+  RELOCATED=0
+  SETTING_STATE="none"
+  if [[ ! -x "$WT_HELPER" ]]; then
+    log "wt-helper not found at $WT_HELPER, so worktree.baseDirectory was not read"
+    SETTING_STATE="unusable"
+    return 0
+  fi
+  new_tmp
+  errf="$NEW_TMP"
+  out="$(
+    unset WT_BASE_DIR WT_LAYOUT WT_NESTED_SUBDIR
+    cd "$MAIN" && "$WT_HELPER" --print-base-dir 2>"$errf" 3>&-
+  )"
+  rc=$?
+  # wt-helper colors its messages; the hook's stderr goes to Claude Code's debug log.
+  err="$(sed $'s/\033\\[[0-9;]*m//g' "$errf")"
+  [[ -n "$err" ]] && printf '%s\n' "$err" >&2
+  if ((rc != 0)); then
+    SETTING_STATE="unusable"
+    [[ "$err" == *"not mounted"* ]] && SETTING_STATE="unmounted"
+    return 0
+  fi
+  [[ "$out" == /* ]] || return 0
+  # Where wt-helper cannot tell where the main checkout is (a separate git dir seen from a
+  # linked worktree), its default sits under the common dir's parent, not under MAIN.
+  helper_default="$(dirname "$(common_dir "$MAIN")")/.claude/worktrees"
+  if same_path "$out" "$BASE" || same_path "$out" "$helper_default"; then
+    [[ -n "$err" ]] && SETTING_STATE="unusable"
+    return 0
+  fi
+  case "/$(phys "$out")/" in
+    */.git/*)
+      log "worktree.baseDirectory resolves inside a .git directory ($out); not using it"
+      SETTING_STATE="unusable"
+      return 0
+      ;;
+  esac
+  BASE="$out"
+  RELOCATED=1
+  SETTING_STATE="used"
+}
+
+# ── base commit ───────────────────────────────────────────────────────
+START_SHA=""
+START_DESC=""
+default_branch() {
+  local r
+  r="$(git -C "$MAIN" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)" && r="${r#refs/remotes/origin/}"
+  if [[ -n "${r:-}" ]] && git -C "$MAIN" show-ref --verify -q "refs/remotes/origin/$r"; then
+    printf '%s' "$r"
+    return 0
+  fi
+  for r in main master; do
+    if git -C "$MAIN" show-ref --verify -q "refs/remotes/origin/$r"; then
+      printf '%s' "$r"
+      return 0
+    fi
+  done
+  printf 'main'
+}
+origin_sha() { git -C "$MAIN" rev-parse -q --verify "refs/remotes/origin/$1^{commit}" 2>/dev/null; }
+
+head_base() {
+  START_SHA="$(git -C "$CWD" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" ||
+    die "Failed to resolve the base commit: HEAD of $CWD has no commit"
+  START_DESC="HEAD of $CWD"
+}
+
+fresh_base() {
+  local g sha fetch_head mtime
+  g="$(default_branch)"
+  [[ "$g" == -* ]] && g=HEAD
+  if sha="$(origin_sha "$g")" && [[ -n "$sha" ]]; then
+    START_SHA="$sha"
+    START_DESC="origin/$g"
+    fetch_head="$(git -C "$MAIN" rev-parse --path-format=absolute --git-path FETCH_HEAD 2>/dev/null)"
+    mtime="$(file_mtime "$fetch_head")" || mtime=0
+    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+    if (($(date +%s) - mtime > 86400)); then
+      git_fetch 5 origin "$g"
+      sha="$(origin_sha "$g")" && [[ -n "$sha" ]] && START_SHA="$sha"
+    fi
+    return 0
+  fi
+  if git_fetch 30 origin "$g" && sha="$(origin_sha "$g")" && [[ -n "$sha" ]]; then
+    START_SHA="$sha"
+    START_DESC="origin/$g"
+    return 0
+  fi
+  log "fetch of origin/$g failed; basing the worktree on local HEAD"
+  head_base
+}
+
+url_host() {
+  local u="$1" h=""
+  case "$u" in
+    *://*)
+      h="${u#*://}"
+      h="${h#*@}"
+      h="${h%%/*}"
+      h="${h%%:*}"
+      ;;
+    *@*:*)
+      h="${u#*@}"
+      h="${h%%:*}"
+      ;;
+    [!/]*:*) h="${u%%:*}" ;;
+  esac
+  printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
+}
+
+# The head of pull/merge request $1 from origin. As in Claude Code, which fails the creation
+# then too, a request that cannot be fetched is fatal: the usual base instead would put the
+# caller in code that is not the request's, under its name.
+pr_base() {
+  local n="$1" url refs ref sha why=""
+  url="$(git -C "$MAIN" remote get-url origin 2>/dev/null)" ||
+    die "Failed to fetch PR/MR #$n: the repository has no remote named \"origin\""
+  case "$(url_host "$url")" in
+    github.com) refs="refs/pull/$n/head" ;;
+    gitlab.com) refs="refs/merge-requests/$n/head" ;;
+    *) refs="refs/pull/$n/head refs/merge-requests/$n/head" ;;
+  esac
+  for ref in $refs; do
+    if ! git_fetch 120 origin "$ref"; then
+      [[ -n "$why" ]] || why="$FETCH_ERR"
+      continue
+    fi
+    sha="$(git -C "$MAIN" rev-parse -q --verify 'FETCH_HEAD^{commit}' 2>/dev/null)" || continue
+    [[ -n "$sha" ]] || continue
+    START_SHA="$sha"
+    START_DESC="pull/merge request #$n ($ref)"
+    return 0
+  done
+  die "Failed to fetch PR/MR #$n: ${why:-it may not exist, the fetch may have timed out, or origin may not be the repository it belongs to}"
+}
+
+# ── after the checkout (Claude Code's post-creation steps) ────────────
+# True when $1, or a directory on the way to it, resolves outside $2 (a committed symlink).
+escapes() {
+  local dest="$1" root="$2" parent
+  [[ -L "$dest" ]] && return 0
+  parent="$(dirname "$dest")"
+  while [[ ! -e "$parent" && "$parent" == /?* ]]; do parent="$(dirname "$parent")"; done
+  parent="$(cd -P "$parent" 2>/dev/null && pwd -P)" || return 0
+  [[ "$parent" == "$root" || "$parent" == "$root"/* ]] || return 0
+  return 1
+}
+
+fix_hooks_path() {
+  local hp
+  hp="$(git -C "$MAIN" config --local --get core.hooksPath 2>/dev/null)" || return 0
+  [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* ]] || return 0
+  if git -C "$TARGET" config core.hooksPath "$MAIN/$hp" 2>/dev/null; then
+    log "pointed core.hooksPath at the main checkout's $MAIN/$hp"
+  else
+    log "could not set core.hooksPath to $MAIN/$hp"
+  fi
+}
+
+link_directories() {
+  local d src dst root
+  root="$(cd -P "$TARGET" && pwd -P)"
+  while IFS= read -r d; do
+    case "/$d/" in
+      //*/ | */../* | */./*)
+        log "symlinkDirectories: skipping $d (absolute or has . or .. in it)"
+        continue
+        ;;
+    esac
+    src="$MAIN/$d"
+    dst="$TARGET/$d"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+      log "symlinkDirectories: $d is not in the main checkout"
+      continue
+    fi
+    [[ -e "$dst" || -L "$dst" ]] && continue
+    if escapes "$dst" "$root"; then
+      log "symlinkDirectories: skipping $d (the worktree path escapes through a symlink)"
+      continue
+    fi
+    ln -s "$src" "$dst" 2>/dev/null && log "symlinked $d from the main checkout"
+  done < <(worktree_setting_list symlinkDirectories)
+}
+
+# True when the gitignore-style pattern $1 matches path $2 or one of its parent directories.
+# Close enough to pick which ignored directories to look into; git does the final matching.
+pattern_reaches() {
+  local p="$1" path="$2" anchored=0 prefix="" seg rest
+  p="${p#/}"
+  p="${p%/}"
+  [[ -n "$p" ]] || return 1
+  [[ "$p" == */* ]] && anchored=1
+  rest="$path"
+  while [[ -n "$rest" ]]; do
+    seg="${rest%%/*}"
+    prefix="${prefix:+$prefix/}$seg"
+    if ((anchored)); then
+      # shellcheck disable=SC2053  # $p is a glob pattern on purpose
+      [[ "$prefix" == $p ]] && return 0
+    else
+      # shellcheck disable=SC2053
+      [[ "$seg" == $p ]] && return 0
+    fi
+    [[ "$rest" == */* ]] || break
+    rest="${rest#*/}"
+  done
+  return 1
+}
+
+# Whether ignored directory $1 (trailing /) may hold files the .worktreeinclude patterns name,
+# by Claude Code's rules: a pattern inside it, its literal prefix, a **/ pattern naming one
+# of its path segments, or the directory itself (or a parent) matched.
+dir_may_match() {
+  local d="$1" bare="${1%/}" p pre first wc seg lowfirst
+  while IFS= read -r p || [[ -n "$p" ]]; do
+    p="${p%$'\r'}"
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    [[ -n "$p" && "$p" != \#* && "$p" != \!* ]] || continue
+    p="${p#/}"
+    [[ "$p" == "$d"* ]] && return 0
+    pre="${p%%[*?[]*}"
+    [[ ${#pre} -gt 0 && "$pre" != "$p" && "$d" == "$pre"* ]] && return 0
+    if [[ "$p" == '**/'* ]]; then
+      first="$p"
+      while [[ "$first" == '**/'* ]]; do first="${first#\*\*/}"; done
+      first="${first%%/*}"
+      wc="${first%%[*?[]*}"
+      lowfirst="$(printf '%s' "${wc//\\/}" | tr '[:upper:]' '[:lower:]')"
+      if [[ -n "$lowfirst" ]]; then
+        while IFS= read -r seg; do
+          seg="$(printf '%s' "$seg" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$wc" == "$first" ]]; then
+            [[ "$seg" == "$lowfirst" ]] && return 0
+          else
+            [[ "$seg" == "$lowfirst"* ]] && return 0
+          fi
+        done < <(printf '%s\n' "$bare" | tr '/' '\n')
+      fi
+    fi
+    pattern_reaches "$p" "$bare" && return 0
+  done <"$WTI"
+  return 1
+}
+
+# Copy the gitignored files that .worktreeinclude names into the new worktree.
+WTI=""
+copy_worktreeinclude() {
+  local entries cands files matched e f src dst root copied=0
+  WTI="$MAIN/.worktreeinclude"
+  [[ -f "$WTI" ]] || return 0
+  grep -q -v -E '^[[:space:]]*(#|$)' "$WTI" 2>/dev/null || return 0
+  new_tmp
+  entries="$NEW_TMP"
+  new_tmp
+  cands="$NEW_TMP"
+  new_tmp
+  files="$NEW_TMP"
+  new_tmp
+  matched="$NEW_TMP"
+  git -C "$MAIN" "${QUIET_GIT[@]}" ls-files -z --others --ignored --exclude-standard --directory >"$entries" 2>/dev/null || return 0
+  while IFS= read -r -d '' e; do
+    if [[ "$e" == */ ]]; then
+      dir_may_match "$e" && printf '%s\0' "$e" >>"$cands"
+    else
+      printf '%s\0' "$e" >>"$files"
+    fi
+  done <"$entries"
+  if [[ -s "$cands" ]]; then
+    GIT_LITERAL_PATHSPECS=1 xargs -0 git -C "$MAIN" "${QUIET_GIT[@]}" ls-files -z --others --ignored --exclude-standard -- <"$cands" >>"$files" 2>/dev/null
+  fi
+  [[ -s "$files" ]] || return 0
+  # Keep the ones the .worktreeinclude patterns themselves match (git's own matching).
+  GIT_LITERAL_PATHSPECS=1 xargs -0 git -C "$MAIN" "${QUIET_GIT[@]}" ls-files -z --others --ignored --exclude-from="$WTI" -- <"$files" >"$matched" 2>/dev/null
+  root="$(cd -P "$TARGET" && pwd -P)"
+  while IFS= read -r -d '' f; do
+    src="$MAIN/$f"
+    dst="$TARGET/$f"
+    if [[ -L "$src" ]]; then
+      log ".worktreeinclude: skipping symlink $f"
+      continue
+    fi
+    [[ -f "$src" ]] || continue
+    if escapes "$dst" "$root"; then
+      log ".worktreeinclude: skipping $f (the worktree path escapes through a symlink)"
+      continue
+    fi
+    if mkdir -p "$(dirname "$dst")" && cp -p "$src" "$dst"; then
+      copied=$((copied + 1))
+    else
+      log ".worktreeinclude: could not copy $f"
+    fi
+  done <"$matched"
+  ((copied > 0)) && log "copied $copied file(s) named in .worktreeinclude"
+  return 0
+}
+
+write_marker() {
+  local gd
+  gd="$(git -C "$TARGET" rev-parse --absolute-git-dir 2>/dev/null)" || {
+    log "cannot find the git dir of $TARGET, so CLAUDE_BASE was not written"
+    return 0
+  }
+  rm -f "$gd/CLAUDE_BASE.$$"
+  if printf '%s' "$1" >"$gd/CLAUDE_BASE.$$" && mv -f "$gd/CLAUDE_BASE.$$" "$gd/CLAUDE_BASE"; then
+    return 0
+  fi
+  rm -f "$gd/CLAUDE_BASE.$$"
+  log "could not write $gd/CLAUDE_BASE"
+}
+
+# The worktree path the gitdir file of admin dir $1 points back to. Under
+# worktree.useRelativePaths git writes it relative to that admin dir.
+gitdir_backlink() {
+  local back
+  back="$(cat "$1/gitdir" 2>/dev/null)" || return 1
+  [[ -n "$back" ]] || return 1
+  [[ "$back" == /* ]] || back="$1/$back"
+  dirname "$back"
+}
+
+# The main checkout's admin dir for the linked worktree at $1 (physical path), if registered.
+registered_gitdir() {
+  local wt="$1" gd back
+  [[ -d "$wt" ]] || return 1
+  gd="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  [[ "$(phys "$gd")" == "$(phys "$COMMON")"/worktrees/* ]] || return 1
+  back="$(gitdir_backlink "$gd")" || return 1
+  same_path "$back" "$wt" || return 1
+  same_path "$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" "$wt" || return 1
+  printf '%s' "$gd"
+}
+
+# Reopening an existing worktree: like Claude Code, move it to the current fresh base when it
+# is one Claude Code made (CLAUDE_BASE), still on its branch, clean, with no commits of its own.
+refresh_existing() {
+  local gd="$1" g sha head marker
+  ((FROM_HEAD)) && return 0
+  [[ -n "$PR_NUMBER" ]] && return 0
+  [[ -f "$gd/CLAUDE_BASE" ]] || return 0
+  [[ "$(git -C "$TARGET" symbolic-ref -q --short HEAD 2>/dev/null)" == "$BRANCH" ]] || return 0
+  g="$(default_branch)"
+  sha="$(origin_sha "$g")" && [[ -n "$sha" ]] || return 0
+  head="$(git -C "$TARGET" rev-parse HEAD 2>/dev/null)" || return 0
+  [[ "$sha" != "$head" ]] || return 0
+  marker="$(cat "$gd/CLAUDE_BASE" 2>/dev/null)"
+  [[ "$head" == "$marker" ]] || git -C "$TARGET" merge-base --is-ancestor HEAD "$sha" 2>/dev/null || return 0
+  # Reading the tree and moving it run the filter drivers as a checkout does, so they are off
+  # for both, read in the worktree itself; where they cannot be (filter_args), as Claude Code
+  # does, it stays where it is. Nor do the repo's hooks or fsmonitor run, nor git in its
+  # submodules (status as Claude Code reads it), nor a signature check's gpg.program.
+  if ! filter_args "$TARGET"; then
+    log "left the reopened worktree where it is: $FILTER_REFUSAL"
+    return 0
+  fi
+  [[ -z "$(git -C "$TARGET" --no-optional-locks ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"} "${QUIET_GIT[@]}" \
+    status --porcelain --untracked-files=normal --ignore-submodules=dirty 2>/dev/null)" ]] || return 0
+  if git_quiet -C "$TARGET" ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"} "${QUIET_GIT[@]}" -c submodule.recurse=false \
+    -c merge.verifySignatures=false merge --ff-only -q "$sha"; then
+    write_marker "$sha"
+    log "moved the reopened worktree up to origin/$g"
+  fi
+}
+
+# Undo a worktree whose checkout failed after `git worktree add`.
+abandon_worktree() {
+  git_quiet -C "$MAIN" "${QUIET_GIT[@]}" worktree remove --force "$TARGET"
+  if ((!BRANCH_EXISTED)); then
+    git -C "$MAIN" "${QUIET_GIT[@]}" branch -D --end-of-options "$BRANCH" >/dev/null 2>&1
+  fi
+  die "$1"
+}
+
+emit() { printf '%s\n' "$1" >&3; }
+
+# Start `prune` for this repo in the background when the last start is a day old: in its own
+# session (setsid, else perl), ignoring SIGHUP, with stdin, stdout, stderr and fd 3 off the
+# hook's pipes (its output goes to the log), so it neither delays nor fails the creation.
+# Not while the setting cannot be used: prune would refuse, and the stamp would put off the
+# run due once the volume is back.
+auto_prune() {
+  local stamp="$COMMON/claude-worktree-prune.stamp" log="$COMMON/claude-worktree-prune.log" now mtime sh
+  [[ "${CLAUDE_WORKTREE_AUTO_PRUNE:-1}" != 0 ]] || return 0
+  ((RELOCATED)) || return 0
+  now="$(date +%s)"
+  mtime="$(file_mtime "$stamp")" || mtime=0
+  [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+  ((now - mtime >= 86400 || mtime > now)) || return 0
+  touch "$stamp" 2>/dev/null || return 0
+  sh="$BASH"
+  [[ "$sh" == /* ]] || sh=bash
+  (
+    trap '' HUP
+    cd / || exit 0
+    if command -v setsid >/dev/null 2>&1; then
+      exec setsid "$sh" "$SELF" prune "$MAIN"
+    elif command -v perl >/dev/null 2>&1; then
+      exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or exit 127' "$sh" "$SELF" prune "$MAIN"
+    fi
+    exec "$sh" "$SELF" prune "$MAIN"
+  ) </dev/null >"$log" 2>&1 3>&- &
+  return 0
+}
+
+# ── create ────────────────────────────────────────────────────────────
+NAME="" CWD="" TOP="" MAIN="" COMMON="" SLUG="" BRANCH="" TARGET="" PR_NUMBER=""
+FROM_HEAD=0
+BRANCH_EXISTED=0
+
+cmd_create() {
+  local default_base gd attach=0 copied=0 base_sha tip sparse=() add_args=() p what
+  exec 3>&1 1>&2
+  read_hook_input
+  NAME="$(hook_field name)"
+  CWD="$(hook_field cwd)"
+  [[ -n "$CWD" && -d "$CWD" ]] || CWD="$PWD"
+  valid_name "$NAME" || die "invalid worktree name: \"$NAME\""
+  command -v git >/dev/null 2>&1 || die "git is required"
+
+  TOP="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)"
+  [[ -n "$TOP" ]] || die "Cannot create a worktree: $CWD is not in a git repository"
+  MAIN="$(main_worktree "$CWD")" || die "Cannot create a worktree from $CWD: its repository has no main checkout (a bare repository)"
+  COMMON="$(common_dir "$CWD")" || die "Cannot find the git directory of $CWD"
+  SLUG="${NAME//\//+}"
+  BRANCH="worktree-$SLUG"
+  [[ "$NAME" =~ ^pr-([0-9]+)$ ]] && PR_NUMBER="${BASH_REMATCH[1]}"
+  settings_files
+
+  resolve_base
+  default_base="$MAIN/.claude/worktrees"
+  if ((RELOCATED)) && ! { mkdir -p "$BASE" 2>/dev/null && [[ -w "$BASE" ]]; }; then
+    log "cannot create or write $BASE"
+    SETTING_STATE="unusable"
+    BASE="$default_base"
+    RELOCATED=0
+  fi
+  if ((!RELOCATED)); then
+    case "$SETTING_STATE" in
+      unmounted) log "warning: worktree.baseDirectory is on a volume that is not mounted, so this worktree goes in the default $default_base instead" ;;
+      unusable) log "warning: worktree.baseDirectory could not be used, so this worktree goes in the default $default_base instead" ;;
+    esac
+    for p in "$MAIN/.claude" "$default_base"; do
+      [[ -L "$p" ]] && die "$p is a symlink; Claude Code does not create worktrees through one. Remove the symlink and retry."
+    done
+    mkdir -p "$default_base" || die "cannot create $default_base"
+    BASE="$default_base"
+  fi
+  BASE="$(cd -P "$BASE" && pwd -P)" || die "cannot enter $BASE"
+  TARGET="$BASE/$SLUG"
+  [[ -L "$TARGET" ]] && die "$TARGET is a symlink; Claude Code does not create worktrees through one. Remove the symlink and retry."
+
+  [[ "$(worktree_setting baseRef)" == "head" && -z "$PR_NUMBER" ]] && FROM_HEAD=1
+
+  # A worktree of this name already: reopen it, as `--worktree <name>` does.
+  if [[ -e "$TARGET" ]]; then
+    if gd="$(registered_gitdir "$TARGET")"; then
+      refresh_existing "$gd"
+      # Reopening is use: the daily prune, which may start just below, leaves it alone.
+      touch -c "$gd" 2>/dev/null
+      log "reusing the existing worktree $TARGET"
+      auto_prune
+      emit "$TARGET"
+      exit 0
+    fi
+    if git -C "$TARGET" rev-parse --absolute-git-dir >/dev/null 2>&1 && same_path "$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)" "$TARGET"; then
+      if same_path "$(common_dir "$TARGET")" "$COMMON"; then
+        die "$TARGET is a checkout of this repository that git's worktree records do not match (try git worktree repair), so it cannot be reused. Repair or remove it, or choose a different worktree name."
+      fi
+      die "the worktree directory at $TARGET belongs to a different repository. Remove it if it has no work to keep, or choose a different worktree name."
+    fi
+    if [[ ! -d "$TARGET" ]] || [[ -n "$(ls -A "$TARGET" 2>/dev/null)" ]]; then
+      die "worktree \"$NAME\" already exists at $TARGET but cannot be reused (it is not a worktree of this repository). Remove that directory or pass a different worktree name."
+    fi
+  fi
+
+  filter_args "$MAIN" || die "Cannot create the worktree: $FILTER_REFUSAL"
+  if [[ -n "$PR_NUMBER" ]]; then
+    pr_base "$PR_NUMBER"
+  elif ((FROM_HEAD)); then
+    head_base
+  else
+    fresh_base
+  fi
+  base_sha="$START_SHA"
+
+  # An existing worktree-<slug> branch with commits the base lacks keeps them: attach it
+  # instead of resetting it with -B (which Claude Code does). CLAUDE_BASE is then their merge
+  # base, or with none (an unrelated history) the base itself, never the branch's own tip,
+  # which would leave it no commits of its own: remove leaves a pull request's base out.
+  if tip="$(git -C "$MAIN" rev-parse -q --verify "refs/heads/$BRANCH^{commit}" 2>/dev/null)" && [[ -n "$tip" ]]; then
+    BRANCH_EXISTED=1
+    if ! git -C "$MAIN" merge-base --is-ancestor "$tip" "$START_SHA" 2>/dev/null; then
+      attach=1
+      base_sha="$(git -C "$MAIN" merge-base "$tip" "$START_SHA" 2>/dev/null)" || base_sha="$START_SHA"
+      [[ -n "$base_sha" ]] || base_sha="$START_SHA"
+      log "branch $BRANCH already has $(git -C "$MAIN" rev-list --count "$START_SHA..$tip" 2>/dev/null) commit(s) that $START_DESC lacks; attaching it as it is instead of resetting it"
+    fi
+  fi
+
+  worker_args "$MAIN"
+  while IFS= read -r p; do sparse+=("$p"); done < <(worktree_setting_list sparsePaths)
+
+  # Under extensions.worktreeConfig git copies the main checkout's worktree config into the new
+  # worktree, where a relative include in it resolves from another directory and can load a
+  # driver the listing above did not see. So then, and for sparse paths, the worktree is added
+  # without a checkout and checked out once its drivers are read in it, as Claude Code does for
+  # sparse paths.
+  [[ "$(git -C "$MAIN" config --bool --get extensions.worktreeConfig 2>/dev/null)" == true ]] && copied=1
+  add_args=(worktree add)
+  ((copied || ${#sparse[@]})) && add_args+=(--no-checkout)
+  if ((attach)); then
+    add_args+=("$TARGET" "$BRANCH")
+  else
+    add_args+=(--no-track -B "$BRANCH" "$TARGET" "$START_SHA^{commit}")
+  fi
+  if ! git_quiet -C "$MAIN" ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"} ${WORKER_ARGS[@]+"${WORKER_ARGS[@]}"} "${add_args[@]}"; then
+    case "$GIT_OUT" in
+      *"is already used by worktree at"* | *"is already checked out at"* | *"used by worktree at"* | *"checked out at"*)
+        die "branch \"$BRANCH\" for worktree \"$NAME\" is already checked out elsewhere in this repository. Pass a different worktree name." ;;
+    esac
+    p="$(printf '%s\n' "$GIT_OUT" | grep -E '^(fatal|error):' | tail -n 1)"
+    [[ -n "$p" ]] || p="$(printf '%s\n' "$GIT_OUT" | tail -n 1)"
+    die "Failed to create worktree: ${p:-git worktree add failed}"
+  fi
+
+  if ((copied || ${#sparse[@]})); then
+    what="worktree"
+    if ((${#sparse[@]})); then
+      what="sparse worktree"
+      if ! git -C "$MAIN" config --local --get extensions.worktreeConfig >/dev/null 2>&1; then
+        git -C "$MAIN" config --local claude.enabledWorktreeConfigExtension true
+      fi
+      filter_args "$TARGET" || abandon_worktree "Cannot create the worktree: $FILTER_REFUSAL"
+      git_quiet -C "$TARGET" ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"} "${QUIET_GIT[@]}" sparse-checkout set --cone -- "${sparse[@]}" ||
+        abandon_worktree "Failed to configure sparse-checkout: $GIT_OUT"
+    fi
+    filter_args "$TARGET" || abandon_worktree "Cannot create the worktree: $FILTER_REFUSAL"
+    git_quiet -C "$TARGET" ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"} ${WORKER_ARGS[@]+"${WORKER_ARGS[@]}"} checkout --no-recurse-submodules HEAD ||
+      abandon_worktree "Failed to checkout $what: $GIT_OUT"
+  fi
+
+  write_marker "$base_sha"
+  fix_hooks_path
+  link_directories
+  copy_worktreeinclude
+
+  if ((attach)); then
+    log "created $TARGET on the existing branch $BRANCH"
+  else
+    log "created $TARGET on $BRANCH from $START_DESC ($START_SHA)"
+  fi
+  auto_prune
+  emit "$TARGET"
+}
+
+# ── remove ────────────────────────────────────────────────────────────
+# How many commits $2 has that no remote and no branch other than $3 has (prints nothing when
+# git cannot tell). The base $4 (CLAUDE_BASE) is a commit, not a ref that keeps one: once
+# nothing else has it (the HEAD a baseRef head worktree began at was reset, or the branch was
+# attached with an unrelated history), it and what leads to it are the branch's own. Only a
+# pull request's worktree (branch worktree-pr-<N>) leaves its base out, the head origin keeps.
+unique_commits() {
+  local main="$1" rev="$2" branch="$3" base="$4" not=()
+  if [[ "$branch" =~ ^worktree-pr-[0-9]+$ && -n "$base" ]] && git -C "$main" rev-parse -q --verify "$base^{commit}" >/dev/null 2>&1; then
+    not+=("$base")
+  fi
+  not+=(--remotes)
+  [[ -n "$branch" ]] && not+=("--exclude=$branch")
+  not+=(--branches)
+  git -C "$main" rev-list --count "$rev" --not "${not[@]}" 2>/dev/null
+}
+
+# Delete branch $2 after its worktree went away, unless it holds commits that no remote or
+# other branch has (unique_commits, with its base $3). Only the worktree-<slug> branch create
+# names.
+remove_branch() {
+  local main="$1" branch="$2" base="$3" slug="$4" unique
+  [[ -n "$branch" ]] || return 0
+  if [[ "$branch" != "worktree-$slug" ]]; then
+    log "kept branch $branch: it is not the worktree-$slug branch this hook makes"
+    return 0
+  fi
+  git -C "$main" show-ref --verify -q "refs/heads/$branch" || return 0
+  unique="$(unique_commits "$main" "refs/heads/$branch" "$branch" "$base")"
+  if [[ "$unique" != "0" ]]; then
+    log "kept branch $branch: it has ${unique:-some} commit(s) that no remote or other branch has"
+    return 0
+  fi
+  git -C "$main" "${QUIET_GIT[@]}" branch -D --end-of-options "$branch" >/dev/null 2>&1 || log "could not delete branch $branch"
+}
+
+# Claude Code turns extensions.worktreeConfig back off once the last linked worktree is gone,
+# when it was the one that needed it for sparse paths.
+restore_worktree_config() {
+  local main="$1" common="$2"
+  [[ "$(git -C "$main" config --local --get claude.enabledWorktreeConfigExtension 2>/dev/null)" == "true" ]] || return 0
+  [[ "$(git -C "$main" worktree list --porcelain 2>/dev/null | grep -c '^worktree ')" == "1" ]] || return 0
+  [[ -s "$common/config.worktree" ]] && return 0
+  git -C "$main" config --local --unset-all extensions.worktreeConfig 2>/dev/null
+  git -C "$main" config --local --unset-all claude.enabledWorktreeConfigExtension 2>/dev/null
+  log "turned extensions.worktreeConfig back off now that no linked worktree is left"
+}
+
+# The worktree directory is already gone: drop git's record of that one worktree and its
+# branch. Only when its parent directory is still there: a worktree on a volume that is not
+# mounted only looks gone, and `git worktree prune` would forget every worktree on it. Nor
+# while the repo's worktree.baseDirectory is on a volume that is not mounted (as wt-helper
+# tells), since the directory such a volume mounts on (a Linux /mnt/<disk>) stays without it.
+forget_missing() {
+  local wt="$1" from="$2" main common gd back branch="" base="" found=""
+  if [[ ! -d "$(dirname "$wt")" ]]; then
+    log "$(dirname "$wt") is not there either (a volume that is not mounted?); leaving git's record of $wt alone"
+    return 0
+  fi
+  [[ -n "$from" && -d "$from" ]] || return 0
+  main="$(main_worktree "$from")" || return 0
+  common="$(common_dir "$main")" || return 0
+  for gd in "$common"/worktrees/*; do
+    back="$(gitdir_backlink "$gd")" || continue
+    same_path "$back" "$wt" || continue
+    found="$gd"
+    break
+  done
+  [[ -n "$found" && -f "$found/CLAUDE_BASE" ]] || return 0
+  if [[ -f "$found/locked" ]] && ! is_claude_lock "$(cat "$found/locked" 2>/dev/null)"; then
+    log "git's record of $wt is locked; leaving it alone"
+    return 0
+  fi
+  MAIN="$main" TOP="$main" COMMON="$common"
+  settings_files
+  resolve_base
+  if [[ "$SETTING_STATE" == unmounted ]]; then
+    log "worktree.baseDirectory of $main is on a volume that is not mounted, where $wt may only look gone; leaving git's record of it alone"
+    return 0
+  fi
+  base="$(cat "$found/CLAUDE_BASE" 2>/dev/null)"
+  branch="$(sed -n 's#^ref: refs/heads/##p' "$found/HEAD" 2>/dev/null)"
+  rm -rf -- "$found" || return 0
+  log "dropped git's record of $wt"
+  remove_branch "$main" "$branch" "$base" "$(basename "$wt")"
+  restore_worktree_config "$main" "$common"
+}
+
+cmd_remove() {
+  local wt from wt_p gd main base branch reason lockf
+  exec 3>&1 1>&2
+  read_hook_input
+  command -v git >/dev/null 2>&1 || die "git is required"
+  wt="$(hook_field worktree_path)"
+  from="$(hook_field cwd)"
+  [[ -n "$wt" ]] || die "the WorktreeRemove input has no worktree_path"
+  [[ "$wt" == /* ]] || die "worktree_path is not absolute: $wt"
+  if [[ ! -e "$wt" && ! -L "$wt" ]]; then
+    forget_missing "$wt" "$from"
+    log "$wt is already gone"
+    exit 0
+  fi
+  [[ -L "$wt" ]] && die "$wt is a symlink; leaving it in place"
+  [[ -d "$wt" ]] || die "$wt is not a directory; leaving it in place"
+  wt_p="$(cd -P "$wt" && pwd -P)" || die "cannot enter $wt; leaving it in place"
+  main="$(main_worktree "$wt_p")" || die "$wt is not a worktree of a git repository; leaving it in place"
+  COMMON="$(common_dir "$wt_p")" || die "cannot find the git directory of $wt; leaving it in place"
+  same_path "$main" "$wt_p" && die "$wt is the main checkout, not a linked worktree; leaving it in place"
+  gd="$(registered_gitdir "$wt_p")" || die "git does not have $wt registered as a worktree of $main; leaving it in place"
+  [[ -f "$gd/CLAUDE_BASE" ]] || die "$wt was not made by Claude Code or this hook (no CLAUDE_BASE in $gd); leaving it in place"
+  base="$(cat "$gd/CLAUDE_BASE" 2>/dev/null)"
+  branch="$(git -C "$wt_p" symbolic-ref -q --short HEAD 2>/dev/null)"
+  lockf="$gd/locked"
+  if [[ -f "$lockf" ]]; then
+    reason="$(cat "$lockf" 2>/dev/null)"
+    is_claude_lock "$reason" || die "$wt is locked (${reason:-no reason given}); unlock it first"
+    git -C "$main" "${QUIET_GIT[@]}" worktree unlock "$wt_p" 2>/dev/null
+  fi
+  cd "$main" || die "cannot enter $main"
+  if ! git_quiet -C "$main" "${QUIET_GIT[@]}" worktree remove --force "$wt_p" && [[ -e "$wt_p" ]]; then
+    die "git could not remove $wt; leaving it in place"
+  fi
+  [[ -e "$wt_p" ]] && die "$wt is still there after git worktree remove"
+  restore_worktree_config "$main" "$COMMON"
+  remove_branch "$main" "$branch" "$base" "$(basename "$wt_p")"
+  log "removed $wt"
+  exit 0
+}
+
+# ── prune ─────────────────────────────────────────────────────────────
+# The running processes whose working directory is in directory $1 (physical), as
+# "pid US command US cwd" lines (US is \037, which unlike a tab keeps an empty field; cwd is
+# the kernel's physical path), from lsof, else /proc. Fails when neither lists processes.
+PROC_CWDS=""
+CWDS_UNKNOWN=0
+US=$'\037'
+scan_cwds() {
+  local under="$1" out p c comm
+  PROC_CWDS=""
+  if command -v lsof >/dev/null 2>&1; then
+    # lsof's exit status is not the test (it can fail on processes it may not inspect); a
+    # listing with no process at all, not even this one, is.
+    if out="$(
+      set +o pipefail
+      lsof -nPw -d cwd -Fpcn </dev/null 2>/dev/null | CWD_UNDER="$under" awk -v us="$US" '
+        BEGIN { dir = ENVIRON["CWD_UNDER"] }
+        /^p/ { pid = substr($0, 2); comm = ""; seen = 1 }
+        /^c/ { comm = substr($0, 2) }
+        /^n\// { n = substr($0, 2); if (n == dir || index(n, dir "/") == 1) print pid us comm us n }
+        END { exit !seen }'
+    )"; then
+      PROC_CWDS="$out"
+      return 0
+    fi
+  fi
+  [[ -n "$(readlink /proc/self/cwd 2>/dev/null)" ]] || return 1
+  for p in /proc/[0-9]*; do
+    c="$(readlink "$p/cwd" 2>/dev/null)" || continue
+    [[ "$c" == "$under" || "$c" == "$under"/* ]] || continue
+    comm=""
+    { read -r comm <"$p/comm"; } 2>/dev/null
+    PROC_CWDS+="${p#/proc/}$US$comm$US$c"$'\n'
+  done
+  return 0
+}
+
+# "pid (command)" of a process working in directory $1 (physical).
+cwd_user() {
+  local pid comm cwd
+  while IFS="$US" read -r pid comm cwd; do
+    [[ -n "$cwd" ]] || continue
+    if [[ "$cwd" == "$1" || "$cwd" == "$1"/* ]]; then
+      printf '%s%s' "$pid" "${comm:+ ($comm)}"
+      return 0
+    fi
+  done <<<"$PROC_CWDS"
+  return 1
+}
+
+# Whether the Claude Code lock reason $1 still has its process (true when that cannot be told).
+claude_lock_live() {
+  local re='\(pid ([0-9]{1,10})( start .{1,255})?\)$'
+  [[ "$1" =~ $re ]] || return 0
+  command -v ps >/dev/null 2>&1 || return 0
+  ps -p "${BASH_REMATCH[1]}" >/dev/null 2>&1
+}
+
+# Seconds since anything about the worktree $1 (git dir $2, branch $3) last changed: the
+# newest mtime of its directory and .git file, its git dir and the entries in it (index, HEAD,
+# logs, ...), its logs/HEAD and its branch's reflog.
+idle_seconds() {
+  local f files=() newest
+  for f in "$1" "$1/.git" "$2" "$2"/* "$2/logs/HEAD" ${3:+"$COMMON/logs/refs/heads/$3"}; do
+    [[ -e "$f" ]] && files+=("$f")
+  done
+  newest="$({ stat -c %Y "${files[@]}" 2>/dev/null || stat -f %m "${files[@]}" 2>/dev/null; } |
+    awk 'BEGIN { m = 0 } /^[0-9]+$/ && $1 > m { m = $1 } END { print m }')"
+  printf '%s' "$(($(date +%s) - newest))"
+}
+
+ago() {
+  local d=$(($1 / 86400))
+  case "$d" in
+    0) printf 'less than a day ago' ;;
+    1) printf '1 day ago' ;;
+    *) printf '%s days ago' "$d" ;;
+  esac
+}
+
+# The git operation under way in the worktree whose git dir is $1, if any.
+op_in_progress() {
+  local f
+  for f in MERGE_HEAD rebase-merge rebase-apply CHERRY_PICK_HEAD REVERT_HEAD sequencer BISECT_LOG; do
+    [[ -e "$1/$f" ]] || continue
+    case "$f" in
+      MERGE_HEAD) printf 'a merge' ;;
+      rebase-*) printf 'a rebase' ;;
+      CHERRY_PICK_HEAD) printf 'a cherry-pick' ;;
+      REVERT_HEAD) printf 'a revert' ;;
+      sequencer) printf 'a cherry-pick or revert' ;;
+      BISECT_LOG) printf 'a bisect' ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+# Whether $2 in worktree $1 is one of create's symlinkDirectories links (to the same path in
+# the main checkout), which git status counts as untracked.
+LINK_DIRS=()
+hook_link() {
+  local d
+  for d in ${LINK_DIRS[@]+"${LINK_DIRS[@]}"}; do
+    [[ "${d%/}" == "$2" && -L "$1/$2" && "$(readlink "$1/$2")" == "$MAIN/$d" ]] && return 0
+  done
+  return 1
+}
+
+# A submodule checked out in worktree $1 (git dir $2), if any, found as git worktree remove
+# finds one, which it then refuses: a modules dir in the git dir, or a gitlink whose directory
+# has a .git. git status would run git in it too, with that repository's own drivers.
+checked_out_submodule() {
+  local entry
+  if [[ -d "$2/modules" ]]; then
+    printf '%s' "$2/modules"
+    return 0
+  fi
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == "160000 "* ]] || continue
+    entry="${entry#*$'\t'}"
+    if [[ -e "$1/$entry/.git" ]]; then
+      printf '%s' "$entry"
+      return 0
+    fi
+  done < <(git -C "$1" "${QUIET_GIT[@]}" ls-files -s -z 2>/dev/null)
+  return 1
+}
+
+# The lines of `git status` for worktree $1 that are changes (create's links left out); fails
+# when git status does. Untracked files count whatever status.showUntrackedFiles says. The
+# repo's drivers (FILTER_ARGS, read in it), hooks and fsmonitor stay out of it.
+changes() {
+  local out line
+  out="$(git -C "$1" ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"} "${QUIET_GIT[@]}" status --porcelain --untracked-files=normal \
+    --ignore-submodules=none 2>/dev/null)" || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    [[ "$line" == '?? '* ]] && hook_link "$1" "${line#?? }" && continue
+    printf '%s\n' "$line"
+  done <<<"$out"
+}
+
+# Why prune keeps the worktree at $1 (physical path), in VERDICT; empty when it may go. Sets
+# WT_GD, WT_BRANCH, WT_BASE and WT_LOCK (the stale Claude Code lock, if any) for the removal.
+VERDICT="" WT_GD="" WT_BRANCH="" WT_BASE="" WT_LOCK=""
+LIMIT=0 DAYS=7
+prune_verdict() {
+  local wt="$1" lock idle n head who op ch sub
+  VERDICT="" WT_GD="" WT_BRANCH="" WT_BASE="" WT_LOCK=""
+  if [[ -L "$wt" || ! -d "$wt" ]]; then
+    VERDICT="its directory is missing"
+    [[ -L "$wt" ]] && VERDICT="it is a symlink"
+    return 0
+  fi
+  WT_GD="$(registered_gitdir "$wt")" || {
+    VERDICT="git's record of it does not match the directory"
+    return 0
+  }
+  [[ -f "$WT_GD/CLAUDE_BASE" ]] || {
+    VERDICT="not made by this hook (no CLAUDE_BASE in $WT_GD)"
+    return 0
+  }
+  WT_BASE="$(cat "$WT_GD/CLAUDE_BASE" 2>/dev/null)"
+  WT_BRANCH="$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)"
+  if [[ -f "$WT_GD/locked" ]]; then
+    lock="$(cat "$WT_GD/locked" 2>/dev/null)"
+    if ! is_claude_lock "$lock"; then
+      VERDICT="locked (${lock:-no reason given})"
+      return 0
+    fi
+    if claude_lock_live "$lock"; then
+      VERDICT="in use (locked by a Claude Code process that is still running: $lock)"
+      return 0
+    fi
+    WT_LOCK="$lock"
+  fi
+  if ((CWDS_UNKNOWN)); then
+    VERDICT="cannot tell whether a process works in it (neither lsof nor /proc lists them)"
+    return 0
+  fi
+  if who="$(cwd_user "$wt")"; then
+    VERDICT="in use (process $who works in it)"
+    return 0
+  fi
+  idle="$(idle_seconds "$wt" "$WT_GD" "$WT_BRANCH")"
+  if ((idle <= LIMIT)); then
+    VERDICT="last changed $(ago "$idle") (prune waits until it is idle for over $DAYS days)"
+    return 0
+  fi
+  head="$(git -C "$wt" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" || {
+    VERDICT="it has no commit checked out"
+    return 0
+  }
+  n="$(unique_commits "$MAIN" "$head" "$WT_BRANCH" "$WT_BASE")"
+  if [[ "$n" != 0 ]]; then
+    VERDICT="${n:-some} commit(s) that no remote or other branch has"
+    return 0
+  fi
+  if op="$(op_in_progress "$WT_GD")"; then
+    VERDICT="$op is in progress"
+    return 0
+  fi
+  # Reading its tree and removing it run the repo's filter drivers as a checkout does: they
+  # stay off for both, read in the worktree itself, and where they cannot be, it stays.
+  if ! filter_args "$wt"; then
+    VERDICT="its git config does not let the filter drivers be switched off: $FILTER_REFUSAL"
+    return 0
+  fi
+  if sub="$(checked_out_submodule "$wt" "$WT_GD")"; then
+    VERDICT="it has a submodule checked out ($sub), which git worktree remove refuses"
+    return 0
+  fi
+  if ! ch="$(changes "$wt")"; then
+    VERDICT="git status failed in it"
+  elif [[ -n "$ch" ]]; then
+    VERDICT="uncommitted or untracked changes (git status lists $(printf '%s\n' "$ch" | wc -l | tr -d ' '))"
+  fi
+  return 0
+}
+
+# Remove worktree $1 as remove does, except that git's own clean check stays on (no --force):
+# create's links go first, since git counts them as untracked, and come back when git refuses.
+# Unlocks only the stale Claude Code lock prune_verdict saw; any other lock (one written since)
+# stops it, as git worktree remove would.
+PRUNE_ERR=""
+prune_one() {
+  local wt="$1" d lock links=()
+  PRUNE_ERR=""
+  if [[ -f "$WT_GD/locked" ]]; then
+    lock="$(cat "$WT_GD/locked" 2>/dev/null)"
+    if [[ -z "$WT_LOCK" || "$lock" != "$WT_LOCK" ]]; then
+      PRUNE_ERR="it was locked meanwhile (${lock:-no reason given})"
+      return 1
+    fi
+    git -C "$MAIN" "${QUIET_GIT[@]}" worktree unlock "$wt" 2>/dev/null || {
+      PRUNE_ERR="could not unlock its stale lock ($WT_LOCK)"
+      return 1
+    }
+  fi
+  for d in ${LINK_DIRS[@]+"${LINK_DIRS[@]}"}; do
+    d="${d%/}"
+    hook_link "$wt" "$d" && rm -f "$wt/$d" && links+=("$d")
+  done
+  # git's clean check reads the tree: the drivers prune_verdict read stay off, and the hooks.
+  if ! git_quiet -C "$MAIN" ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"} "${QUIET_GIT[@]}" worktree remove "$wt" || [[ -e "$wt" ]]; then
+    PRUNE_ERR="$(printf '%s\n' "$GIT_OUT" | grep -E '^(fatal|error):' | tail -n 1)"
+    [[ -n "$PRUNE_ERR" ]] || PRUNE_ERR="it is still there after git worktree remove"
+    for d in ${links[@]+"${links[@]}"}; do [[ -e "$wt/$d" || -L "$wt/$d" ]] || ln -s "$MAIN/$d" "$wt/$d" 2>/dev/null; done
+    return 1
+  fi
+  restore_worktree_config "$MAIN" "$COMMON"
+  remove_branch "$MAIN" "$WT_BRANCH" "$WT_BASE" "${wt##*/}"
+  return 0
+}
+
+cmd_prune() {
+  local arg dry=0 repo="" base_p list line wt wtp paths=() removed=0 kept=0 failed=0
+  for arg in "$@"; do
+    case "$arg" in
+      -n | --dry-run) dry=1 ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      -*)
+        usage >&2
+        exit 2
+        ;;
+      *)
+        [[ -z "$repo" ]] || {
+          usage >&2
+          exit 2
+        }
+        repo="$arg"
+        ;;
+    esac
+  done
+  DAYS="${CLAUDE_WORKTREE_PRUNE_DAYS:-7}"
+  [[ "$DAYS" =~ ^[0-9]+$ ]] || die "CLAUDE_WORKTREE_PRUNE_DAYS must be a whole number of days, not \"$DAYS\""
+  LIMIT=$((10#$DAYS * 86400))
+  command -v git >/dev/null 2>&1 || die "git is required"
+  command -v jq >/dev/null 2>&1 || die "jq is required"
+  repo="${repo:-.}"
+  [[ -d "$repo" ]] || die "$repo is not a directory"
+  MAIN="$(main_worktree "$repo")" || die "$repo is not in a git repository with a main checkout"
+  COMMON="$(common_dir "$MAIN")" || die "cannot find the git directory of $MAIN"
+  TOP="$MAIN"
+  cd "$MAIN" || die "cannot enter $MAIN"
+  # Reading must change nothing: no index refresh by git status, which would reset the idle
+  # clock prune reads.
+  export GIT_OPTIONAL_LOCKS=0
+  settings_files
+  resolve_base
+  case "$SETTING_STATE" in
+    used) ;;
+    none) die "$MAIN has no worktree.baseDirectory of its own, so there are no worktrees of this hook's to prune (Claude Code cleans up its .claude/worktrees itself)" ;;
+    unmounted) die "worktree.baseDirectory of $MAIN is on a volume that is not mounted; nothing pruned (its worktrees only look missing until it is back)" ;;
+    *) die "worktree.baseDirectory of $MAIN cannot be used right now (see wt-helper --print-base-dir there); nothing pruned" ;;
+  esac
+  # Past a config that keeps the repo's filter drivers from being switched off (as for create),
+  # nothing goes: prune reads trees and removes worktrees.
+  filter_args "$MAIN" || die "$FILTER_REFUSAL; nothing pruned"
+  if [[ ! -d "$BASE" ]]; then
+    printf '%s: nothing to prune: %s does not exist\n' "$PROG" "$BASE"
+    return 0
+  fi
+  base_p="$(phys "$BASE")"
+  while IFS= read -r line; do LINK_DIRS+=("$line"); done < <(worktree_setting_list symlinkDirectories)
+  scan_cwds "$base_p" || CWDS_UNKNOWN=1
+  list="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null)" || die "git worktree list failed in $MAIN"
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] && paths+=("${line#worktree }")
+  done <<<"$list"
+
+  for wt in ${paths[@]+"${paths[@]}"}; do
+    wtp="$(phys "$wt")"
+    [[ "${wtp%/*}" == "$base_p" ]] || continue
+    same_path "$wtp" "$MAIN" && continue
+    prune_verdict "$wtp"
+    if [[ -z "$VERDICT" ]] && ((!dry)); then
+      # Look again just before removing: a session may have started in it since the scan.
+      CWDS_UNKNOWN=0
+      scan_cwds "$base_p" || CWDS_UNKNOWN=1
+      prune_verdict "$wtp"
+    fi
+    if [[ -n "$VERDICT" ]]; then
+      printf '%s: kept %s: %s\n' "$PROG" "$wtp" "$VERDICT"
+      kept=$((kept + 1))
+    elif ((dry)); then
+      printf '%s: would remove %s%s\n' "$PROG" "$wtp" "${WT_BRANCH:+ (branch $WT_BRANCH)}"
+      removed=$((removed + 1))
+    elif prune_one "$wtp"; then
+      printf '%s: removed %s%s\n' "$PROG" "$wtp" "${WT_BRANCH:+ (branch $WT_BRANCH)}"
+      removed=$((removed + 1))
+    else
+      printf '%s: could not remove %s: %s\n' "$PROG" "$wtp" "$PRUNE_ERR"
+      failed=$((failed + 1))
+    fi
+  done
+  if ((dry)); then
+    printf '%s: prune --dry-run: %d would be removed, %d kept, in %s\n' "$PROG" "$removed" "$kept" "$base_p"
+  else
+    printf '%s: prune: %d removed, %d kept, %d failed, in %s\n' "$PROG" "$removed" "$kept" "$failed" "$base_p"
+  fi
+  ((failed == 0))
+}
+
+# ── enable / disable ──────────────────────────────────────────────────
+settings_target() {
+  local repo="${1:-.}"
+  [[ -d "$repo" ]] || die "$repo is not a directory"
+  command -v jq >/dev/null 2>&1 || die "jq is required"
+  MAIN="$(main_worktree "$repo")" || die "$repo is not in a git repository with a main checkout"
+  SETTINGS_FILE="$MAIN/.claude/settings.local.json"
+}
+
+# Rewrite SETTINGS_FILE with jq program $1 (atomically, keeping its mode).
+rewrite_settings() {
+  local prog="$1" tmp mode
+  mkdir -p "$(dirname "$SETTINGS_FILE")" || die "cannot create $(dirname "$SETTINGS_FILE")"
+  [[ -f "$SETTINGS_FILE" ]] || printf '{}\n' >"$SETTINGS_FILE"
+  jq -e 'type == "object"' "$SETTINGS_FILE" >/dev/null 2>&1 || die "$SETTINGS_FILE is not a JSON object; fix it first"
+  tmp="$(mktemp "$SETTINGS_FILE.XXXXXX")" || die "cannot write next to $SETTINGS_FILE"
+  if ! jq --arg c "$HOOK_CMD_PREFIX create" --arg r "$HOOK_CMD_PREFIX remove" "$prog" "$SETTINGS_FILE" >"$tmp"; then
+    rm -f "$tmp"
+    die "could not update $SETTINGS_FILE"
+  fi
+  mode="$(stat -c %a "$SETTINGS_FILE" 2>/dev/null || stat -f %Lp "$SETTINGS_FILE" 2>/dev/null)"
+  [[ -n "$mode" ]] && chmod "$mode" "$tmp"
+  mv -f "$tmp" "$SETTINGS_FILE" || {
+    rm -f "$tmp"
+    die "could not replace $SETTINGS_FILE"
+  }
+}
+
+SETTINGS_FILE=""
+cmd_enable() {
+  local others f
+  settings_target "${1:-.}"
+  TOP="$MAIN"
+  resolve_base
+  if [[ "$SETTING_STATE" == "none" ]]; then
+    die "$MAIN has no worktree.baseDirectory (in .claude/settings.local.json or .claude/settings.json); set it first, since without it the hooks would only change how Claude Code treats its worktrees"
+  fi
+  [[ -f "$SETTINGS_FILE" ]] && ! jq -e 'type == "object"' "$SETTINGS_FILE" >/dev/null 2>&1 && die "$SETTINGS_FILE is not a JSON object; fix it first"
+  others="$( [[ -f "$SETTINGS_FILE" ]] && jq -r '[.hooks.WorktreeCreate[]?.hooks[]?.command // empty | select(test("claude-worktree-hook") | not)] | .[]' "$SETTINGS_FILE" 2>/dev/null)"
+  [[ -z "$others" ]] || die "$SETTINGS_FILE already has another WorktreeCreate hook ($others); Claude Code would run both and take whichever path comes first"
+  for f in "$HOME/.claude/settings.json" "$MAIN/.claude/settings.json"; do
+    [[ -f "$f" ]] || continue
+    others="$(jq -r '[.hooks.WorktreeCreate[]?.hooks[]?.command // empty | select(test("claude-worktree-hook") | not)] | .[]' "$f" 2>/dev/null)"
+    [[ -z "$others" ]] || log "warning: $f has a WorktreeCreate hook too ($others); Claude Code runs both"
+  done
+  rewrite_settings '
+    def add(ev; cmd):
+      .hooks[ev] = ((.hooks[ev] // [])
+        | if any(.[]?; any(.hooks[]?; (.command // "") | test("claude-worktree-hook"))) then .
+          else . + [{"hooks": [{"type": "command", "command": cmd}]}] end);
+    .hooks = (.hooks // {}) | add("WorktreeCreate"; $c) | add("WorktreeRemove"; $r)'
+  printf '%s: WorktreeCreate and WorktreeRemove hooks are set in %s\n' "$PROG" "$SETTINGS_FILE"
+  case "$SETTING_STATE" in
+    used) printf '%s: new Claude Code worktrees of %s go in %s\n' "$PROG" "$MAIN" "$BASE" ;;
+    *) printf '%s: worktree.baseDirectory cannot be used right now (see wt-helper --print-base-dir in %s); until it can, they go in %s/.claude/worktrees\n' "$PROG" "$MAIN" "$MAIN" ;;
+  esac
+  printf '%s: note: Claude Code keeps every worktree a hook made when its agent finishes, even an unchanged one; once a day create removes the ones that are clean, unused and idle for over CLAUDE_WORKTREE_PRUNE_DAYS (7) days (claude-worktree-hook prune --dry-run lists them; disable undoes all of this)\n' "$PROG"
+}
+
+cmd_disable() {
+  settings_target "${1:-.}"
+  if [[ ! -f "$SETTINGS_FILE" ]]; then
+    printf '%s: %s does not exist; nothing to do\n' "$PROG" "$SETTINGS_FILE"
+    return 0
+  fi
+  rewrite_settings '
+    def drop(ev):
+      if (.hooks[ev] | type) == "array" then
+        .hooks[ev] |= (map(if (.hooks | type) == "array"
+                           then .hooks |= map(select(((.command // "") | test("claude-worktree-hook")) | not))
+                           else . end)
+                       | map(select((.hooks | type) != "array" or (.hooks | length) > 0)))
+        | if (.hooks[ev] | length) == 0 then del(.hooks[ev]) else . end
+      else . end;
+    if (.hooks | type) == "object" then drop("WorktreeCreate") | drop("WorktreeRemove")
+      | if .hooks == {} then del(.hooks) else . end
+    else . end'
+  printf '%s: WorktreeCreate and WorktreeRemove hooks are out of %s\n' "$PROG" "$SETTINGS_FILE"
+}
+
+case "${1:-}" in
+  create) cmd_create ;;
+  remove) cmd_remove ;;
+  enable) cmd_enable "${2:-.}" ;;
+  disable) cmd_disable "${2:-.}" ;;
+  prune)
+    shift
+    cmd_prune "$@"
+    ;;
+  -h | --help | help) usage ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

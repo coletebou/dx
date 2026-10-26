@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+# wt-helper — git worktree spinner with state-aware prompts.
+#
+# Invoked by the `wt` shell function in base/aliases.sh. The function
+# captures the final worktree path from stdout and `cd`s into it.
+# Everything user-facing (prompts, menus, status lines) is written to
+# /dev/tty so it never leaks into the path the function reads.
+#
+# Usage: wt-helper <branch> [--from fresh|head] [--no-cd] [--target PATH]
+#        wt-helper --print-base-dir
+#
+# Conventions:
+#   - Default worktree path: <repo>/.claude/worktrees/<branch>
+#     (nested inside the main repo, e.g. ~/code/app/.claude/worktrees/1847-foo).
+#     .claude/worktrees/ is git-ignored so worktrees aren't tracked.
+#   - Per-repo directory: worktree.baseDirectory in the repo's
+#     .claude/settings.local.json, then .claude/settings.json, puts worktrees
+#     in <dir>/<branch> (absolute, ~/..., or relative to the repo root), e.g.
+#     an external drive. A <dir> on a volume that is not mounted is refused
+#     rather than created on the root disk.
+#   - Revert to flat siblings: set WT_LAYOUT=sibling to use
+#     <parent-of-repo>/<repo-name>-<branch> (e.g. ~/code/app-1847-foo).
+#   - Collected layout: set WT_BASE_DIR to use <WT_BASE_DIR>/<branch>.
+#   - Inside the repo whatever the setting says: WT_LAYOUT=nested.
+#   - Nested subpath: set WT_NESTED_SUBDIR to change it (default .claude/worktrees).
+#   - Explicit override: pass --target <abs-path> to use that path
+#     verbatim. Used by pw (parallel-worktrees) so it can keep
+#     tag-based names (<repo>-<tag>) instead of branch-slug names.
+#   - --print-base-dir prints the directory new worktrees go in and exits
+#     without touching anything; pw puts its tag-named worktrees there.
+#   - Stale worktree records are pruned first, except while a registered
+#     worktree is on a volume that is not mounted (directly or through a
+#     symlink): it only looks stale, and prune would make git forget it.
+#   - Branch names with '/' are sanitized to '-' in the path only;
+#     the actual git ref keeps its slashes.
+#   - Default base for new branches: origin/HEAD's symbolic target.
+#     (a repo whose default is `dev` resolves to it; most to `master`/`main`.)
+#   - Branch state machine:
+#       NEW                    → ask: fresh / head / cancel
+#       EXISTS_NOT_CHECKED_OUT → just attach the worktree
+#       EXISTS_IN_WORKTREE     → ask: cd / copy / recreate / cancel
+#
+# All errors and prompts go to /dev/tty. Only the final absolute path
+# is printed to stdout on success.
+
+set -uo pipefail
+# An exported CDPATH would take `cd .git` somewhere other than the cwd's.
+unset CDPATH
+
+# ── tty handling ─────────────────────────────────────────────────────
+# Prefer /dev/tty so prompts and chrome reach the user even when stdout
+# is captured by command substitution. Fall back to stderr when there
+# is no controlling tty (CI, Bash tool, cron, nohup, …).
+# Redirection order matters: stderr → /dev/null FIRST, then attempt
+# the /dev/tty redirection. Bash logs failed redirections immediately,
+# so reversing the order would let the "Device not configured" error
+# leak past the silencer in non-tty contexts.
+# Messages go to fd 3, opened once. Writing to /dev/stderr per message
+# instead reopens it, and on Linux that truncates a file stderr points at
+# (wt-helper ... 2>log), so only the last line would survive.
+if { : 2>/dev/null >/dev/tty; } 2>/dev/null; then
+  exec 3>/dev/tty
+  HAS_TTY=1
+else
+  exec 3>&2
+  HAS_TTY=0
+fi
+
+say()  { printf '%s\n' "$*" >&3; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&3; }
+err()  { printf '\033[31m%s\033[0m\n' "$*" >&3; }
+ok()   { printf '\033[32m%s\033[0m\n' "$*" >&3; }
+dim()  { printf '\033[2m%s\033[0m\n' "$*" >&3; }
+
+ask() {
+  # Read interactively from /dev/tty; refuse if no tty (no way to
+  # answer a prompt non-interactively without an explicit --from flag).
+  if [[ $HAS_TTY -eq 0 ]]; then
+    err "wt: prompt required but no controlling tty (re-run interactively, or pass --from fresh|head)"
+    exit 2
+  fi
+  local reply
+  printf '%s' "$1" >/dev/tty
+  IFS= read -r reply </dev/tty || return 1
+  printf '%s' "$reply"
+}
+
+usage() {
+  cat <<'EOF' >&2
+Usage: wt <branch> [--from fresh|head] [--no-cd]
+
+  Creates (or attaches) a git worktree for <branch> rooted at the
+  current repo. If <branch> doesn't exist, you'll be asked whether
+  to base the new branch off origin/HEAD (fresh) or local HEAD.
+  If the branch is already checked out in another worktree, you
+  get options to cd, copy, or recreate.
+
+Options:
+  --from fresh   Skip the menu and branch off origin/HEAD.
+  --from head    Skip the menu and branch off local HEAD.
+  --no-cd        Don't print the path on stdout — the wrapper won't cd.
+                 (Use --print-target if you want both no-cd AND the path.)
+  --no-fetch     Skip `git fetch origin <default-branch>` (offline use).
+  --target PATH  Use PATH for the worktree dir instead of the default
+                 nested layout. Path must be absolute.
+  --print-target Always print the final path on stdout, even with --no-cd.
+                 (For batch callers like pw that need the path but don't
+                 need a cwd change.)
+  --print-base-dir
+                 Print the directory new worktrees go in (the layout below)
+                 and exit. Takes no branch and creates nothing. (pw uses it
+                 to place its tag-named worktrees.)
+
+Worktree layout (precedence high→low; --target beats all):
+  WT_BASE_DIR       Collected layout: worktrees go in <WT_BASE_DIR>/<branch>.
+  WT_LAYOUT=sibling Revert to the old flat-sibling layout:
+                    <parent-of-repo>/<repo>-<branch> (e.g. ~/code/app-foo).
+  WT_LAYOUT=nested  The nested default below, ignoring the repo setting.
+  worktree.baseDirectory
+                    Repo setting, read from .claude/settings.local.json, then
+                    .claude/settings.json: worktrees go in <dir>/<branch>.
+                    Absolute, ~/..., or relative to the repo root. Refused if
+                    <dir> is on an external volume that is not mounted.
+  WT_NESTED_SUBDIR  Nested subpath under the repo (default .claude/worktrees).
+  (default)         Nested: <repo>/.claude/worktrees/<branch>
+                    (e.g. ~/code/app/.claude/worktrees/foo). git-ignored.
+EOF
+}
+
+# ── argument parse ───────────────────────────────────────────────────
+BRANCH=""
+FROM=""              # "" | "fresh" | "head"
+NO_CD=0
+NO_FETCH=0           # skip `git fetch origin <default-branch>` for offline use
+TARGET_OVERRIDE=""   # explicit path (used by pw)
+PRINT_TARGET=0       # force path to stdout even with --no-cd (used by pw)
+PRINT_BASE_DIR=0     # print the resolved worktree directory and exit (used by pw)
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --from)
+      FROM="${2:-}"; shift 2
+      [[ "$FROM" == "fresh" || "$FROM" == "head" ]] || { err "--from must be fresh|head"; exit 2; }
+      ;;
+    --no-cd) NO_CD=1; shift ;;
+    --no-fetch) NO_FETCH=1; shift ;;
+    --target)
+      TARGET_OVERRIDE="${2:-}"; shift 2
+      [[ -n "$TARGET_OVERRIDE" ]] || { err "--target requires a path"; exit 2; }
+      [[ "$TARGET_OVERRIDE" == /* ]] || { err "--target path must be absolute: $TARGET_OVERRIDE"; exit 2; }
+      ;;
+    --print-target) PRINT_TARGET=1; shift ;;
+    --print-base-dir) PRINT_BASE_DIR=1; shift ;;
+    --*) err "Unknown flag: $1"; usage; exit 2 ;;
+    *)
+      [[ -n "$BRANCH" ]] && { err "Unexpected positional arg: $1"; exit 2; }
+      BRANCH="$1"; shift
+      ;;
+  esac
+done
+
+[[ -n "$BRANCH" || $PRINT_BASE_DIR -eq 1 ]] || { usage; exit 2; }
+
+# Reject obviously invalid refs early — git's own validator.
+if [[ -n "$BRANCH" ]] && ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
+  err "Invalid branch name: $BRANCH"
+  exit 2
+fi
+
+# ── locate the repo ──────────────────────────────────────────────────
+if ! REPO_TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null); then
+  err "Not inside a git repository (cwd: $PWD)"
+  exit 1
+fi
+
+# When run from inside a worktree, common-dir points at the main repo's .git.
+# git prints both dirs relative to the cwd (../../.git from a subdirectory),
+# so they are resolved from here.
+GIT_DIR_ABS=$(cd "$(git rev-parse --git-dir 2>/dev/null)" && pwd -P)
+GIT_COMMON_DIR=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)" && pwd -P)
+# The main checkout, whose settings and nested default count. In the main
+# worktree that is the toplevel: the git dir's parent is not the checkout for
+# a submodule (its git dir is the superproject's .git/modules/<name>) or a
+# separate git dir. From a linked worktree it is the parent of a common .git,
+# else the checkout core.worktree names (a submodule's), else that parent
+# anyway (a separate git dir names its checkout nowhere).
+if [[ -n "$GIT_DIR_ABS" && "$GIT_DIR_ABS" == "$GIT_COMMON_DIR" ]]; then
+  MAIN_REPO="$REPO_TOPLEVEL"
+elif [[ "${GIT_COMMON_DIR##*/}" != .git ]] &&
+  _wt_core=$(git config --file "$GIT_COMMON_DIR/config" --get core.worktree 2>/dev/null) &&
+  [[ -n "$_wt_core" ]] && _wt_core=$(cd "$GIT_COMMON_DIR" && cd "$_wt_core" 2>/dev/null && pwd -P); then
+  MAIN_REPO="$_wt_core"
+else
+  MAIN_REPO=$(cd "$GIT_COMMON_DIR/.." && pwd)
+fi
+unset _wt_core
+REPO_NAME=$(basename "$MAIN_REPO")
+PARENT_DIR=$(dirname "$MAIN_REPO")
+
+# Sanitize branch name for use in a path component: '/' → '-'. Git allows
+# slashes in branch names ("feat/foo"); a flat layout can't, so collapse
+# them in the directory name only — the actual ref keeps its slashes.
+BRANCH_SLUG="${BRANCH//\//-}"
+
+# ── worktree directory ───────────────────────────────────────────────
+# Print worktree.baseDirectory from one Claude Code settings file. Returns 1
+# when the file is absent or doesn't set it, and 2, after a warning, when the
+# file may set it but can't be read (unreadable, no jq, not JSON, not a
+# string), so the caller moves on to the next file and then the default.
+wt_setting_base_dir() {
+  local file="$1" name=".claude/${1##*/}" out
+  [[ -e "$file" ]] || return 1
+  if [[ ! -r "$file" ]]; then
+    warn "wt: cannot read $name, so any worktree.baseDirectory in it was not read"
+    return 2
+  fi
+  # A file that never mentions the key can't set it, so a missing jq or a
+  # malformed file only matters when it does.
+  grep -q '"baseDirectory"' "$file" 2>/dev/null || return 1
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "wt: jq not found, so worktree.baseDirectory in $name was not read"
+    return 2
+  fi
+  if ! out=$(jq -r 'try .worktree.baseDirectory catch null
+      | if type == "string" then "s:" + . elif . == null then "n:" else "t:" + type end' "$file" 2>/dev/null); then
+    warn "wt: $name is not valid JSON, so its worktree.baseDirectory was not read"
+    return 2
+  fi
+  case "$out" in
+    *$'\n'*) warn "wt: $name holds more than one JSON document, so its worktree.baseDirectory was not read"; return 2 ;;
+    s:?*) printf '%s' "${out#s:}" ;;
+    s:|n:) return 1 ;;
+    *) warn "wt: worktree.baseDirectory in $name is a ${out#t:}, not a path; ignoring it"; return 2 ;;
+  esac
+}
+
+# Device number of a path (GNU stat first: BSD stat rejects -c, while GNU
+# stat -f is filesystem mode and would print something else).
+wt_device() { stat -c %d "$1" 2>/dev/null || stat -f %d "$1" 2>/dev/null; }
+
+# True when $1 is a mount point: its device differs from its parent's, or,
+# for a Linux bind mount that shares the device, mountpoint(1) says so.
+wt_is_mountpoint() {
+  local dev pdev
+  [[ -d "$1" ]] || return 1
+  dev=$(wt_device "$1") && pdev=$(wt_device "$(dirname "$1")") && [[ "$dev" != "$pdev" ]] && return 0
+  command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$1" 2>/dev/null
+}
+
+# $1 with the symlinks in its existing part resolved and the rest kept as
+# written, so /Volumes/Macintosh HD/... (a symlink to /) isn't taken for a volume.
+wt_physical_path() {
+  local head="$1" tail="" phys
+  while [[ ! -d "$head" && "$head" == /?* ]]; do
+    tail="/${head##*/}$tail"
+    head="${head%/*}"
+    [[ -n "$head" ]] || head=/
+  done
+  phys=$(cd "$head" 2>/dev/null && pwd -P) || phys="$head"
+  [[ "$phys" == / ]] && phys=""
+  printf '%s' "$phys$tail"
+}
+
+# A directory on an external volume that isn't mounted must not be created:
+# mkdir -p would put it on the root disk (and on macOS the drive would then
+# mount at "/Volumes/<name> 1" beside the stray folder). So a path under a
+# mount container needs a mount point between the container and itself.
+wt_volume_mounted() {
+  local path container
+  path=$(wt_physical_path "$1")
+  for container in /Volumes /mnt /media /run/media; do
+    [[ "$path" == "$container"/* ]] || continue
+    while :; do
+      wt_is_mountpoint "$path" && return 0
+      [[ "$path" == "$container" || "$path" != /?* ]] && return 1
+      path=$(dirname "$path")
+    done
+  done
+  return 0
+}
+
+# $1 with its symlinks resolved, dangling ones included, and the missing rest
+# kept as written. A worktree reached through a link into a volume that is not
+# mounted sits behind a link to nowhere, which wt_physical_path (it resolves
+# only the part that exists) would place wherever the link is.
+wt_resolve_links() {
+  local path="$1" head tail link hops=0
+  while (( hops < 40 )); do
+    head="$path" tail=""
+    while [[ ! -e "$head" && "$head" == /?* ]]; do
+      if [[ -L "$head" ]] && link=$(readlink "$head"); then
+        [[ "$link" == /* ]] || link="${head%/*}/$link"
+        path="$link$tail"
+        hops=$((hops + 1))
+        continue 2
+      fi
+      tail="/${head##*/}$tail"
+      head="${head%/*}"
+      [[ -n "$head" ]] || head=/
+    done
+    break
+  done
+  wt_physical_path "$path"
+}
+
+# Count the registered worktrees that only look stale because the volume they
+# are on is not mounted: no .git where git recorded one, not locked (prune
+# keeps locked worktrees anyway), and on a volume, once links are followed,
+# that no mount point covers. Sets WT_UNMOUNTED and WT_UNMOUNTED_FIRST.
+wt_find_unmounted_worktrees() {
+  local line path="" locked=0
+  WT_UNMOUNTED=0 WT_UNMOUNTED_FIRST=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) path="${line#worktree }" locked=0 ;;
+      locked | "locked "*) locked=1 ;;
+      "")
+        # A blank line ends each record.
+        if [[ -n "$path" && $locked -eq 0 && ! -e "$path/.git" ]] \
+          && ! wt_volume_mounted "$(wt_resolve_links "$path")"; then
+          WT_UNMOUNTED=$((WT_UNMOUNTED + 1))
+          [[ -n "$WT_UNMOUNTED_FIRST" ]] || WT_UNMOUNTED_FIRST="$path"
+        fi
+        path="" ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null; echo)
+}
+
+# Resolve the directory new worktrees go in, honoring (highest priority first):
+#   1. WT_BASE_DIR=<dir>        collected layout: <dir>/<slug>.
+#   2. WT_LAYOUT=sibling        flat-sibling layout: <parent>/<repo>-<slug>
+#                               (the old default — now an opt-in revert lever).
+#   3. WT_LAYOUT=nested         the nested default (5), ignoring the setting (4).
+#   4. worktree.baseDirectory   from the main repo's .claude/settings.local.json,
+#                               then .claude/settings.json (local wins, as in
+#                               Claude Code): <dir>/<slug>. Absolute, ~ or ~/...,
+#                               or relative to the repo root. Refused when <dir>
+#                               is on a volume that is not mounted.
+#   5. default (nested)         <repo>/<WT_NESTED_SUBDIR>/<slug>, where
+#                               WT_NESTED_SUBDIR defaults to .claude/worktrees.
+#                               Nested worktrees live INSIDE the main repo;
+#                               .claude/worktrees/ is git-ignored (add it to a
+#                               .dockerignore too) so they aren't tracked or shipped.
+# Sets BASE_DIR, LEAF_PREFIX ("<repo>-" in the sibling layout) and LAYOUT_DESC.
+# --target (see wt_resolve_target) beats all of these. One env var
+# (WT_LAYOUT=sibling) is a full revert to the historical behavior.
+wt_resolve_base_dir() {
+  local file raw dir rc unread=0
+  LEAF_PREFIX=""
+  if [[ -n "${WT_BASE_DIR:-}" ]]; then
+    BASE_DIR="$WT_BASE_DIR"; LAYOUT_DESC="WT_BASE_DIR"
+    return 0
+  fi
+  case "${WT_LAYOUT:-}" in
+    sibling)
+      BASE_DIR="$PARENT_DIR"; LEAF_PREFIX="${REPO_NAME}-"; LAYOUT_DESC="WT_LAYOUT=sibling"
+      return 0 ;;
+    nested)
+      BASE_DIR="$MAIN_REPO/${WT_NESTED_SUBDIR:-.claude/worktrees}"; LAYOUT_DESC="WT_LAYOUT=nested"
+      return 0 ;;
+    "") ;;
+    *) warn "wt: ignoring unknown WT_LAYOUT=$WT_LAYOUT (expected sibling or nested)" ;;
+  esac
+  for file in "$MAIN_REPO/.claude/settings.local.json" "$MAIN_REPO/.claude/settings.json"; do
+    raw=$(wt_setting_base_dir "$file"); rc=$?
+    (( rc == 2 )) && unread=1
+    (( rc == 0 )) || continue
+    while [[ "$raw" == ?*/ ]]; do raw="${raw%/}"; done
+    # shellcheck disable=SC2088  # matching a literal ~ written in the setting
+    case "$raw" in
+      "~")   dir="$HOME" ;;
+      "~/"*) dir="$HOME/${raw#"~/"}" ;;
+      "~"*)
+        warn "wt: worktree.baseDirectory in .claude/${file##*/} uses ~user, which wt doesn't expand; ignoring it"
+        unread=1; continue ;;
+      /*)    dir="$raw" ;;
+      *)     dir="$MAIN_REPO/$raw" ;;
+    esac
+    if ! wt_volume_mounted "$dir"; then
+      err "wt: worktree.baseDirectory in .claude/${file##*/} is on a volume that is not mounted:"
+      err "      $dir"
+      err "    Not creating it on the root disk. Mount the volume and retry, or override"
+      err "    this run with WT_BASE_DIR=<dir>, WT_LAYOUT=nested (inside the repo) or WT_LAYOUT=sibling."
+      return 1
+    fi
+    BASE_DIR="$dir"; LAYOUT_DESC="worktree.baseDirectory in .claude/${file##*/}"
+    return 0
+  done
+  BASE_DIR="$MAIN_REPO/${WT_NESTED_SUBDIR:-.claude/worktrees}"; LAYOUT_DESC="nested default"
+  (( unread )) && warn "wt: falling back to the default: $BASE_DIR"
+  return 0
+}
+
+# The worktree path for a slug: --target verbatim (pw uses this), else the
+# resolved directory.
+wt_resolve_target() {
+  local slug="$1"
+  if [[ -n "$TARGET_OVERRIDE" ]]; then
+    printf '%s' "$TARGET_OVERRIDE"
+  else
+    printf '%s' "$BASE_DIR/${LEAF_PREFIX}${slug}"
+  fi
+}
+
+# --target needs no directory, so its callers never see setting warnings.
+BASE_DIR="" LEAF_PREFIX="" LAYOUT_DESC="--target"
+if [[ -z "$TARGET_OVERRIDE" || $PRINT_BASE_DIR -eq 1 ]]; then
+  wt_resolve_base_dir || exit 1
+fi
+if [[ $PRINT_BASE_DIR -eq 1 ]]; then
+  printf '%s\n' "$BASE_DIR"
+  exit 0
+fi
+
+TARGET="$(wt_resolve_target "$BRANCH_SLUG")"
+
+# Quietly drop stale metadata before we look at worktree state, but not while
+# a worktree only looks stale because its volume is not mounted: prune would
+# make git forget it, cutting its checkout (maybe the only copy of its work)
+# off from the repo. Worktrees on an unplugged drive went that way once.
+wt_find_unmounted_worktrees
+if (( WT_UNMOUNTED == 0 )); then
+  git worktree prune >/dev/null 2>&1 || true
+elif (( WT_UNMOUNTED == 1 )); then
+  warn "wt: skipped git worktree prune: the worktree at $WT_UNMOUNTED_FIRST is on a volume that is not mounted, so prune would make git forget it"
+else
+  warn "wt: skipped git worktree prune: $WT_UNMOUNTED worktrees are on a volume that is not mounted (one is $WT_UNMOUNTED_FIRST), so prune would make git forget them"
+fi
+
+# ── default branch detection (cached) ────────────────────────────────
+# origin/HEAD is the authoritative answer (dev for some repos, most → master).
+# Cached for 7 days per repo: we'd rather pay one stale read than 4
+# git invocations on every wt call. Cache key is sha1(repo_toplevel).
+DEFAULT_BRANCH=""
+WT_CACHE_DIR_REPO=""
+if command -v sha1sum >/dev/null 2>&1; then
+  _wt_repo_hash=$(printf '%s' "$REPO_TOPLEVEL" | sha1sum | cut -c1-12)
+elif command -v shasum >/dev/null 2>&1; then
+  _wt_repo_hash=$(printf '%s' "$REPO_TOPLEVEL" | shasum | cut -c1-12)
+else
+  _wt_repo_hash=""
+fi
+if [[ -n "$_wt_repo_hash" ]]; then
+  WT_CACHE_DIR_REPO="$HOME/.cache/wt-helper/$_wt_repo_hash"
+  mkdir -p "$WT_CACHE_DIR_REPO" 2>/dev/null || WT_CACHE_DIR_REPO=""
+fi
+
+# Try cache first (TTL: 7 days = 604800s). origin/HEAD almost never moves.
+if [[ -n "$WT_CACHE_DIR_REPO" && -f "$WT_CACHE_DIR_REPO/default-branch" ]]; then
+  if find "$WT_CACHE_DIR_REPO/default-branch" -mtime -7 -print 2>/dev/null | grep -q .; then
+    DEFAULT_BRANCH=$(cat "$WT_CACHE_DIR_REPO/default-branch" 2>/dev/null || true)
+  fi
+fi
+# ...but only while its ref still exists. A remote that renamed its default
+# branch (main -> master) left the cache naming origin/main, and --from fresh
+# then failed with "invalid reference: origin/main". With an origin, check its
+# remote-tracking ref; without one, the local branch. A miss recomputes below
+# and rewrites the cache.
+if [[ -n "$DEFAULT_BRANCH" ]]; then
+  if git remote get-url origin >/dev/null 2>&1; then
+    _wt_cached_ref="refs/remotes/origin/$DEFAULT_BRANCH"
+  else
+    _wt_cached_ref="refs/heads/$DEFAULT_BRANCH"
+  fi
+  git show-ref --verify --quiet "$_wt_cached_ref" || DEFAULT_BRANCH=""
+  unset _wt_cached_ref
+fi
+
+if [[ -z "$DEFAULT_BRANCH" ]]; then
+  if ref=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null); then
+    DEFAULT_BRANCH="${ref#refs/remotes/origin/}"
+  fi
+  # Fallback: a few common names if origin/HEAD isn't set.
+  if [[ -z "$DEFAULT_BRANCH" ]]; then
+    for candidate in master main dev; do
+      if git show-ref --verify --quiet "refs/heads/$candidate"; then
+        DEFAULT_BRANCH="$candidate"
+        break
+      fi
+    done
+  fi
+  DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
+  # Persist for next time. Best-effort — failures don't block.
+  if [[ -n "$WT_CACHE_DIR_REPO" ]]; then
+    printf '%s' "$DEFAULT_BRANCH" > "$WT_CACHE_DIR_REPO/default-branch" 2>/dev/null || true
+  fi
+fi
+
+# ── branch state ─────────────────────────────────────────────────────
+BRANCH_EXISTS=0
+git show-ref --verify --quiet "refs/heads/$BRANCH" && BRANCH_EXISTS=1
+
+# Find a worktree that already has this branch checked out, if any.
+EXISTING_WT=""
+while IFS= read -r line; do
+  case "$line" in
+    "worktree "*) cur_wt="${line#worktree }" ;;
+    "branch refs/heads/$BRANCH")
+      EXISTING_WT="$cur_wt"
+      ;;
+  esac
+done < <(git worktree list --porcelain 2>/dev/null)
+
+# ── header ───────────────────────────────────────────────────────────
+say ""
+say "wt → $REPO_NAME"
+dim "    repo:    $MAIN_REPO"
+dim "    target:  $TARGET"
+dim "    layout:  $LAYOUT_DESC"
+dim "    branch:  $BRANCH"
+dim "    default: $DEFAULT_BRANCH (origin/HEAD)"
+say ""
+
+# ── decision tree ────────────────────────────────────────────────────
+mode=""    # what we'll actually do
+src_ref="" # what to base a new branch off (when applicable)
+new_branch_name="$BRANCH"  # may change in "copy" path
+
+if [[ $BRANCH_EXISTS -eq 0 ]]; then
+  # NEW BRANCH PATH
+  say "Branch '$BRANCH' does not exist locally."
+  if [[ -z "$FROM" ]]; then
+    say ""
+    say "Create from:"
+    say "  1) fresh   — origin/$DEFAULT_BRANCH (clean remote tip)"
+    say "  2) head    — current HEAD ($(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD))"
+    say "  3) cancel"
+    choice=$(ask "> ") || exit $?
+    case "$choice" in
+      1|fresh) FROM="fresh" ;;
+      2|head)  FROM="head" ;;
+      3|cancel|c|q|"") err "Cancelled."; exit 1 ;;
+      *) err "Unknown choice."; exit 1 ;;
+    esac
+  fi
+  mode="create"
+  if [[ "$FROM" == "fresh" ]]; then
+    if [[ $NO_FETCH -eq 0 ]]; then
+      git fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || dim "    (fetch origin/$DEFAULT_BRANCH skipped or failed)"
+    else
+      dim "    (--no-fetch: skipping git fetch origin/$DEFAULT_BRANCH)"
+    fi
+    src_ref="origin/$DEFAULT_BRANCH"
+  else
+    src_ref="HEAD"
+  fi
+
+elif [[ -n "$EXISTING_WT" ]]; then
+  # ALREADY-IN-A-WORKTREE PATH
+  say "Branch '$BRANCH' is already checked out in:"
+  say "    $EXISTING_WT"
+  say ""
+  say "What now?"
+  say "  1) cd       — switch into that worktree"
+  say "  2) copy     — branch off $BRANCH and make a new worktree (you'll name it)"
+  say "  3) recreate — DELETE that worktree and recreate it from $BRANCH's tip"
+  say "  4) cancel"
+  choice=$(ask "> ") || exit $?
+  case "$choice" in
+    1|cd|"")
+      printf '%s' "$EXISTING_WT"
+      ok "→ switching into existing worktree"
+      exit 0
+      ;;
+    2|copy)
+      default_name="${BRANCH}-2"
+      n=2
+      while git show-ref --verify --quiet "refs/heads/$default_name"; do
+        n=$((n + 1)); default_name="${BRANCH}-${n}"
+      done
+      new=$(ask "New branch name [$default_name]: ") || exit $?
+      [[ -z "$new" ]] && new="$default_name"
+      if ! git check-ref-format --branch "$new" >/dev/null 2>&1; then
+        err "Invalid branch name: $new"; exit 2
+      fi
+      if git show-ref --verify --quiet "refs/heads/$new"; then
+        err "Branch $new already exists. Pick another name or use \`wt $new\`."; exit 1
+      fi
+      mode="create"
+      src_ref="$BRANCH"
+      new_branch_name="$new"
+      new_slug="${new//\//-}"
+      # Same layout as above (--target, or the directory resolved once by
+      # wt_resolve_base_dir) — the copy path honors every lever for the new branch.
+      TARGET="$(wt_resolve_target "$new_slug")"
+      ;;
+    3|recreate)
+      say ""
+      warn "This will:"
+      warn "  • git worktree remove --force $EXISTING_WT"
+      warn "  • git branch -D $BRANCH"
+      warn "  • recreate worktree at $TARGET from origin/$DEFAULT_BRANCH"
+      confirm=$(ask "Type 'yes' to proceed: ") || exit $?
+      [[ "$confirm" == "yes" ]] || { err "Cancelled."; exit 1; }
+      git worktree remove --force "$EXISTING_WT" >/dev/null 2>&1 || { err "Failed to remove existing worktree."; exit 1; }
+      git branch -D "$BRANCH" >/dev/null 2>&1 || true
+      if [[ $NO_FETCH -eq 0 ]]; then
+        git fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
+      fi
+      mode="create"
+      src_ref="origin/$DEFAULT_BRANCH"
+      ;;
+    4|cancel|c|q) err "Cancelled."; exit 1 ;;
+    *) err "Unknown choice."; exit 1 ;;
+  esac
+
+else
+  # EXISTS BUT NOT CHECKED OUT — just attach
+  mode="attach"
+fi
+
+# ── target dir collision check ───────────────────────────────────────
+if [[ -e "$TARGET" ]]; then
+  warn "Path already exists: $TARGET"
+  choice=$(ask "Delete and recreate? [y/N]: ") || exit $?
+  case "$choice" in
+    y|Y|yes) rm -rf "$TARGET" ;;
+    *) err "Cancelled."; exit 1 ;;
+  esac
+fi
+
+mkdir -p "$(dirname "$TARGET")"
+
+# ── execute ──────────────────────────────────────────────────────────
+case "$mode" in
+  create)
+    if ! git -C "$MAIN_REPO" worktree add -b "$new_branch_name" "$TARGET" "$src_ref" >/dev/null 2>&1; then
+      err "git worktree add failed."
+      err "  branch: $new_branch_name"
+      err "  base:   $src_ref"
+      err "  path:   $TARGET"
+      git -C "$MAIN_REPO" worktree add -b "$new_branch_name" "$TARGET" "$src_ref" >&3 2>&1 || true
+      exit 1
+    fi
+    ok "→ created $new_branch_name at $TARGET (from $src_ref)"
+    ;;
+  attach)
+    if ! git -C "$MAIN_REPO" worktree add "$TARGET" "$BRANCH" >/dev/null 2>&1; then
+      err "git worktree add failed."
+      git -C "$MAIN_REPO" worktree add "$TARGET" "$BRANCH" >&3 2>&1 || true
+      exit 1
+    fi
+    ok "→ attached $BRANCH at $TARGET"
+    ;;
+  *)
+    err "Internal error: unknown mode '$mode'"; exit 99 ;;
+esac
+
+# ── share .remember across worktrees ─────────────────────────────────
+# The `remember` plugin keys its data dir off the working-tree path, so
+# each worktree would otherwise get its own isolated .remember/ — the
+# same fragmentation Claude Code already solved for native auto-memory by
+# keying off the git repo. Mirror that here: symlink the worktree's
+# .remember at the MAIN repo's, so the rolling journal (recent/archive/
+# today-*, core-memories) is unified across every worktree of this repo.
+# Guards: only when the main repo actually has a .remember, and never
+# clobber a real .remember the worktree may already carry.
+if [[ -d "$MAIN_REPO/.remember" && ! -e "$TARGET/.remember" ]]; then
+  if ln -s "$MAIN_REPO/.remember" "$TARGET/.remember" 2>/dev/null; then
+    dim "    linked .remember → $MAIN_REPO/.remember (shared journal)"
+  fi
+fi
+# The symlink is untracked, so it dirties `git status` and makes a plain
+# `git worktree remove` refuse. Exclude it repo-wide via the COMMON dir's
+# info/exclude (shared by every worktree). No trailing slash: git sees a
+# symlink as a file, so `.remember/` would never match it.
+if [[ -L "$TARGET/.remember" ]]; then
+  _exclude="$GIT_COMMON_DIR/info/exclude"
+  if ! grep -qxF '/.remember' "$_exclude" 2>/dev/null; then
+    mkdir -p "$GIT_COMMON_DIR/info" && printf '/.remember\n' >> "$_exclude"
+  fi
+  unset _exclude
+fi
+
+# Print the final path on stdout unless --no-cd was passed.
+# --no-cd was historically used by callers that wanted "do the work, don't
+# tell me where" — i.e. the helper script existed only for its side effects.
+# But pw (and any other batch caller) needs the path back. We honor both:
+# pass --print-target to force the path to print regardless of --no-cd.
+if (( NO_CD == 0 )) || (( PRINT_TARGET == 1 )); then
+  printf '%s' "$TARGET"
+fi
