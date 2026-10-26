@@ -1,0 +1,11 @@
+#!/bin/sh
+# Git credential helper for github.com: run `gh auth git-credential` with whichever
+# gh this machine has. `gh auth setup-git` writes its own absolute path into the
+# shared gitconfig (one machine's /usr/bin/gh, say), which breaks every machine
+# whose gh lives elsewhere (Macs: ~/homebrew/bin, /opt/homebrew/bin).
+for gh in "$(command -v gh 2>/dev/null)" "$HOME/homebrew/bin/gh" /opt/homebrew/bin/gh /usr/local/bin/gh "$HOME/.local/bin/gh" /usr/bin/gh; do
+  if [ -n "$gh" ] && [ -x "$gh" ]; then
+    exec "$gh" auth git-credential "$@"
+  fi
+done
+exit 0

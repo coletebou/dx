@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Run the repository's pre-commit suite (.pre-commit-config.yaml) on commit.
+#
+# core.hooksPath points at this directory on every managed machine, so git
+# never runs a repo's own .git/hooks, and `pre-commit install` refuses to
+# install while core.hooksPath is set. Without this hook no repo's pre-commit
+# suite would run on any commit from these machines, even in a repo whose
+# suite is its only pre-merge gate. Repos without a .pre-commit-config.yaml
+# are untouched.
+#
+# One deliberate difference from the hook pre-commit generates: the files are
+# passed with --files, so pre-commit does not stash. Its stash runs
+# `git checkout -- .` over the whole working tree for the length of the run,
+# and again if the stash does not re-apply. Live checkouts here are shared by
+# several agent sessions and bind-mounted into running dev stacks, so that
+# would revert every other session's unstaged edits mid-run (tsx and Vite
+# reload them) and can throw away an edit written during the run. The cost is
+# that a partly staged file is checked as it is on disk; the hook says so.
+#
+# The file list matches pre-commit's own choice: the staged files, or while
+# concluding a merge, the conflicted files plus what the resolution changed.
+#
+# Skip one hook with SKIP=<hook-id> (pre-commit's own switch), all of them
+# with --no-verify. A missing pre-commit binary warns and lets the commit
+# through: install.sh installs it, and blocking every commit on a box that has
+# not re-run install.sh yet would stop all agent work there. Secrets stay
+# gated fail-closed by pre-push.
+#
+# Before the suite, every repo's staged diff is scanned with gitleaks, so a
+# secret is stopped before it lands in local history instead of at push time,
+# when removing it means rewriting commits. This is the early layer only:
+# a missing gitleaks or a gitleaks error warns and lets the commit through,
+# and pre-push stays the fail-closed gate. Merge commits are left to pre-push,
+# which excludes what the destination already has; scanning the merge's staged
+# diff here would re-flag published commits. Skip with SKIP=gitleaks.
+
+set -euo pipefail
+
+top="$(git rev-parse --show-toplevel)"
+cd "$top"
+
+skip_hook() {
+  [[ ",${SKIP:-}," == *",$1,"* ]]
+}
+
+GITLEAKS_LEAK_EXIT=42
+if ! skip_hook gitleaks && [[ ! -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
+  GITLEAKS_BIN="${GITLEAKS_BIN:-$(command -v gitleaks || true)}"
+  if [[ -z "$GITLEAKS_BIN" || ! -x "$GITLEAKS_BIN" ]]; then
+    echo "pre-commit: gitleaks not installed, staged changes were NOT scanned for secrets (pre-push still blocks)" >&2
+  else
+    gitleaks_status=0
+    # --verbose names the file and line; --redact keeps the value out of the output.
+    "$GITLEAKS_BIN" git --pre-commit --staged --redact --verbose --no-banner --no-color \
+      --log-level warn --exit-code "$GITLEAKS_LEAK_EXIT" . >&2 || gitleaks_status=$?
+    if [[ "$gitleaks_status" -eq "$GITLEAKS_LEAK_EXIT" ]]; then
+      echo "pre-commit: gitleaks found a potential secret in the staged changes; commit blocked" >&2
+      echo "pre-commit: unstage it, or for a false positive add it to .gitleaksignore (SKIP=gitleaks bypasses)" >&2
+      exit 1
+    elif [[ "$gitleaks_status" -ne 0 ]]; then
+      echo "pre-commit: gitleaks failed (exit $gitleaks_status); staged changes were NOT scanned (pre-push still blocks)" >&2
+    fi
+  fi
+fi
+
+[[ -f .pre-commit-config.yaml ]] || exit 0
+
+PRE_COMMIT_BIN="${PRE_COMMIT_BIN:-$(command -v pre-commit || true)}"
+if [[ -z "$PRE_COMMIT_BIN" || ! -x "$PRE_COMMIT_BIN" ]]; then
+  echo "pre-commit: not installed, so this repo's .pre-commit-config.yaml did NOT run" >&2
+  echo "pre-commit: install with: pipx install pre-commit   (or re-run ~/.dotfiles/install.sh)" >&2
+  exit 0
+fi
+
+files=()
+add_files() {
+  local f
+  while IFS= read -r -d '' f; do
+    if [[ -n "$f" ]]; then files+=("$f"); fi
+  done
+}
+
+merge_head="$(git rev-parse --git-path MERGE_HEAD)"
+merge_msg="$(git rev-parse --git-path MERGE_MSG)"
+if [[ -f "$merge_head" && -f "$merge_msg" ]]; then
+  # Same selection as pre-commit's get_conflicted_files(): the lines of
+  # MERGE_MSG that start with a tab or "#<tab>" (git's conflict list), plus
+  # everything the resolution changed relative to both parents.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      $'\t'*|$'#\t'*)
+        line="${line#"${line%%[!#]*}"}"
+        IFS=$' \t\r' read -r line <<<"$line" || true
+        if [[ -n "$line" ]]; then files+=("$line"); fi
+        ;;
+    esac
+  done <"$merge_msg"
+  add_files < <(git diff --name-only --no-ext-diff -z -m "$(git write-tree)" HEAD MERGE_HEAD --)
+else
+  add_files < <(git diff --staged --name-only --no-ext-diff -z --diff-filter=ACMRTUXB)
+fi
+
+# An empty --files list makes pre-commit fall back to its stashing default,
+# so nothing staged (a deletion-only commit) means nothing to check.
+(( ${#files[@]} > 0 )) || exit 0
+
+partial=()
+while IFS= read -r -d '' f; do
+  partial+=("$f")
+done < <(printf '%s\0' "${files[@]}" | sort -zu |
+  xargs -0 git --literal-pathspecs diff --name-only --no-ext-diff -z --)
+if (( ${#partial[@]} > 0 )); then
+  echo "pre-commit: ${#partial[@]} staged file(s) also have unstaged edits; hooks checked the on-disk version:" >&2
+  printf '  %s\n' "${partial[@]:0:5}" >&2
+  if (( ${#partial[@]} > 5 )); then echo "  ..." >&2; fi
+fi
+
+# xargs splits an oversized list across runs instead of failing on ARG_MAX,
+# and exits non-zero if any run fails.
+printf '%s\0' "${files[@]}" | sort -zu |
+  xargs -0 "$PRE_COMMIT_BIN" run --hook-stage pre-commit --files

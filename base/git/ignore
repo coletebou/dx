@@ -1,0 +1,31 @@
+# User-global gitignore. Applies to every git repo on the machine —
+# good for per-user files that Claude Code or other tools create
+# in repo subdirectories without the repo's own .gitignore knowing.
+#
+# install.sh links it to ~/.config/git/ignore, git's default excludes file.
+
+**/.claude/settings.local.json
+**/.claude/scheduled_tasks.json
+# Subagent auto-memory (session-summarizer, etc.) — Claude Code writes
+# these to <cwd>/.claude/agent-memory/<agent>/ during subagent runs.
+# Per-session scratch, not repo content.
+**/.claude/agent-memory/
+
+# Per-session scratch directories (notes, runbooks, transcripts created
+# by Claude Code sessions). Not repo content; don't track.
+.scratch/
+
+.clawpatch
+.superpowers
+
+# node_modules in git worktrees that symlink to the parent repo's install
+# instead of running their own `npm install`. The repo's own .gitignore uses
+# "node_modules/" (trailing slash = directories only), which never matches a
+# symlink — git treats a symlink as a file. Slash-less here catches both the
+# symlink and any real dir, in every repo on the machine.
+node_modules
+.sticker-work
+
+# macOS Finder metadata. Finder drops these into any browsed directory, where
+# they make a checkout read as dirty and block fast-forward-only updaters.
+.DS_Store
