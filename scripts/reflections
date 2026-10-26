@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""reflections — one searchable, per-repo store of what agents learned and what is still open.
+
+Claude Code and Codex both use it through this CLI (`reflections --help`).
+
+  Write:   reflections add --kind action --title "Fix X" [--body …]      → prints the new id
+           reflections add --batch - < items.json                         (the reflector and skills)
+           reflections done <id>… | reopen <id>… | drop <id>… | edit <id> …
+           reflections apply --batch - < ops.json      (done/drop/reopen/edit in one call)
+  Read:    reflections list [--all] [--status open]   reflections search <words>
+           reflections show <id>   reflections repos   reflections context   (hook-sized summary)
+           reflections candidates --session S --query-file F   (ids a reflector may reconcile)
+
+Stale: an open item nobody has touched for REFLECTIONS_STALE_DAYS (7; 30 for items a
+person or /reflect wrote — REFLECTIONS_STALE_DAYS_CURATED) reads as `stale`. It is derived
+when the index is built, never written, so no machine has to sweep and none can race;
+`reopen`, `edit` or re-adding the same title brings it back. `list --status stale` shows them.
+
+Storage — plain events are the source of truth, SQLite is only an index:
+  * Every change is one JSON line appended to
+        <memory home>/reflections/<host>.jsonl
+    inside the repo's canonical memory home (claude/memory-homes.conf; unregistered repos
+    get identities/<DF_IDENTITY>/claude/memory/<repo>/). If you sync the memory tree with
+    git (a private repo), the logs reach every machine with no new sync path. Each machine
+    appends only to its own <host>.jsonl, so two machines never edit the same file and git
+    never has to merge one. Marking another machine's item done appends a `set` event here.
+    Items fold latest-event-wins by (ts, host).
+  * Kept out of the memory home's top level on purpose: top-level *.md there is copied to
+    Codex by codex-memory-bridge, read by other memory tools, and counted against MEMORY.md
+    caps.
+  * ~/.local/state/agent-reflections/index.sqlite (FTS5) is derived and rebuildable; it also
+    indexes — read-only — canonical Claude memories, per-project auto-memory dirs, Codex's
+    ~/.codex/memories/MEMORY.md, session-analyzer reports and, if REFLECTIONS_FEATURE_LOG
+    names one, a feature log, so one `reflections search` spans everything both agents
+    remember. Never commit it.
+
+Env: REFLECTIONS_DOTFILES (default ~/.dotfiles), REFLECTIONS_INDEX, REFLECTIONS_HOST,
+     MEMORY_HOMES_CONF, DF_IDENTITY, CLAUDE_MACHINE / DF_MACHINE, CODEX_HOME,
+     REFLECTIONS_FEATURE_LOG (optional JSONL of {id, title, state, notes, repo, ts} events).
+"""
+
+import argparse
+import collections
+import contextlib
+import fcntl
+import functools
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import sys
+import textwrap
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+DOTFILES = Path(os.environ.get("REFLECTIONS_DOTFILES") or HOME / ".dotfiles")
+MEMORY_HOMES_CONF = Path(os.environ.get("MEMORY_HOMES_CONF") or DOTFILES / "claude/memory-homes.conf")
+INDEX = Path(os.environ.get("REFLECTIONS_INDEX")
+             or HOME / ".local/state/agent-reflections/index.sqlite")
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+CLAUDE_PROJECTS = Path(os.environ.get("REFLECTIONS_CLAUDE_PROJECTS") or HOME / ".claude/projects")
+SCHEMA_VERSION = "2"
+
+# kind → default status. Actionable kinds start open; knowledge is a note.
+KINDS = {
+    "action": "open", "question": "open", "handoff": "open",
+    "learning": "note", "decision": "note", "gotcha": "note", "idea": "note", "note": "note",
+}
+STATUSES = ("open", "done", "dropped", "note")  # what an event may set
+# Derived, never written: see "Stale" above. Automatic reflections age out fast; what a
+# person or /reflect recorded is given longer.
+AUTO_ORIGINS = ("precompact", "sessionend", "advisor", "stage")
+STALE_DAYS = float(os.environ.get("REFLECTIONS_STALE_DAYS") or 7)
+STALE_DAYS_CURATED = float(os.environ.get("REFLECTIONS_STALE_DAYS_CURATED") or 30)
+# op → (status it sets, statuses it may leave)
+TRANSITIONS = {"done": ("done", ("open", "stale")), "drop": ("dropped", ("open", "stale", "note")),
+               "reopen": ("open", ("done", "dropped", "stale"))}
+SOURCES = ("reflection", "memory", "codex", "feature", "analysis")
+MAX_TITLE, MAX_BODY = 200, 20000
+
+
+def utcnow():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def die(msg, code=2):
+    print(f"reflections: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------ identity ------
+
+def _profile_field(name):
+    try:
+        for line in (HOME / ".df-profile").read_text().splitlines():
+            m = re.match(rf"^export {name}=([A-Za-z0-9._:-]+)$", line.strip())
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+def host_key():
+    """This machine's stable id: REFLECTIONS_HOST, else CLAUDE_MACHINE / DF_MACHINE (install.sh
+    writes DF_MACHINE to ~/.df-profile, see base/machine-id.sh), else the short hostname."""
+    if os.environ.get("REFLECTIONS_HOST"):
+        return os.environ["REFLECTIONS_HOST"]
+    m = os.environ.get("CLAUDE_MACHINE") or os.environ.get("DF_MACHINE") or _profile_field("DF_MACHINE")
+    m = (m or os.uname().nodename.split(".")[0]).lower()
+    return re.sub(r"[^a-z0-9._-]", "-", m) or "unknown-local"
+
+
+def identity():
+    return (os.environ.get("DF_IDENTITY") or _profile_field("DF_IDENTITY") or "example").lower()
+
+
+def identity_key():
+    """identity() as it appears in a path segment (identities/<key>/…), safe inside SQL LIKE."""
+    return re.sub(r"[^a-z0-9_-]", "", identity()) or "example"
+
+
+def current_agent():
+    if os.environ.get("CLAUDECODE") == "1":
+        return "claude"
+    if any(k.startswith("CODEX_") for k in os.environ):
+        return "codex"
+    return "human"
+
+
+def current_session():
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
+
+
+# ---------------------------------------------------------------- repos ------
+
+def slug(name):
+    s = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-.")
+    return s or "home"
+
+
+def memory_homes():
+    """{repo shortname: Path} from claude/memory-homes.conf (same parse as memory-homes.sh)."""
+    homes = {}
+    try:
+        for line in MEMORY_HOMES_CONF.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                raw = parts[1].replace("$HOME", str(HOME))
+                homes[parts[0]] = Path(str(HOME) + raw[1:] if raw.startswith("~") else raw)
+    except OSError:
+        pass
+    return homes
+
+
+def _git(cwd, *args):
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def exact_checkout(cwd):
+    """Physical checkout root, never the main-worktree/common-dir inference used for grouping."""
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    return str(Path(top).resolve()) if top else None
+
+
+def repo_root(cwd):
+    """Main worktree root for cwd (worktrees map to their main repo), or None outside git."""
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if not top:
+        return None
+    common = _git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common and Path(common).name == ".git":
+        return Path(common).parent
+    return Path(top)
+
+
+def host_log(log_dir):
+    """This machine's event log in a reflections log directory."""
+    return Path(log_dir) / f"{host_key()}.jsonl"
+
+
+class Repo:
+    """Where one repo's reflections live. `key` is the stable cross-machine name."""
+
+    def __init__(self, key, home, shortname, path=None):
+        self.key, self.home, self.shortname, self.path = key, home, shortname, path
+
+    @property
+    def log_dir(self):
+        return self.home / "reflections"
+
+    @property
+    def log_file(self):
+        return host_log(self.log_dir)
+
+
+def repo_for_name(name, path=None):
+    wanted = name.lower()
+    for short, home in memory_homes().items():
+        if wanted in (short.lower(), home.name.lower()):
+            return Repo(home.name, home, short, path)
+    key = slug(name)
+    return Repo(key, DOTFILES / "identities" / identity() / "claude/memory" / key, name, path)
+
+
+def resolve_repo(explicit=None, cwd=None):
+    if explicit and explicit != ".":
+        return repo_for_name(explicit)
+    cwd = Path(cwd or os.getcwd())
+    root = repo_root(cwd)
+    if root is None:
+        name = "home" if cwd == HOME else cwd.name
+        return repo_for_name(name, cwd)
+    return repo_for_name(root.name, root)
+
+
+# ------------------------------------------------------------ redaction ------
+
+_SECRET_PATTERNS = [
+    ("private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----")),
+    ("anthropic-key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
+    ("aws-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")),
+    ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("bearer", re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._~+/-]{20,}=*")),
+]
+# NAME=value / "name": "value" where the name says it holds a secret
+# (AWS_SECRET_ACCESS_KEY=…, OPENAI_API_KEY=…, "password": "…"). The name is kept
+# so the row still reads; `$VAR` references and short values (max_tokens: 4096) stay.
+_ASSIGNMENT = re.compile(
+    r"(?i)\b([a-z0-9_.-]*(?:secret|token|password|passwd|passphrase|api_?key|access_?key"
+    r"|private_?key|credential)[a-z0-9_.-]*)([\"']?\s*[=:]\s*)([\"']?)(?!\$|\[REDACTED)([^\s\"',;]{8,})")
+
+
+def redact(text):
+    """Scrub credential-shaped strings. Logs may be committed and pushed with the memory tree."""
+    if not text:
+        return text
+    for label, pat in _SECRET_PATTERNS:
+        if label == "bearer":
+            text = pat.sub(lambda m: m.group(1) + "[REDACTED:bearer]", text)
+        else:
+            text = pat.sub(f"[REDACTED:{label}]", text)
+    return _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED:assignment]", text)
+
+
+# ---------------------------------------------------------------- events -----
+
+def split_tags(text):
+    return [t for t in re.split(r"[,\s]+", text) if t]
+
+
+def new_id():
+    alphabet = "abcdefghijkmnpqrstuvwxyz23456789"  # no 0/o/1/l
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def append_event(log_file, event):
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with open(log_file, "a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(line)
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def memory_dirs():
+    """Every memory home: the identity trees, plus registered homes that live elsewhere."""
+    dirs = {h for h in DOTFILES.glob("identities/*/claude/memory/*") if h.is_dir()}
+    dirs.update(h for h in memory_homes().values() if h.is_dir())
+    return sorted(dirs)
+
+
+def reflection_logs():
+    return sorted({p for home in memory_dirs() for p in home.glob("reflections/*.jsonl")})
+
+
+def fold_events(paths):
+    """Replay every host's log into current items, latest (ts, host) wins per field set."""
+    events = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                for n, line in enumerate(f):
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue  # a torn last line from an interrupted write
+                    if isinstance(ev, dict) and ev.get("id") and ev.get("op"):
+                        events.append((ev.get("ts", ""), ev.get("host", ""), str(path), n, ev))
+        except OSError:
+            continue
+    events.sort(key=lambda e: e[:4])
+    items = {}
+    for _, _, path, _, ev in events:
+        op, iid = ev["op"], ev["id"]
+        if op == "add":
+            if iid in items:
+                continue
+            items[iid] = {k: ev.get(k) for k in (
+                "id", "repo", "kind", "status", "title", "body", "tags", "priority", "session_id",
+                "agent", "origin", "cwd", "checkout", "branch", "host")}
+            items[iid].update(created_at=ev.get("ts"), updated_at=ev.get("ts"), done_at=None,
+                              log_dir=str(Path(path).parent), notes=[])
+        elif iid in items:
+            it = items[iid]
+            if op == "set" and ev.get("status") in STATUSES:
+                it["status"] = ev["status"]
+                it["done_at"] = ev.get("ts") if ev["status"] in ("done", "dropped") else None
+            elif op == "edit":
+                # Content may now include another checkout/host's private context, so the merged
+                # item keeps no single checkout's provenance (an edit without one clears it too).
+                if ev.get("checkout") != it.get("checkout") or ev.get("host") != it.get("host"):
+                    it["checkout"] = None
+                for k in ("title", "body", "tags", "kind", "priority"):
+                    if k in ev:
+                        it[k] = ev[k]
+            if ev.get("note"):
+                it["notes"].append(f"{ev.get('ts')} {ev.get('host')}: {ev['note']}")
+            it["updated_at"] = ev.get("ts")
+    return items
+
+
+# ----------------------------------------------------------------- index -----
+
+DDL = """
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER);
+CREATE TABLE IF NOT EXISTS items(
+  rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, source TEXT NOT NULL, kind TEXT,
+  status TEXT, repo TEXT, title TEXT, body TEXT, tags TEXT, priority INTEGER,
+  session_id TEXT, host TEXT, agent TEXT, origin TEXT, cwd TEXT, checkout TEXT, branch TEXT,
+  created_at TEXT, updated_at TEXT, done_at TEXT, path TEXT, notes TEXT);
+CREATE INDEX IF NOT EXISTS items_repo ON items(repo, status);
+CREATE INDEX IF NOT EXISTS items_path ON items(path);
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+  title, body, tags, repo, tokenize="unicode61 remove_diacritics 2 tokenchars '_-'", prefix='2 3');
+"""
+
+
+@contextlib.contextmanager
+def index_lock():
+    INDEX.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(INDEX) + ".lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def open_index():
+    INDEX.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(INDEX), timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(DDL)
+    if "checkout" not in {r[1] for r in db.execute("PRAGMA table_info(items)")}:
+        db.execute("ALTER TABLE items ADD COLUMN checkout TEXT")
+    if (db.execute("SELECT v FROM meta WHERE k='schema'").fetchone() or [None])[0] != SCHEMA_VERSION:
+        db.executescript("DELETE FROM items; DELETE FROM items_fts; DELETE FROM sources; DELETE FROM meta;")
+        db.execute("INSERT INTO meta VALUES('schema', ?)", (SCHEMA_VERSION,))
+    # `mine`: this identity's rows (see identity_scope); what hooks and reflectors read.
+    db.execute("CREATE TEMP VIEW IF NOT EXISTS mine AS SELECT * FROM items WHERE path IS NULL OR "
+               f"path NOT LIKE '%/identities/%' OR path LIKE '%/identities/{identity_key()}/%'")
+    return db
+
+
+def _put(db, it):
+    tags = it.get("tags")
+    tags = " ".join(tags) if isinstance(tags, list) else (tags or "")
+    notes = it.get("notes")
+    notes = "\n".join(notes) if isinstance(notes, list) else (notes or "")
+    cur = db.execute(
+        """INSERT OR REPLACE INTO items(id, source, kind, status, repo, title, body, tags, priority,
+           session_id, host, agent, origin, cwd, checkout, branch, created_at, updated_at, done_at, path, notes)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (it["id"], it["source"], it.get("kind"), it.get("status"), it.get("repo"), it.get("title"),
+         it.get("body"), tags, it.get("priority"), it.get("session_id"), it.get("host"),
+         it.get("agent"), it.get("origin"), it.get("cwd"), it.get("checkout"), it.get("branch"), it.get("created_at"),
+         it.get("updated_at"), it.get("done_at"), it.get("path"), notes))
+    db.execute("INSERT INTO items_fts(rowid, title, body, tags, repo) VALUES(?,?,?,?,?)",
+               (cur.lastrowid, it.get("title") or "", it.get("body") or "", tags, it.get("repo") or ""))
+
+
+def _drop(db, where, args):
+    db.execute(f"DELETE FROM items_fts WHERE rowid IN (SELECT rowid FROM items WHERE {where})", args)
+    db.execute(f"DELETE FROM items WHERE {where}", args)
+
+
+def _frontmatter(text):
+    meta, body = {}, text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            for line in text[3:end].splitlines():
+                m = re.match(r"^\s*([A-Za-z_]+):\s*(.*)$", line)
+                if m and m.group(2).strip():
+                    meta.setdefault(m.group(1), m.group(2).strip().strip("'\""))
+            body = text[end + 4:].lstrip("\n")
+    return meta, body
+
+
+def _mtime(p):
+    st = p.stat()
+    return st.st_size, st.st_mtime_ns
+
+
+@functools.lru_cache(maxsize=None)
+def _project_dirs():
+    """{project slug: directory} for HOME and two levels below it."""
+    dirs = {}
+    try:
+        tops = [HOME] + [p for p in HOME.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    except OSError:
+        tops = [HOME]
+    for base in tops:
+        try:
+            for d in [base] + [c for c in base.iterdir() if c.is_dir()]:
+                dirs[re.sub(r"[^A-Za-z0-9]", "-", str(d))] = d
+        except OSError:
+            continue
+    return dirs
+
+
+@functools.lru_cache(maxsize=None)
+def slug_repo_key(project_slug):
+    """Repo key for a ~/.claude/projects/<slug> dir: map the slug back to the directory a
+    session started in (HOME and two levels below), then resolve it like any cwd. Only
+    runs when a file under that slug is (re)indexed, so the git calls stay off the hot path."""
+    d = _project_dirs().get(project_slug)
+    return resolve_repo(cwd=d).key if d and d.exists() else slug(project_slug)
+
+
+def doc_sources():
+    """(path, parser) for every read-only document the index mirrors."""
+    homes = memory_homes()
+    registered = {h.resolve() for h in homes.values() if h.exists()}
+    out = []
+    for home in memory_dirs():
+        for md in sorted(home.glob("*.md")):
+            if md.name == "MEMORY.md" or md.name.startswith("DREAMS"):
+                continue
+            out.append((md, ("memory", home.name)))
+        for md in sorted(home.glob(".analysis/*/*.md")):
+            out.append((md, ("analysis", home.name)))
+    # Per-project auto-memory dirs that are NOT a registered repo's (those hold
+    # stale pre-consolidation copies of canonical memory and would duplicate it).
+    registered_re = re.compile(r"-(" + "|".join(re.escape(n) for n in homes) + r")(-|$)", re.I) \
+        if homes else None
+    for mem in sorted(CLAUDE_PROJECTS.glob("*/memory")):
+        try:
+            real = mem.resolve()
+        except OSError:
+            continue
+        if real in registered or any(str(real).startswith(str(r) + os.sep) for r in registered):
+            continue
+        if registered_re and registered_re.search(mem.parent.name):
+            continue
+        for md in sorted(mem.glob("*.md")):
+            if md.name != "MEMORY.md":
+                out.append((md, ("memory", "slug:" + mem.parent.name)))
+    codex_mem = CODEX_HOME / "memories/MEMORY.md"
+    if codex_mem.is_file():
+        out.append((codex_mem, ("codex", "codex")))
+    feature_log = Path(os.environ.get("REFLECTIONS_FEATURE_LOG") or "/nonexistent")
+    if feature_log.is_file():
+        out.append((feature_log, ("feature", None)))
+    return out
+
+
+def parse_doc(path, kind_repo):
+    source, repo = kind_repo
+    if repo and repo.startswith("slug:"):
+        repo = slug_repo_key(repo[5:])
+    text = path.read_text(encoding="utf-8", errors="replace")
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = {"source": source, "repo": repo, "path": str(path), "created_at": mtime, "updated_at": mtime,
+            "status": "note"}
+    if source == "memory":
+        meta, body = _frontmatter(text)
+        mtype = meta.get("type") or ""
+        m = re.search(r"^\s*type:\s*(\w+)", text[:600], re.M)
+        mtype = mtype or (m.group(1) if m else "")
+        title = meta.get("description") or meta.get("name") or path.stem
+        kind = "handoff" if "handoff" in path.stem else "memory"
+        return [{**base, "id": f"m:{repo}/{path.name}", "kind": kind,
+                 "title": f"{meta.get('name', path.stem)} — {title}"[:MAX_TITLE],
+                 "body": body[:MAX_BODY], "tags": [mtype] if mtype else []}]
+    if source == "analysis":
+        return [{**base, "id": f"a:{repo}/{path.parent.name}/{path.name}", "kind": "analysis",
+                 "title": f"{repo} {path.stem} ({path.parent.name})", "body": text[:MAX_BODY],
+                 "host": path.parent.name}]
+    if source == "codex":
+        items, chunks = [], re.split(r"(?m)^(?=#{1,2} )", text)
+        for n, chunk in enumerate(c for c in chunks if c.strip()):
+            heading = chunk.strip().splitlines()[0].lstrip("#").strip()
+            cid = hashlib.sha1(f"{n}:{heading}".encode()).hexdigest()[:12]
+            items.append({**base, "id": f"c:{cid}", "kind": "memory", "title": heading[:MAX_TITLE],
+                          "body": chunk[:8000], "tags": ["codex"]})
+        return items
+    if source == "feature":
+        state = {}
+        for line in text.splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("id"):
+                state.setdefault(ev["id"], {}).update({k: v for k, v in ev.items() if v is not None})
+        status_map = {"shipped": "done", "abandoned": "dropped"}
+        return [{**base, "id": f"f:{fid}", "kind": "feature", "repo": ev.get("repo") or "",
+                 "status": status_map.get(ev.get("state"), "open"), "title": ev.get("title") or fid,
+                 "body": ev.get("notes") or "", "created_at": ev.get("ts"), "updated_at": ev.get("ts")}
+                for fid, ev in state.items()]
+    return []
+
+
+def _age_days(ts, now):
+    try:
+        then = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return 0.0
+    return (now - then).total_seconds() / 86400
+
+
+def is_stale(it, now):
+    limit = STALE_DAYS if it.get("origin") in AUTO_ORIGINS else STALE_DAYS_CURATED
+    return it.get("status") == "open" and _age_days(it.get("updated_at"), now) > limit
+
+
+def refresh(db, force=False):
+    """Bring the index up to date. Cheap when nothing changed: a stat per file."""
+    with index_lock():
+        logs, parts = [], []
+        for p in reflection_logs():
+            try:
+                parts.append(f"{p}:{_mtime(p)}")
+                logs.append(p)
+            except OSError:
+                continue  # removed between glob and stat
+        # Staleness depends on the clock as well as the logs: re-fold once a day.
+        now = datetime.now(timezone.utc)
+        parts.append(f"stale:{now:%Y-%m-%d}:{STALE_DAYS}:{STALE_DAYS_CURATED}")
+        sig = hashlib.sha1("\n".join(parts).encode()).hexdigest()
+        stored = (db.execute("SELECT v FROM meta WHERE k='refl_sig'").fetchone() or [None])[0]
+        if force or sig != stored:
+            _drop(db, "source = ?", ("reflection",))
+            for it in fold_events(logs).values():
+                it["source"] = "reflection"
+                it["path"] = it.pop("log_dir")
+                if is_stale(it, now):
+                    it["status"] = "stale"
+                _put(db, it)
+            db.execute("INSERT OR REPLACE INTO meta VALUES('refl_sig', ?)", (sig,))
+        seen = set()
+        known = {r["path"]: (r["size"], r["mtime"]) for r in db.execute("SELECT * FROM sources")}
+        for path, kr in doc_sources():
+            p = str(path)
+            seen.add(p)
+            try:
+                sm = _mtime(path)
+            except OSError:
+                continue
+            if not force and known.get(p) == sm:
+                continue
+            _drop(db, "path = ? AND source != 'reflection'", (p,))
+            try:
+                for it in parse_doc(path, kr):
+                    _put(db, it)
+            except (OSError, ValueError):
+                pass
+            db.execute("INSERT OR REPLACE INTO sources VALUES(?,?,?)", (p, *sm))
+        for gone in set(known) - seen:
+            _drop(db, "path = ? AND source != 'reflection'", (gone,))
+            db.execute("DELETE FROM sources WHERE path = ?", (gone,))
+        db.commit()
+
+
+# --------------------------------------------------------------- queries -----
+
+def fts_query(text, any_word=False):
+    words = [w for w in re.findall(r"[\w][\w'-]*", text.lower()) if len(w) > 1]
+    terms = [f'"{w}"*' if len(w) >= 3 else f'"{w}"' for w in words]
+    return (" OR " if any_word else " ").join(terms)
+
+
+def identity_scope(col="i.path"):
+    """Keep rows of this machine's identity (and rows outside any identity tree). One repo
+    key can hold logs from both identities (`code`, `dotfiles`, …); work items must not reach a
+    personal session or model, nor personal items a work one, unless asked (--any-identity)."""
+    return (f"({col} IS NULL OR {col} NOT LIKE '%/identities/%' OR {col} LIKE ?)",
+            [f"%/identities/{identity_key()}/%"])
+
+
+def _filters(args, repo_key):
+    where, params = [], []
+    if not getattr(args, "any_identity", False):
+        clause, extra = identity_scope()
+        where.append(clause)
+        params += extra
+    if repo_key:
+        where.append("i.repo = ?")
+        params.append(repo_key)
+    if getattr(args, "session", None):
+        where.append("i.session_id = ?")
+        params.append(args.session)
+    status = None if args.status == "all" else args.status
+    for column, csv in (("status", status), ("kind", getattr(args, "kind", None)),
+                        ("source", getattr(args, "source", None))):
+        if csv:
+            values = csv.split(",")
+            where.append(f"i.{column} IN ({','.join('?' * len(values))})")
+            params += values
+    return where, params
+
+
+def resolve_id(db, prefix):
+    prefix = prefix.strip().lstrip("#")
+    if len(prefix) < 3:  # "" or "a" would silently match whichever item is alone in the store
+        die(f"id prefix '{prefix}' is too short (need at least 3 characters)")
+    rows = db.execute("SELECT * FROM items WHERE source='reflection' AND id LIKE ? || '%'",
+                      (prefix,)).fetchall()
+    if not rows:
+        die(f"no reflection matches id '{prefix}'")
+    if len(rows) > 1:
+        die(f"'{prefix}' is ambiguous: " + ", ".join(r["id"] for r in rows[:8]))
+    return rows[0]
+
+
+def fmt_row(r, snippet=None):
+    when = (r["updated_at"] or r["created_at"] or "")[:10]
+    tag = f"{r['kind']}·{r['status']}" if r["source"] == "reflection" else f"{r['source']}:{r['kind']}"
+    line = f"#{r['id']:<9} [{tag}] {r['repo'] or '-'}: {r['title']}  ({when}{', ' + r['host'] if r['host'] else ''})"
+    if snippet:
+        line += "\n    " + " ".join(snippet.split())[:220]
+    return line
+
+
+def row_json(r):
+    d = dict(r)
+    d.pop("rowid", None)
+    d["tags"] = (d.get("tags") or "").split()
+    return d
+
+
+# ------------------------------------------------------------- commands -----
+
+def cmd_add(args, db):
+    refresh(db)  # dedup below must see what other sessions/hosts already recorded
+    repo = resolve_repo(args.repo)
+    defaults = {"kind": args.kind, "status": args.status, "tags": args.tags, "priority": args.priority,
+                "session_id": args.session or current_session(), "origin": args.origin,
+                "agent": args.agent or current_agent()}
+    if args.batch:
+        raw = sys.stdin.read() if args.batch == "-" else Path(args.batch).read_text()
+        raw = raw.strip()
+        entries = json.loads(raw) if raw.startswith("[") else [json.loads(x) for x in raw.splitlines() if x.strip()]
+    else:
+        if not args.title:
+            die("--title is required (or use --batch)")
+        body = sys.stdin.read() if args.body == "-" else args.body
+        entries = [{"title": args.title, "body": body}]
+
+    existing = {}  # normalized title → (id, status, log dir)
+    for r in db.execute("SELECT id, title, status, path FROM mine WHERE source='reflection' AND repo=? "
+                        "AND status IN ('open','note','stale')", (repo.key,)):
+        existing[" ".join((r["title"] or "").casefold().split())] = (r["id"], r["status"], r["path"])
+    checkout = exact_checkout(os.getcwd())
+    branch = _git(os.getcwd(), "rev-parse", "--abbrev-ref", "HEAD") if checkout else ""
+    created = []
+    for e in entries:
+        kind = (e.get("kind") or defaults["kind"] or "note").lower()
+        if kind not in KINDS:
+            die(f"unknown kind '{kind}' (one of: {', '.join(KINDS)})")
+        title = redact(" ".join(str(e.get("title") or "").split()))[:MAX_TITLE]
+        if not title:
+            continue
+        norm = title.casefold()
+        if norm in existing and not args.allow_duplicate:
+            iid, status, log_dir = existing[norm]
+            dup = {"id": iid, "title": title, "duplicate": True}
+            if status == "stale":  # raised again: bring the old item back instead of hiding it
+                append_event(host_log(log_dir), {
+                    "v": 1, "ts": utcnow(), "op": "set", "id": iid, "status": "open", "host": host_key(),
+                    "agent": e.get("agent") or defaults["agent"],
+                    "note": f"raised again ({e.get('origin') or defaults['origin'] or 'add'})"})
+                existing[norm] = (iid, "open", log_dir)
+                dup["reopened"] = True
+            created.append(dup)
+            continue
+        status = (e.get("status") or defaults["status"] or KINDS[kind]).lower()
+        if status not in STATUSES:
+            die(f"unknown status '{status}'")
+        tags = e.get("tags") if e.get("tags") is not None else defaults["tags"]
+        if isinstance(tags, str):
+            tags = split_tags(tags)
+        ev = {"v": 1, "ts": utcnow(), "op": "add", "id": new_id(), "host": host_key(),
+              "repo": repo.key, "kind": kind, "status": status, "title": title,
+              "body": redact(str(e.get("body") or ""))[:MAX_BODY], "tags": tags or [],
+              "priority": e.get("priority", defaults["priority"]),
+              "session_id": e.get("session_id") or defaults["session_id"],
+              "agent": e.get("agent") or defaults["agent"], "origin": e.get("origin") or defaults["origin"],
+              "cwd": str(repo.path) if repo.path else os.getcwd(), "checkout": checkout, "branch": branch or None}
+        append_event(repo.log_file, {k: v for k, v in ev.items() if v not in (None, "", [])})
+        existing[norm] = (ev["id"], status, str(repo.log_dir))
+        created.append({"id": ev["id"], "title": title})
+    refresh(db)
+    if args.json:
+        print(json.dumps({"repo": repo.key, "log": str(repo.log_file), "items": created}))
+    else:
+        for c in created:
+            print(f"#{c['id']}{'  (already recorded)' if c.get('duplicate') else ''}  {c['title']}")
+
+
+def cmd_set(args, db, status):
+    refresh(db)
+    for prefix in args.ids:
+        r = resolve_id(db, prefix)
+        ev = {"v": 1, "ts": utcnow(), "op": "set", "id": r["id"], "status": status,
+              "host": host_key(), "agent": args.agent or current_agent()}
+        if args.note:
+            ev["note"] = redact(args.note)
+        append_event(host_log(r["path"]), ev)
+        print(f"#{r['id']} → {status}  {r['title']}")
+    refresh(db)
+
+
+def _edit_changes(src):
+    """Validated edit fields from a dict (argparse namespace vars or a batch op)."""
+    changes = {}
+    if src.get("title"):
+        changes["title"] = redact(" ".join(str(src["title"]).split()))[:MAX_TITLE]
+    if src.get("body") is not None:
+        changes["body"] = redact(str(src["body"]))[:MAX_BODY]
+    if src.get("tags") is not None:
+        tags = src["tags"]
+        changes["tags"] = split_tags(tags) if isinstance(tags, str) else [str(t)[:40] for t in tags][:8]
+    if src.get("kind"):
+        if src["kind"] not in KINDS:
+            raise ValueError(f"unknown kind '{src['kind']}'")
+        changes["kind"] = src["kind"]
+    if src.get("priority") is not None:
+        if not isinstance(src["priority"], int) or not 1 <= src["priority"] <= 5:
+            raise ValueError("priority must be 1-5")
+        changes["priority"] = src["priority"]
+    return changes
+
+
+def cmd_apply(args, db):
+    """Status changes and edits in one call, each validated: the reflector's reconcile path.
+    Ops: {"op": "done"|"drop"|"reopen"|"edit", "id": "<exact id>", "note": "why", ...edit fields}.
+    Scoped to one repo unless --any-repo, so a reflection can only touch its own repo."""
+    refresh(db)
+    raw = (sys.stdin.read() if args.batch == "-" else Path(args.batch).read_text()).strip()
+    ops = json.loads(raw) if raw else []
+    if isinstance(ops, dict):
+        ops = ops.get("ops") or []
+    repo_key = None if args.any_repo else resolve_repo(args.repo).key
+    applied, skipped = [], []
+    status_now = {}  # the index is refreshed once at the end, so track this batch's own changes
+    for op in ops if isinstance(ops, list) else []:
+        if not isinstance(op, dict):
+            continue
+        name, iid = str(op.get("op") or "").lower(), str(op.get("id") or "").strip().lstrip("#")
+        row = db.execute("SELECT * FROM items WHERE source='reflection' AND id=?", (iid,)).fetchone()
+        status = status_now.get(iid, row["status"] if row else None)
+        changes, why = {}, ""
+        if not row:
+            why = "unknown id"
+        elif repo_key and row["repo"] != repo_key:
+            why = f"belongs to repo {row['repo']}"
+        elif name == "edit":
+            try:
+                changes = _edit_changes(op)
+            except ValueError as exc:
+                why = str(exc)
+            else:
+                why = "" if changes else "nothing to change"
+        elif name not in TRANSITIONS:
+            why = f"unknown op '{name}'"
+        elif status not in TRANSITIONS[name][1]:
+            why = f"is {status}"
+        if why:
+            skipped.append({"id": iid, "op": name, "reason": why})
+            continue
+        ev = {"v": 1, "ts": utcnow(), "id": row["id"], "host": host_key(),
+              "agent": op.get("agent") or args.agent or current_agent()}
+        if name == "edit":
+            ev.update(op="edit", checkout=exact_checkout(os.getcwd()), **changes)
+        else:
+            ev.update(op="set", status=TRANSITIONS[name][0])
+            status_now[iid] = TRANSITIONS[name][0]
+        note = redact(" ".join(str(op.get("note") or args.note or "").split()))[:1000]
+        if note:
+            ev["note"] = note
+        append_event(host_log(row["path"]), ev)
+        applied.append({"id": row["id"], "op": name, "title": row["title"]})
+    refresh(db)
+    if args.json:
+        print(json.dumps({"applied": applied, "skipped": skipped}))
+        return
+    for a in applied:
+        print(f"#{a['id']} {a['op']}  {a['title']}")
+    for s in skipped:
+        print(f"#{s['id']} skipped ({s['op']}): {s['reason']}", file=sys.stderr)
+
+
+_STOPWORDS = frozenset("""about above after again also always another anything because been before being
+below between both cannot could does doing done down during each else even every from have having here
+into just know like made make many might more most much must need needs never next only other over
+please really same should since some still such than that their them then there these they thing
+think this those though through under until upon very want were what when where which while with
+within without would your yours user assistant tool tools error errors file files command output read
+write edit bash session sessions true false none null""".split())
+
+
+def keywords(text, n=24):
+    """Distinctive terms of a text, for an FTS OR-query: frequent in the text, rare in the index."""
+    counts = collections.Counter()
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{3,}", text or ""):
+        t = tok.strip(".-_").lower()
+        if len(t) >= 4 and t not in _STOPWORDS:
+            counts[t] += 1
+    return [t for t, _ in counts.most_common(n)]
+
+
+def cmd_candidates(args, db):
+    """The items a reflection of this session may close, reopen, edit or must not repeat:
+    this session's own open items, open/stale/note items matching the text, the repo's
+    freshest open items, and recently closed ones that match (so they can be reopened)."""
+    refresh(db)
+    repo_key = resolve_repo(args.repo).key
+    text = " ".join(args.query or [])
+    if args.query_file:
+        text += " " + Path(args.query_file).read_text(encoding="utf-8", errors="replace")
+    terms = keywords(text)
+    fts = " OR ".join(f'"{t}"' for t in terms)
+    picked = {}
+
+    def take(rows, why, upto):
+        """Add rows not picked yet, until `upto` items are picked in all."""
+        for r in rows:
+            if len(picked) >= upto:
+                break
+            if r["id"] not in picked:
+                picked[r["id"]] = (r, why)
+
+    def matching(statuses, limit):
+        if not fts:
+            return []
+        marks = ",".join("?" * len(statuses))
+        return db.execute(
+            f"""SELECT i.* FROM items_fts JOIN mine i ON i.rowid = items_fts.rowid
+                WHERE items_fts MATCH ? AND i.source='reflection' AND i.repo=? AND i.status IN ({marks})
+                ORDER BY bm25(items_fts, 8.0, 2.0, 3.0, 1.0) LIMIT ?""", (fts, repo_key, *statuses, limit)).fetchall()
+
+    if args.session:
+        take(db.execute("SELECT * FROM mine WHERE source='reflection' AND repo=? AND session_id=? "
+                        "AND status IN ('open','stale') ORDER BY updated_at DESC LIMIT ?",
+                        (repo_key, args.session, args.limit)), "this-session", args.limit)
+    take(matching(("open", "stale"), args.limit), "matches", args.limit)
+    take(db.execute("SELECT * FROM mine WHERE source='reflection' AND repo=? AND status='open' "
+                    "ORDER BY updated_at DESC LIMIT ?", (repo_key, args.limit)), "recent", args.limit)
+    take(matching(("note",), args.notes), "matches", len(picked) + args.notes)
+    closed_upto = len(picked) + args.closed  # this session's closed items and closed matches share one budget
+    if args.session:
+        take(db.execute("SELECT * FROM mine WHERE source='reflection' AND repo=? AND session_id=? "
+                        "AND status IN ('done','dropped') ORDER BY updated_at DESC LIMIT ?",
+                        (repo_key, args.session, args.closed)), "this-session", closed_upto)
+    take(matching(("done", "dropped"), args.closed), "matches", closed_upto)
+    now = datetime.now(timezone.utc)
+    out = [{"id": r["id"], "kind": r["kind"], "status": r["status"], "title": r["title"],
+            "age_days": round(_age_days(r["updated_at"], now), 1), "origin": r["origin"],
+            "this_session": bool(args.session and r["session_id"] == args.session), "why": why,
+            "body": " ".join((r["body"] or "").split())[:args.body_chars]}
+           for r, why in picked.values()]
+    print(json.dumps({"repo": repo_key, "terms": terms, "items": out}, indent=None if args.json else 1))
+
+
+def cmd_export(args, db):
+    """Every reflection item (all statuses, all repos) as JSON lines, for indexers.
+    --since keeps those whose updated_at is at or after it; stale status changes daily without
+    an event, so a consumer re-reads everything once a day."""
+    refresh(db)
+    where, params = ["source='reflection'"], []
+    if not args.any_identity:
+        clause, extra = identity_scope("path")
+        where.append(clause)
+        params += extra
+    if args.since:
+        where.append("updated_at >= ?")
+        params.append(args.since)
+    if args.repo:
+        where.append("repo = ?")
+        params.append(resolve_repo(args.repo).key)
+    for r in db.execute(f"SELECT * FROM items WHERE {' AND '.join(where)} ORDER BY updated_at", params):
+        d = row_json(r)
+        d["notes"] = [n for n in (d.get("notes") or "").splitlines() if n]
+        print(json.dumps(d, ensure_ascii=False))
+
+
+def cmd_edit(args, db):
+    refresh(db)
+    r = resolve_id(db, args.id)
+    try:
+        changes = _edit_changes({"title": args.title, "tags": args.tags, "kind": args.kind,
+                                 "priority": args.priority,
+                                 "body": sys.stdin.read() if args.body == "-" else args.body})
+    except ValueError as exc:
+        die(str(exc))
+    if not changes:  # an empty edit would still bump updated_at and reorder lists
+        die("nothing to change (use --title/--body/--tags/--kind/--priority)")
+    append_event(host_log(r["path"]), {"v": 1, "ts": utcnow(), "op": "edit", "id": r["id"],
+                                       "host": host_key(), "agent": args.agent or current_agent(),
+                                       "checkout": exact_checkout(os.getcwd()), **changes})
+    refresh(db)
+    print(f"#{r['id']} edited")
+
+
+def cmd_list(args, db):
+    refresh(db)
+    repo_key = None if args.all else resolve_repo(args.repo).key
+    where, params = _filters(args, repo_key)
+    where.append("i.source = 'reflection'")
+    rows = db.execute(f"SELECT i.* FROM items i WHERE {' AND '.join(where)} "
+                      "ORDER BY COALESCE(i.priority, 3), i.updated_at DESC LIMIT ?",
+                      (*params, args.limit)).fetchall()
+    if args.json:
+        print(json.dumps([row_json(r) for r in rows], indent=1))
+        return
+    if not rows:
+        scope = "all repos" if args.all else repo_key
+        print(f"no {args.status} reflections for {scope}")
+    for r in rows:
+        print(fmt_row(r))
+
+
+def cmd_search(args, db):
+    refresh(db)
+    repo_key = resolve_repo(args.repo).key if args.repo else None
+    where, params = _filters(args, repo_key)
+    rows = []
+    for any_word in (False, True):
+        q = fts_query(" ".join(args.query), any_word)
+        if not q:
+            die("empty query")
+        clause = " AND ".join(["items_fts MATCH ?"] + where)
+        rows = db.execute(
+            f"""SELECT i.*, snippet(items_fts, 1, '[', ']', '…', 14) AS snip,
+                       bm25(items_fts, 8.0, 2.0, 3.0, 1.0) AS rank
+                FROM items_fts JOIN items i ON i.rowid = items_fts.rowid
+                WHERE {clause} ORDER BY rank LIMIT ?""", (q, *params, args.limit)).fetchall()
+        if rows:
+            break
+    if args.json:
+        print(json.dumps([{**row_json(r), "snippet": r["snip"]} for r in rows], indent=1))
+        return
+    if not rows:
+        print("no matches")
+    for r in rows:
+        print(fmt_row(r, r["snip"]))
+
+
+def cmd_show(args, db):
+    refresh(db)
+    row = db.execute("SELECT * FROM items WHERE id = ?", (args.id.lstrip("#"),)).fetchone() \
+        or resolve_id(db, args.id)
+    if args.json:
+        print(json.dumps(row_json(row), indent=1))
+        return
+    print(fmt_row(row))
+    for k in ("source", "origin", "agent", "session_id", "branch", "cwd", "created_at", "done_at", "path"):
+        if row[k]:
+            print(f"  {k:10} {row[k]}")
+    if row["tags"]:
+        print(f"  {'tags':10} {row['tags']}")
+    if row["body"]:
+        print("\n" + textwrap.indent(row["body"].strip(), "  "))
+    if row["notes"]:
+        print("\n  notes:\n" + textwrap.indent(row["notes"], "    "))
+
+
+def cmd_repos(args, db):
+    refresh(db)
+    rows = db.execute("""SELECT repo, SUM(status='open') o, SUM(status='stale') s, SUM(status='done') d,
+                          SUM(status='note') n, MAX(updated_at) last FROM items WHERE source='reflection'
+                          GROUP BY repo ORDER BY o DESC, last DESC""").fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=1))
+        return
+    print(f"{'repo':24} {'open':>5} {'stale':>5} {'done':>5} {'notes':>6}  last")
+    for r in rows:
+        print(f"{r['repo'] or '-':24} {r['o']:>5} {r['s']:>5} {r['d']:>5} {r['n']:>6}  {(r['last'] or '')[:16]}")
+
+
+def context_text(db, repo_key, limit, max_chars):
+    """Compact markdown of what a new session in this repo should know is open."""
+    open_rows = db.execute(
+        """SELECT * FROM mine WHERE source='reflection' AND repo=? AND status='open'
+           ORDER BY kind='handoff' DESC, COALESCE(priority, 3), updated_at DESC LIMIT ?""",
+        (repo_key, limit)).fetchall()
+    notes = db.execute(
+        """SELECT * FROM mine WHERE source='reflection' AND repo=? AND status='note'
+           AND kind IN ('gotcha','decision','learning') ORDER BY updated_at DESC LIMIT ?""",
+        (repo_key, max(2, limit // 2))).fetchall()
+    total_open, stale = db.execute("SELECT SUM(status='open'), SUM(status='stale') FROM mine "
+                                   "WHERE source='reflection' AND repo=?", (repo_key,)).fetchone()
+    total_open, stale = total_open or 0, stale or 0
+    if not open_rows and not notes:
+        return ""
+    lines = [f"## Reflections store — {repo_key}"]
+    if open_rows:
+        counts = []
+        if total_open > len(open_rows):
+            counts.append(f"showing {len(open_rows)} of {total_open}")
+        if stale:
+            counts.append(f"{stale} stale hidden")
+        lines.append(f"Open items ({'; '.join(counts)}):" if counts else "Open items:")
+        for r in open_rows:
+            lines.append(f"- #{r['id']} [{r['kind']}] {r['title']} ({(r['updated_at'] or '')[:10]})")
+    if notes:
+        lines.append("Recent learnings:")
+        for r in notes:
+            lines.append(f"- #{r['id']} [{r['kind']}] {r['title']}")
+    lines.append("Manage with `reflections list|search|show|done <id>`.")
+    text = "\n".join(lines)
+    return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
+
+
+def cmd_context(args, db):
+    refresh(db)
+    text = context_text(db, resolve_repo(args.repo).key, args.limit, args.max_chars)
+    if args.json:
+        print(json.dumps({"context": text}))
+    elif text:
+        print(text)
+
+
+def cmd_index(args, db):
+    t0 = time.time()
+    refresh(db, force=args.rebuild)
+    counts = db.execute("SELECT source, COUNT(*) c FROM items GROUP BY source").fetchall()
+    print(f"index {INDEX} refreshed in {time.time() - t0:.2f}s: "
+          + ", ".join(f"{r['source']}={r['c']}" for r in counts))
+
+
+def cmd_where(args, db):
+    repo = resolve_repo(args.repo)
+    print(json.dumps({"repo": repo.key, "shortname": repo.shortname, "path": str(repo.path or ""),
+                      "home": str(repo.home), "log": str(repo.log_file), "host": host_key(),
+                      "identity": identity(), "index": str(INDEX)}, indent=1))
+
+
+# ------------------------------------------------------------------ main -----
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="reflections", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="Kinds: " + ", ".join(f"{k} ({v})" for k, v in KINDS.items()))
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp, repo=True):
+        if repo:
+            sp.add_argument("--repo", help="repo name (default: the repo of the current directory)")
+        sp.add_argument("--json", action="store_true", help="machine-readable output")
+        return sp
+
+    a = common(sub.add_parser("add", help="record a reflection or action item"))
+    a.add_argument("--kind", choices=KINDS, help="default: note, or each batch item's own kind")
+    a.add_argument("--title")
+    a.add_argument("--body", help="text, or - to read stdin")
+    a.add_argument("--status", choices=STATUSES, help="default depends on kind")
+    a.add_argument("--tags", help="comma-separated")
+    a.add_argument("--priority", type=int, choices=range(1, 6), help="1 (urgent) … 5")
+    a.add_argument("--session", help="session id (default: $CLAUDE_CODE_SESSION_ID)")
+    a.add_argument("--origin", help="what produced it: reflect, handoff, precompact, sessionend, manual…")
+    a.add_argument("--agent", help="claude | codex | human (default: detected)")
+    a.add_argument("--batch", metavar="FILE|-", help="JSON array or JSONL of {kind,title,body,tags,status,priority}")
+    a.add_argument("--allow-duplicate", action="store_true", help="add even if an identical open title exists")
+
+    for name, helptext in (("done", "mark items done"), ("reopen", "mark items open again"),
+                           ("drop", "close items without doing them")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("ids", nargs="+", metavar="ID", help="id or unique id prefix")
+        s.add_argument("--note", help="why / how (kept with the item)")
+        s.add_argument("--agent")
+
+    e = sub.add_parser("edit", help="change an item's title, body, tags, kind or priority")
+    e.add_argument("id")
+    e.add_argument("--title")
+    e.add_argument("--body", help="text, or - to read stdin")
+    e.add_argument("--tags")
+    e.add_argument("--kind", choices=KINDS)
+    e.add_argument("--priority", type=int, choices=range(1, 6))
+    e.add_argument("--agent")
+
+    ap = common(sub.add_parser("apply", help="done/drop/reopen/edit several items from a JSON list"))
+    ap.add_argument("--batch", required=True, metavar="FILE|-",
+                    help='JSON list of {"op": "done|drop|reopen|edit", "id": …, "note": …, title/body/tags/priority}')
+    ap.add_argument("--any-repo", action="store_true", help="allow ids outside --repo / the current repo")
+    ap.add_argument("--note", help="default note for ops without one")
+    ap.add_argument("--agent")
+
+    ca = common(sub.add_parser("candidates", help="items a reflection may reconcile (JSON, with ids)"))
+    ca.add_argument("query", nargs="*", help="text to match (words, paths, names)")
+    ca.add_argument("--query-file", help="read the text to match from a file")
+    ca.add_argument("--session", help="this session's own items come first")
+    ca.add_argument("--limit", type=int, default=50, help="open/stale items (default 50)")
+    ca.add_argument("--notes", type=int, default=12, help="matching notes (default 12)")
+    ca.add_argument("--closed", type=int, default=12, help="recently closed items (default 12)")
+    ca.add_argument("--body-chars", type=int, default=180)
+
+    ex = sub.add_parser("export", help="all reflection items as JSON lines (for indexers)")
+    ex.add_argument("--since", help="only items updated at or after this ISO time")
+    ex.add_argument("--repo")
+    ex.add_argument("--any-identity", action="store_true", help="include the other identity's items")
+
+    ls = common(sub.add_parser("list", help="list reflections for a repo (default: open ones)"))
+    ls.add_argument("--all", action="store_true", help="every repo")
+    ls.add_argument("--status", default="open",
+                    help="open (default) | stale | done | dropped | note | all, comma-separated")
+    ls.add_argument("--kind", help="comma-separated kinds")
+    ls.add_argument("--session", help="only items from this session")
+    ls.add_argument("--any-identity", action="store_true", help="include the other identity's items")
+    ls.add_argument("--limit", type=int, default=30)
+
+    s = common(sub.add_parser("search", help="full-text search across reflections and memories"))
+    s.add_argument("query", nargs="+")
+    s.add_argument("--status", default="all", help="filter: open | done | note | all (default all)")
+    s.add_argument("--kind")
+    s.add_argument("--source", help="comma-separated: " + ",".join(SOURCES))
+    s.add_argument("--any-identity", action="store_true", help="include the other identity's items")
+    s.add_argument("--limit", type=int, default=15)
+
+    sh = sub.add_parser("show", help="one item in full")
+    sh.add_argument("id")
+    sh.add_argument("--json", action="store_true")
+
+    common(sub.add_parser("repos", help="open/done counts per repo"), repo=False)
+
+    c = common(sub.add_parser("context", help="compact open-items summary (used by hooks)"))
+    c.add_argument("--limit", type=int, default=8)
+    c.add_argument("--max-chars", type=int, default=2500)
+
+    i = sub.add_parser("index", help="refresh (or --rebuild) the search index")
+    i.add_argument("--rebuild", action="store_true")
+
+    common(sub.add_parser("where", help="show where the current repo's reflections are stored"))
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    db = open_index()
+    try:
+        {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "search": cmd_search, "show": cmd_show,
+         "repos": cmd_repos, "context": cmd_context, "index": cmd_index, "where": cmd_where,
+         "apply": cmd_apply, "candidates": cmd_candidates, "export": cmd_export,
+         "done": lambda a, d: cmd_set(a, d, "done"), "reopen": lambda a, d: cmd_set(a, d, "open"),
+         "drop": lambda a, d: cmd_set(a, d, "dropped")}[args.cmd](args, db)
+    except BrokenPipeError:
+        pass
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
