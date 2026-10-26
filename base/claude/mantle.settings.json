@@ -1,0 +1,20 @@
+{
+  "model": "opus",
+  "env": {
+    "CLAUDE_CODE_USE_MANTLE": "1",
+    "CLAUDE_CODE_USE_BEDROCK": "",
+    "CLAUDE_CODE_USE_VERTEX": "",
+    "CLAUDE_CODE_USE_FOUNDRY": "",
+    "ANTHROPIC_BASE_URL": "",
+    "AWS_REGION": "us-east-1",
+    "ANTHROPIC_MODEL": "",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "anthropic.claude-opus-5-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "anthropic.claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "anthropic.claude-haiku-4-5",
+    "ANTHROPIC_SMALL_FAST_MODEL": "anthropic.claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "anthropic.claude-fable-5",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "anthropic.claude-opus-5",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Opus 5",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Claude Opus 5 via Bedrock Mantle (us-east-1)"
+  }
+}
