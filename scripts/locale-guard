@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# locale-guard — detect when this shell landed in a non-UTF-8 locale and warn
+# with the exact fix, instead of leaving the user to stare at mojibake.
+#
+# WHY this exists:
+#   Some transports (a jump host, a cloud session-manager hop) DROP ssh's
+#   SendEnv of LANG/LC_*, so the remote shell can fall back to the C locale
+#   (charmap ANSI_X3.4-1968 = ASCII). When that happens, every Unicode
+#   box-drawing char / glyph in tmux + Claude Code renders as garbage. The
+#   shell-init guards (zshenv, profile.server) FORCE a UTF-8 locale on the way
+#   in, and a connect wrapper can bake LANG/LC_ALL=C.UTF-8 into the remote
+#   command. But a session reached by some OTHER path (a bare `ssh box`, a
+#   cron job, an old tmux server started before the guards landed, a non-login
+#   subshell) can still end up in C/ASCII. This guard makes that VISIBLE.
+#
+#   The lesson learned the hard way on 2026-05-31: when a TUI renders garbage
+#   but TERM is correct, it is almost always a dropped locale, not TERM. This
+#   guard short-circuits that whole debugging detour by saying so on login.
+#
+# Behavior:
+#   - Exit 0 + print NOTHING when the effective charmap is UTF-8 (the happy
+#     path: silent, zero noise on every login).
+#   - Exit 1 + print a one-block warning with the cause and the copy-paste fix
+#     when the charmap is NOT UTF-8.
+#   - `--quiet` / `-q`: set exit code only, print nothing (for scripts).
+#   - `--fix`: in addition to warning, attempt to export a UTF-8 locale into
+#     the CURRENT process is impossible (a child cannot mutate its parent), so
+#     --fix instead PRINTS the exact `export ...` line and, when run as
+#     `eval "$(locale-guard --fix)"`, applies it. With --fix we emit ONLY the
+#     export lines on stdout (warning goes to stderr) so eval is safe.
+#   - `--motd`: emit a single compact line suitable for the MOTD pipeline
+#     (only when broken; nothing when fine).
+#
+# Portable: bash 3.2 + sh safe. No GNU-only flags. No associative arrays.
+set -u
+
+mode="warn"
+case "${1:-}" in
+  -q|--quiet) mode="quiet" ;;
+  --fix)      mode="fix" ;;
+  --motd)     mode="motd" ;;
+  "")         mode="warn" ;;
+  -h|--help)
+    sed -n '2,40p' "$0"
+    exit 0
+    ;;
+esac
+
+# Resolve the effective charmap. `locale charmap` is the authoritative answer
+# (it reflects LC_CTYPE after all the LANG/LC_* precedence rules). Fall back to
+# inspecting the env vars directly if `locale` is unavailable.
+charmap=""
+if command -v locale >/dev/null 2>&1; then
+  charmap=$(locale charmap 2>/dev/null)
+fi
+if [ -z "$charmap" ]; then
+  # No `locale` binary — infer from the env. Pick the first set of LC_ALL,
+  # LC_CTYPE, LANG (that is the precedence order glibc uses for LC_CTYPE).
+  eff="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  case "$eff" in
+    *.UTF-8|*.utf8|*.UTF8) charmap="UTF-8" ;;
+    *) charmap="${eff:-POSIX}" ;;
+  esac
+fi
+
+# Is it UTF-8? Accept the common spellings.
+is_utf8=1
+case "$charmap" in
+  UTF-8|utf-8|utf8|UTF8) is_utf8=0 ;;
+  *) is_utf8=1 ;;
+esac
+
+# Happy path: UTF-8. Silent success (except --fix, which prints nothing to do).
+if [ "$is_utf8" -eq 0 ]; then
+  exit 0
+fi
+
+# ── Broken: not UTF-8. Decide the target locale to recommend. ───────────────
+# C.UTF-8 is present on most Linux systems and macOS; prefer it. Fall back to
+# en_US.UTF-8 only if C.UTF-8 is not installed.
+target="C.UTF-8"
+if command -v locale >/dev/null 2>&1; then
+  if ! locale -a 2>/dev/null | grep -qiE '^C\.utf-?8$'; then
+    if locale -a 2>/dev/null | grep -qiE '^en_US\.utf-?8$'; then
+      target="en_US.UTF-8"
+    fi
+  fi
+fi
+
+case "$mode" in
+  quiet)
+    exit 1
+    ;;
+  motd)
+    # One compact line for the MOTD. Keep under 80 cols. Dim-yellow warning.
+    printf '\033[33m⚠ locale=%s (not UTF-8) — glyphs will garble. fix: export LC_ALL=%s\033[0m\n' \
+      "$charmap" "$target"
+    exit 1
+    ;;
+  fix)
+    # Emit ONLY the export lines on stdout so `eval "$(locale-guard --fix)"`
+    # applies them to the calling shell. Human-readable warning -> stderr.
+    printf 'export LANG=%s LC_ALL=%s\n' "$target" "$target"
+    printf '\033[33m[locale-guard] charmap was %s; applied LANG/LC_ALL=%s\033[0m\n' \
+      "$charmap" "$target" >&2
+    # Also self-heal any tmux server attached to this session, so already-open
+    # panes pick up UTF-8 too.
+    if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+      tmux set-environment -g LANG "$target" 2>/dev/null || true
+      tmux set-environment -g LC_ALL "$target" 2>/dev/null || true
+    fi
+    exit 1
+    ;;
+  warn|*)
+    {
+      printf '\033[33m'
+      printf '┌─ locale-guard ───────────────────────────────────────────────┐\n'
+      printf '│ This shell is in a NON-UTF-8 locale (charmap: %s)\n' "$charmap"
+      printf '│ tmux box-drawing + Claude Code glyphs WILL render as garbage.\n'
+      printf '│ Cause: the LANG/LC_* env was dropped over the connection hop\n'
+      printf '│        (common over jump hosts and session-manager hops). TERM is\n'
+      printf '│        almost never the real cause — do not chase it.\n'
+      printf '│ Fix (this shell):  eval "$(locale-guard --fix)"\n'
+      printf '│ Fix (manual):      export LANG=%s LC_ALL=%s\n' "$target" "$target"
+      printf '└──────────────────────────────────────────────────────────────┘\n'
+      printf '\033[0m'
+    } >&2
+    exit 1
+    ;;
+esac
