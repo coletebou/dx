@@ -1,0 +1,507 @@
+#!/usr/bin/env bash
+# session-analyzer — scan past Claude Code session transcripts and emit:
+#   - unfinished.md : sessions with open TodoWrite items or unresolved work
+#   - workflow-tips.md : repeated correction patterns worth acting on
+#   - memory-candidates.md : durable-looking facts not already in MEMORY.md
+#
+# Reads from: ~/.claude/projects/<canonical>/*.jsonl plus the sibling
+#             <canonical>--claude-worktrees-*/ dirs (nested worktree sessions)
+# Writes to:  <memory-home>/.analysis/[<host-label>/]  where memory-home comes
+#             from claude/memory-homes.conf (lib/memory-homes.sh); a repo with
+#             no entry falls back to ~/.claude/projects/<canonical>/memory/.analysis/
+#
+# Usage:
+#   session-analyzer [--project <canonical>] [--since YYYY-MM-DD] [--dry-run] [--verbose]
+#
+# Default: runs for every repo in claude/memory-canonicals.conf (MEMORY_CANONICALS_CONF;
+# template: claude/memory-canonicals.conf.example) on the current machine.
+# The LLM passes go through claude-consolidate (CLAUDE_CONSOLIDATE_BIN overrides it);
+# transcripts the data boundary restricts (MEMORY_BOUNDARY_CMD, see
+# lib/memory-boundary.sh) are never read. Needs bash 4.4+ (macOS: brew install bash).
+
+set -uo pipefail
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "session-analyzer: needs bash 4.4 or newer (macOS: brew install bash)" >&2
+  exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${MEMORY_CANONICALS_CONF:-$HOME/.dotfiles/claude/memory-canonicals.conf}"
+CONSOLIDATE="${CLAUDE_CONSOLIDATE_BIN:-$SCRIPT_DIR/claude-consolidate}"
+PROJECTS_DIR="$HOME/.claude/projects"
+DAYS=30
+DRY=0
+VERBOSE=0
+ONLY_PROJECT=""
+# Hub-sweep overrides (default to today's single-box behavior):
+#   --transcripts-root DIR  where the *.jsonl live (default ~/.claude/projects).
+#                           On the hub, point at an archived host's dir.
+#   --machine NAME          which memory-canonicals.conf rows to select
+#                           (default $(hostname -s)); lets the hub select a
+#                           DIFFERENT host's transcript-suffix rows.
+#   --host-label LABEL      namespace the .analysis output under
+#                           <memory-home>/.analysis/<LABEL>/ so multiple hosts'
+#                           analyses coexist in one synced dir without clobber.
+TRANSCRIPTS_ROOT=""
+MACHINE_OVERRIDE=""
+HOST_LABEL=""
+
+# Shared memory-home resolver: transcripts live per-box (machine-dependent),
+# but .analysis output must land in the synced memory home so the hub's dream
+# can promote it. See lib/memory-homes.sh.
+# shellcheck source=lib/memory-homes.sh
+source "$SCRIPT_DIR/lib/memory-homes.sh"
+# shellcheck source=lib/memory-boundary.sh
+source "$SCRIPT_DIR/lib/memory-boundary.sh"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project) ONLY_PROJECT="$2"; shift 2 ;;
+    --since)   SINCE="$2"; shift 2 ;;
+    --days)    DAYS="$2"; shift 2 ;;
+    --transcripts-root) TRANSCRIPTS_ROOT="$2"; shift 2 ;;
+    --machine) MACHINE_OVERRIDE="$2"; shift 2 ;;
+    --host-label) HOST_LABEL="$2"; shift 2 ;;
+    --dry-run|-n) DRY=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's|^# \?||'; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$TRANSCRIPTS_ROOT" ]] && PROJECTS_DIR="$TRANSCRIPTS_ROOT"
+
+log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+vlog() { (( VERBOSE )) && log "$*"; }
+# File mtime as YYYY-MM-DD. `stat -c` is GNU-only: on macOS BSD stat it fails
+# with "illegal option -- c" and the session date printed blank. Prefer gstat
+# (Homebrew coreutils), then GNU stat, then BSD's -f/-t syntax.
+mtime_date() {
+  if command -v gstat >/dev/null 2>&1; then gstat -c %y "$1" | cut -d' ' -f1
+  elif stat -c %y "$1" >/dev/null 2>&1; then stat -c %y "$1" | cut -d' ' -f1
+  else stat -f %Sm -t %Y-%m-%d "$1"
+  fi
+}
+mtime_epoch() {
+  if command -v gstat >/dev/null 2>&1; then gstat -c %Y "$1"
+  elif stat -c %Y "$1" >/dev/null 2>&1; then stat -c %Y "$1"
+  else stat -f %m "$1"
+  fi
+}
+
+if [[ -z "${SINCE:-}" ]]; then
+  # `date -d` is GNU-only. On macOS BSD date it fails with "illegal option -- d",
+  # SINCE ends up EMPTY, and the scan silently matches nothing — so running this
+  # on the Mac looked like "0 sessions" rather than an error. Prefer gdate
+  # (Homebrew coreutils), then GNU date, then BSD's -v syntax.
+  if command -v gdate >/dev/null 2>&1; then
+    SINCE=$(gdate -u -d "${DAYS} days ago" +%Y-%m-%d)
+  elif date -u -d "1 day ago" +%Y-%m-%d >/dev/null 2>&1; then
+    SINCE=$(date -u -d "${DAYS} days ago" +%Y-%m-%d)
+  else
+    SINCE=$(date -u -v"-${DAYS}d" +%Y-%m-%d)
+  fi
+fi
+if [[ -z "$SINCE" ]]; then
+  echo "session-analyzer: could not compute a start date — refusing to scan" >&2
+  exit 1
+fi
+
+log "scanning sessions since $SINCE"
+
+# Resolve canonicals for this machine. Each entry is "repo<TAB>transcript-dir"
+# so we can resolve the repo's git-synced memory home separately from its
+# per-box transcript dir. --machine lets the hub select another host's rows.
+MACHINE="${MACHINE_OVERRIDE:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+declare -a CANONICALS
+if [[ -n "$ONLY_PROJECT" ]]; then
+  # Bare transcript dir passed directly. Reverse-look-up the repo from the
+  # conf so .analysis lands in the git-synced memory home; a dir with no row
+  # falls back to "?" → legacy <transcript-dir>/memory (stranded on-box).
+  only_repo=""
+  [[ -f "$CONF" ]] && only_repo=$(
+    grep -v '^\s*#' "$CONF" | grep -v '^\s*$' | awk -v m="$MACHINE" -v d="$ONLY_PROJECT" '
+      { split($2, parts, ":"); if (parts[1]==m && parts[2]==d) { print $1; exit } }'
+  )
+  CANONICALS=("${only_repo:-?}"$'\t'"$PROJECTS_DIR/$ONLY_PROJECT")
+elif [[ -f "$CONF" ]]; then
+  mapfile -t CANONICALS < <(
+    grep -v '^\s*#' "$CONF" | grep -v '^\s*$' | awk -v m="$MACHINE" -v p="$PROJECTS_DIR" '
+      { split($2, parts, ":"); if (parts[1]==m) print $1 "\t" p "/" parts[2] }'
+  )
+fi
+[[ ${#CANONICALS[@]} -gt 0 ]] || { log "no canonicals found (machine=$MACHINE). exiting."; exit 0; }
+
+for entry in "${CANONICALS[@]}"; do
+  repo="${entry%%$'\t'*}"
+  canonical="${entry##*$'\t'}"
+  [[ -d "$canonical" ]] || { vlog "skip missing: $canonical"; continue; }
+  log "project: $canonical (repo=$repo)"
+
+  # Read transcripts from $canonical (per-box), but write .analysis into the
+  # git-synced memory home so promotions aren't stranded on-box. Namespace by
+  # --host-label when the hub sweeps multiple hosts into one shared dir.
+  mem_home="$(memory_home_or_legacy "$repo" "$canonical")"
+  if [[ -n "$HOST_LABEL" ]]; then
+    analysis="$mem_home/.analysis/$HOST_LABEL"
+  else
+    analysis="$mem_home/.analysis"
+  fi
+  mkdir -p "$analysis"
+  unfinished="$analysis/unfinished.md"
+  workflow_tips="$analysis/workflow-tips.md"
+  raw_tips="$analysis/workflow-tips.raw.md"
+  mem_candidates="$analysis/memory-candidates.md"
+  raw_candidates="$analysis/memory-candidates.raw.md"
+
+  # Gather jsonl files modified since $SINCE. Also scan nested-worktree
+  # sessions: a cwd of <repo>/.claude/worktrees/<slug> is escaped by Claude
+  # Code into a SIBLING project dir, <canonical>--claude-worktrees-<slug>, so
+  # a single-dir find silently drops every parallel fan-out session.
+  scan_dirs=("$canonical")
+  for wt in "$canonical"--claude-worktrees-*/; do
+    [[ -d "$wt" ]] && scan_dirs+=("${wt%/}")
+  done
+  mapfile -t SESSIONS < <(find "${scan_dirs[@]}" -maxdepth 1 -name '*.jsonl' -newermt "$SINCE" 2>/dev/null | sort)
+  # Only transcripts the data boundary allows feed the analysis: its output lands
+  # in the memory tree and its text goes to a model (lib/memory-boundary.sh).
+  kept=()
+  for jsonl in ${SESSIONS[@]+"${SESSIONS[@]}"}; do
+    memory_boundary_blocks session-analyzer "$jsonl" || kept+=("$jsonl")
+  done
+  boundary_skipped=$(( ${#SESSIONS[@]} - ${#kept[@]} ))
+  SESSIONS=(${kept[@]+"${kept[@]}"})
+  log "  ${#SESSIONS[@]} sessions in window (${#scan_dirs[@]} dirs; $boundary_skipped restricted skipped)"
+
+  # ---- unfinished.md ----
+  # Claude Code's task tooling shape:
+  #   pre-2026-05ish: TodoWrite tool, full array on every call
+  #   current:        TaskCreate (subject/description) + TaskUpdate (taskId/status)
+  # We support both. TaskCreate adds a task in pending state; TaskUpdate
+  # mutates status. Fold the event stream and treat anything not
+  # completed/deleted at session end as open.
+  {
+    printf '# Unfinished work (generated %s)\n\n' "$(date -u +%FT%TZ)"
+    printf 'Sessions in the last %s days that ended with open Task/Todo items, ended without an assistant reply (ended=no-reply | killed-mid-tool-loop), or self-flagged TODO/FIXME/revisit work in their final stretch ([tail] lines). Sessions active in the last 30 minutes are treated as live and not reported as ended.\n\n' "$DAYS"
+    for jsonl in "${SESSIONS[@]}"; do
+      # Build per-session task state map, then count non-terminal entries.
+      # Output: open_count<TAB>pipe-separated subjects
+      result=$(jq -r -s '
+        # Flatten content blocks across all entries; pick out tool_use of
+        # TaskCreate / TaskUpdate / TodoWrite.
+        [.[] | (.message.content // []) | .[]?
+          | select(.type == "tool_use" and (.name | IN("TaskCreate","TaskUpdate","TodoWrite")))]
+        | reduce .[] as $tu ({};
+            if   $tu.name == "TaskCreate" then
+              .[($tu.id // ($tu.input.subject // "anon") )] = {
+                status: "pending",
+                subject: ($tu.input.subject // "?")
+              }
+            elif $tu.name == "TaskUpdate" then
+              ( .[$tu.input.taskId] // {status:"pending", subject:"(unknown)"} ) as $cur
+              | .[$tu.input.taskId] = ($cur + {status: ($tu.input.status // $cur.status)})
+            elif $tu.name == "TodoWrite" then
+              # Legacy: full array each call. Reset state to the latest array.
+              ( ($tu.input.todos // []) | map({(.id // .content): {status: .status, subject: (.content // "?")}}) | add // {} )
+            else . end)
+        | to_entries
+        | map(select(.value.status as $s | $s != "completed" and $s != "deleted"))
+        | "\(length)\t\(map(.value.subject) | join(" | "))"
+      ' "$jsonl" 2>/dev/null)
+      open=${result%%$'\t'*}
+      open=${open:-0}
+      subjects_line=${result#*$'\t'}
+
+      # Second signal set (spec rules the task fold cannot see — most sessions
+      # never touch the task tools): the turn ended with no assistant reply
+      # (hung prompt, or killed mid tool loop), and TODO/FIXME/revisit-style
+      # self-flags in the final 10% of the assistant text. Hook/skill
+      # injections are user-ROLE lines the user never typed; skip them.
+      tail=$(jq -r -s '
+        def synthetic: test("^\\s*(Stop hook feedback:|<task-notification>|<system-reminder>|<local-command|<command-name>|<command-message>|Base directory for this skill:)");
+        def txt: (.message.content // []) as $c
+          | (if ($c|type)=="string" then $c
+             else ($c | map(select(type=="object" and .type=="text") | .text) | join("\n")) end);
+        [.[] | select(.type=="user" or .type=="assistant")] as $conv
+        | ($conv | length) as $n
+        | ($conv | last) as $last
+        | (if $n == 0 then ""
+           elif $last.type != "user" then ""
+           # A tool_result block means the agent was mid tool loop. Check it
+           # before the text test: harness system-reminders ride along as a
+           # text block on most tool_results, and that text reads as synthetic.
+           elif (($last.message.content // []) | type) == "array"
+                and any(($last.message.content // [])[]; type == "object" and .type == "tool_result") then "killed-mid-tool-loop"
+           elif (($last | txt) | length) > 0 and (($last | txt) | synthetic | not) then "no-reply"
+           else "" end) as $ended
+        | ($conv[(($n*0.9)|floor):]
+            | map(select(.type=="assistant") | txt)
+            | join("\n")
+            | [match("[^\\n]{0,80}\\b(TODO|FIXME|hacky|revisit|follow-?up|deferred|left for later|not yet verified|unverified)\\b[^\\n]{0,80}"; "gi").string]
+            # Literal pipes in the matched text have to go: $flags is joined
+            # on " | " here and split back apart downstream with tr, so one
+            # flag holding a markdown table row became five bogus bullets.
+            | unique | .[0:5] | map(gsub("\\s+"; " ") | gsub("\\|"; "/"))) as $flags
+        | "\($ended)\t" + ($flags | join(" | "))
+      ' "$jsonl" 2>/dev/null)
+      ended=${tail%%$'\t'*}
+      flags_line=${tail#*$'\t'}
+      # A live session sits on a tool_result between calls and would read as
+      # killed. Anything written to in the last 30 min is in flight, not ended.
+      if [[ -n "$ended" ]] && (( $(date +%s) - $(mtime_epoch "$jsonl") < 1800 )); then
+        ended=""
+      fi
+      [[ "$open" -gt 0 || -n "$ended" || -n "$flags_line" ]] || continue
+
+      session_date=$(mtime_date "$jsonl")
+      cwd=$(grep -o '"cwd":"[^"]*"' "$jsonl" 2>/dev/null | head -1 | sed 's/.*"cwd":"//;s/"$//')
+      uuid=$(basename "$jsonl" .jsonl)
+
+      printf -- '- %s · cwd=%s · open=%s · session=%s%s\n' \
+        "$session_date" "${cwd:-?}" "$open" "${uuid:0:8}" "${ended:+ · ended=$ended}"
+      # Print first 8 subjects, one per line
+      if [[ "$open" -gt 0 ]]; then
+        printf '%s\n' "$subjects_line" | tr '|' '\n' | sed 's/^[[:space:]]*/    - /' | head -8
+      fi
+      if [[ -n "$flags_line" ]]; then
+        printf '%s\n' "$flags_line" | tr '|' '\n' | sed 's/^[[:space:]]*/    - [tail] /'
+      fi
+    done
+  } > "$unfinished.tmp"
+  mv "$unfinished.tmp" "$unfinished"
+  log "  wrote $(wc -l < "$unfinished") lines to unfinished.md"
+
+  # ---- workflow-tips.md ----
+  # Two-stage. Stage 1 (here): collect every negative-feedback user prompt
+  # from the window into a raw forensic file. Stage 2 (later): claude -p
+  # clusters them semantically against existing MEMORY.md + CLAUDE.md and
+  # emits actionable tips with sample sessions and remedy suggestions.
+  #
+  # Why not awk bag-of-words: exact-match keys can't cluster "don't push
+  # to main" with "stop pushing yet" — same intent, different wording.
+  # Threshold tuning doesn't fix the normalization being too crude.
+  : > "$raw_tips"
+  {
+    printf '# Workflow tips — RAW (generated %s)\n\n' "$(date -u +%FT%TZ)"
+    printf 'Negative-feedback user prompts across %d sessions. UNFILTERED. Stage 2 (claude -p) consumes this and writes the deduped/clustered workflow-tips.md.\n\n' "${#SESSIONS[@]}"
+  } > "$raw_tips"
+  for jsonl in "${SESSIONS[@]}"; do
+    # Tag each tip with the MESSAGE uuid, not the SESSION uuid.
+    #
+    # `basename "$jsonl"` is the session id, and Claude Code FORKS a session on
+    # resume/compact — the same utterance is copied verbatim into every fork, each
+    # with a different filename. Measured on this Mac: 4189 of 20840 message uuids
+    # (20%) appear in more than one session file, and the flagship "Occurrences: 5"
+    # cluster's four "distinct sessions" all carried one message uuid at the
+    # identical millisecond. So a session-keyed tag inflates recurrence: `sort -u`
+    # below dedupes on the WHOLE line, so N forks of one utterance survive as N
+    # distinct-looking rows, and every downstream consumer (including the LLM's
+    # `Occurrences:` integer) counts forks instead of occasions.
+    #
+    # The message uuid is stable across forks, so `sort -u` collapses the copies and
+    # what survives is genuine multiplicity.
+    jq -r '
+      select(.type == "user")
+      | (.message.content // []) as $c
+      | (if ($c | type) == "string"
+           then $c
+           else ($c | map(select(.type == "text") | .text) | join("\n"))
+         end) as $t
+      | select($t | length > 0 and length < 1500)
+      # Hooks and subagents write user-ROLE messages the user never typed: the
+      # Stop-hook nudge starts with "Stop" and matched as a correction.
+      | select($t | test("^\\s*(Stop hook feedback:|<task-notification>|<system-reminder>|<local-command|<command-name>|<command-message>|Base directory for this skill:)") | not)
+      | select($t | test("^(no|don.?t|stop|wrong|actually|never do|please don)\\b"; "i"))
+      | "- [\(.uuid[0:8])] " + ($t | gsub("\\s+"; " ") | .[0:280])
+    ' "$jsonl" 2>/dev/null
+  done | sort -u | head -300 >> "$raw_tips"
+  # grep -c prints the count EVEN when it exits 1 (zero matches), so `|| echo 0`
+  # appended a second line ("0\n0") and blew up the (( )) checks below with an
+  # arithmetic syntax error. Swallow the exit code, default empty (missing file).
+  raw_tips_count=$(grep -c '^- \[' "$raw_tips" 2>/dev/null || true)
+  raw_tips_count=${raw_tips_count:-0}
+  log "  wrote $raw_tips_count tips to workflow-tips.raw.md"
+
+  # Stage 2: LLM-cluster. Skip if dry-run or no raw input.
+  if (( DRY )); then
+    # Dry-run must not clobber a real workflow-tips.md with the placeholder —
+    # it did, and a placeholder claiming "no raw prompts" landed over a real
+    # cluster pass while raw_tips_count was 2.
+    log "  skipped LLM cluster (dry-run; raw=$raw_tips_count; workflow-tips.md left untouched)"
+  elif (( raw_tips_count == 0 )); then
+    {
+      printf '# Workflow tips (generated %s)\n\n' "$(date -u +%FT%TZ)"
+      printf 'No raw correction prompts in window — nothing to cluster.\n'
+    } > "$workflow_tips"
+    log "  no raw tips — wrote placeholder"
+  elif command -v "$CONSOLIDATE" >/dev/null; then
+    prompt=$(mktemp)
+    cat >"$prompt" <<'PROMPT'
+You are reviewing user-correction utterances from a developer's recent
+Claude Code sessions to surface workflow patterns worth acting on.
+
+Three inputs follow:
+  1. The current MEMORY.md index (existing durable memories).
+  2. The project CLAUDE.md (existing rules — do NOT re-suggest these).
+  3. The raw correction list, one utterance per line, prefixed with
+     [<message-id-short>]. These are MESSAGE ids, not session ids: one long
+     session can contribute many of them, so N ids never proves N sessions.
+
+Cluster utterances by intent (not wording — "don't push" and "stop
+pushing the branch" are the same cluster). Drop singletons unless the
+single utterance describes a clear gap that warrants a new rule.
+
+For each cluster with ≥2 occurrences, OR a singleton describing a
+non-obvious gap, output a markdown section. Be honest: if there's
+nothing actionable, output exactly:
+
+# Workflow tips (0 actionable)
+
+No clusters worth acting on this window.
+
+Otherwise output:
+
+# Workflow tips (N actionable)
+
+## <one-line cluster summary>
+
+- Occurrences: N
+- Sample messages: <message-ids, comma-separated>
+- Pattern: <2-3 sentence description of what the user kept correcting>
+- Remedy: <one of: "add CLAUDE.md rule" / "update <skill> skill" / "add hook" / "human discussion" / "monitor — too small to act yet"> -- <one-line suggestion>
+
+Keep clusters tight. Skip anything already covered by MEMORY.md or
+CLAUDE.md. Cap at 8 clusters; if there are more, pick the ones with the
+highest occurrence count.
+PROMPT
+
+    inputs=()
+    [[ -f "$mem_home/MEMORY.md" ]] && inputs+=(--input "$mem_home/MEMORY.md")
+    if [[ -f "$canonical/CLAUDE.md" ]]; then
+      inputs+=(--input "$canonical/CLAUDE.md")
+    elif [[ -f "$HOME/code/$(basename "${canonical#*-}" | tr - /)/CLAUDE.md" ]]; then
+      # best-effort: try to find the in-repo CLAUDE.md from the escaped-cwd name
+      :
+    fi
+    inputs+=(--input "$raw_tips")
+
+    if "$CONSOLIDATE" \
+        --prompt "$prompt" \
+        --output "$workflow_tips" \
+        "${inputs[@]}" 2>&1 | tail -3 >&2; then
+      log "  wrote $(wc -l < "$workflow_tips") lines to workflow-tips.md"
+    else
+      log "  cluster pass failed; raw tips kept at $raw_tips"
+      {
+        printf '# Workflow tips — fallback (generated %s)\n\n' "$(date -u +%FT%TZ)"
+        printf 'LLM clustering failed. See workflow-tips.raw.md for unfiltered input.\n'
+      } > "$workflow_tips"
+    fi
+    rm -f "$prompt"
+  fi
+
+  # ---- memory-candidates.md ----
+  # Same content extraction, different filter: keepers look like durable facts.
+  {
+    printf '# Raw memory candidates (generated %s)\n\n' "$(date -u +%FT%TZ)"
+    printf 'User utterances that pattern-match as potential durable facts. Not deduped — see memory-candidates.md for the LLM-filtered set.\n\n'
+    for jsonl in "${SESSIONS[@]}"; do
+      jq -r '
+        select(.type == "user")
+        | (.message.content // []) as $c
+        | (if ($c | type) == "string"
+             then $c
+             else ($c | map(select(.type == "text") | .text) | join("\n"))
+           end) as $t
+        | select($t | length > 20 and length < 800)
+        | select($t | test("^\\s*(Stop hook feedback:|<task-notification>|<system-reminder>|<local-command|<command-name>|<command-message>|Base directory for this skill:)") | not)
+        | select($t | test("\\b(always|never|we use|prefer|the convention|remember|note that|keep in mind|from now on)\\b"; "i"))
+        | "- " + ($t | gsub("\\s+"; " ") | .[0:240])
+      ' "$jsonl" 2>/dev/null
+    done | sort -u | head -100
+  } > "$raw_candidates"
+  log "  wrote $(wc -l < "$raw_candidates") lines to memory-candidates.raw.md"
+
+  # LLM-dedup the raw candidates against existing MEMORY.md.
+  if (( ! DRY )) && [[ -s "$raw_candidates" ]] && command -v "$CONSOLIDATE" >/dev/null; then
+    prompt=$(mktemp); trap 'rm -f "$prompt"' EXIT
+    cat >"$prompt" <<'PROMPT'
+You are extracting candidate auto-memory entries for a Claude Code user.
+
+These candidates feed a downstream promotion pass whose bar is DURABLE:
+a standing preference, a non-obvious gotcha, or a stable reference fact —
+something still true next month and worth loading into every future session.
+It REJECTS transient work-state (migration counts, "in flight", open issue
+numbers, today's todo list, incident status). Extract for that bar. A
+candidate the promoter will reject is wasted work, not a safe hedge.
+
+The highest-value move is REPHRASING, not filtering. Raw session material
+usually states a durable fact in transient clothing — pull the fact out:
+
+  raw:  "only 58 of 94 services migrated to the new config format"
+  bad:  restate the count (a number that changes daily → rejected)
+  good: "The config-format migration is per-service and partial by default;
+         verify each service's format rather than assuming a fleet-wide
+         cutover completed."
+
+  raw:  "a DIRTY deploy latch went unnoticed for 17 hours"
+  bad:  restate the incident (one-off status → rejected)
+  good: "A stuck DIRTY deploy latch fails silently and blocks deploys with
+         no alert — check the latch first when a deploy is refused."
+
+So: keep the mechanism, the gotcha, or the rule. Drop the count, the date,
+the ticket number, and the current status.
+
+Types, and what each is for:
+  reference — a stable fact about how a system behaves (paths, ports,
+              contracts, root causes). Most candidates should be this.
+  feedback  — a standing instruction or preference the user expressed about
+              how work should be done.
+  user      — durable context about the user or their situation.
+  project   — use SPARINGLY. Only for a lasting constraint or decision, never
+              for status or progress. If it reads like a status update, either
+              rephrase it into a `reference` gotcha or drop it.
+
+Two inputs follow:
+  1. The existing MEMORY.md index.
+  2. The raw candidates list (one bullet per line).
+
+Output ONLY the section below — no preamble, no commentary, no reasoning about
+the task, nothing before the `#` heading. Anything else becomes input to the
+next stage and gets treated as a candidate.
+
+# Memory candidates (N new)
+
+- [type: reference|feedback|user|project] <one-line statement of the durable fact>
+
+Only include NEW candidates not already represented in MEMORY.md. Skip
+duplicates and session-local noise. Zero is a valid and common answer —
+output just `# Memory candidates (0 new)` rather than padding with
+status-shaped entries.
+PROMPT
+
+    inputs=(--input "$mem_home/MEMORY.md" --input "$raw_candidates")
+    "$CONSOLIDATE" \
+        --prompt "$prompt" \
+        --output "$mem_candidates" \
+        "${inputs[@]}" 2>&1 | tail -3 >&2 || log "  consolidate for candidates failed; keeping raw only"
+    rm -f "$prompt"
+    # Drop anything before the heading. The prompt asks for no preamble, but a
+    # model may still emit commentary (one prefixed an explanatory block on its
+    # first run), and this file is INPUT to the dream phases — a stray paragraph
+    # there reads as a candidate. Enforce the contract instead of trusting it.
+    if [[ -s "$mem_candidates" ]] && ! head -1 "$mem_candidates" | grep -q '^# Memory candidates'; then
+      if grep -q '^# Memory candidates' "$mem_candidates"; then
+        _trimmed=$(mktemp)
+        sed -n '/^# Memory candidates/,$p' "$mem_candidates" > "$_trimmed"
+        mv "$_trimmed" "$mem_candidates"
+        log "  stripped preamble before the candidates heading"
+      else
+        log "  WARNING: candidates file has no heading; leaving as-is for inspection"
+      fi
+    fi
+  fi
+done
+
+log "done"

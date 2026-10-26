@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# dream-prep — dreamer-gated analysis pass that feeds the nightly dream sweep.
+# Run it right before `dream sweep` (the systemd and launchd templates do).
+#
+# Single-writer rule: ONLY a dreamer (dream_machines in dreaming.conf, or a
+# per-repo dream_machines_<repo>) runs session-analyzer, labeled with its own
+# host name. Non-dreamer machines exit 0 immediately.
+#
+# Why: an unlabeled session-analyzer on EVERY machine writes flat
+# .analysis/unfinished.md etc. into the SAME synced memory home, so the
+# machines clobber each other through the sync and the Light phase counts
+# sessions twice. One writer, per-host labels, no races. A hub that also
+# collects other machines' transcripts can run
+#   session-analyzer --transcripts-root DIR --machine HOST --host-label HOST
+# for each of them after this.
+#
+# Usage: dream-prep [--days N]
+# Docs:  ~/.dotfiles/docs/memory/README.md
+
+set -uo pipefail
+
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+DREAMCONF="${DREAMCONF:-$HOME/.dotfiles/claude/dreaming.conf}"
+DAYS=14
+
+log() { printf '[%s] dream-prep: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --days) DAYS="${2:-14}"; shift 2 ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's|^# \{0,1\}||'; exit 0 ;;
+    *) echo "dream-prep: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# shellcheck source=lib/memory-homes.sh
+source "$SCRIPT_DIR/lib/memory-homes.sh"
+# shellcheck source=/dev/null
+[[ -f "$DREAMCONF" ]] && source "$DREAMCONF"
+
+# Same gate dream's sweep uses, including per-repo overrides
+# (dream_machines_<repo>). Checking only the GLOBAL gate would strand a host
+# that dreams for one repo but not the default: it would exit before staging
+# anything, and its sweep would have no fresh .analysis to consolidate.
+#
+# Empty gates = every machine dreams.
+_prep_gated=0
+if [[ -n "${dream_machines:-}" ]]; then
+  _prep_gated=1
+  host_in_list "$dream_machines" && _prep_gated=0
+  # Any per-repo gate naming this host also earns a prep pass.
+  for _r in "${enabled_repos[@]:-}"; do
+    _rk="dream_machines_${_r//[^A-Za-z0-9_]/_}"
+    [[ -n "${!_rk:-}" ]] && host_in_list "${!_rk}" && _prep_gated=0
+  done
+fi
+if [[ "$_prep_gated" -eq 1 ]]; then
+  log "host $(hostname -s) is not a dreamer for any repo (gate: $dream_machines) — skipping analysis; exit 0"
+  exit 0
+fi
+
+SELF="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+
+# Own sessions, labeled like everyone else's so .analysis stays per-host.
+log "analyzing own sessions (label: $SELF, days: $DAYS)"
+"$SCRIPT_DIR/session-analyzer" --days "$DAYS" --host-label "$SELF" \
+  || log "own-session analyzer FAILED"
+
+log "done"
+exit 0

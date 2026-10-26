@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""dream-held-nights — how many nights each Deep candidate has been held.
+
+The Deep phase promotes a candidate only when Light marks it as recurring.
+Light sees one night's analysis inputs, so a durable one-off gotcha (seen in a
+single session that stays inside the lookback window) is "a first sighting"
+forever and can never qualify. This script is the missing producer: it reads
+the Rejected sections of the previous Deep reports, groups the same candidate
+across nights, and prints a table Deep can use as a second recurrence signal
+(a candidate that keeps resurfacing night after night has persisted).
+
+Titles are reworded by the model every night, so grouping is by token overlap,
+not exact text. A title joins a row only by resembling the row's FIRST wording
+(its anchor), never any later member, so a row cannot drift onto a different
+fact one shared word at a time; ties to two rows go to the closer one. Overlap
+alone cannot always tell two facts in the same vocabulary apart (a real EMFILE
+rewording scores the same as an unrelated title about the same shell chain), so
+each row also prints its first and latest wording for Deep to check, and the
+thresholds lean towards splitting: a split under-counts nights, a false merge
+would hand one fact another's history. Deterministic, stdlib only, Python 3.9
+safe, never writes.
+
+Rows that reach --min-nights also list every wording behind them with its dates,
+because word overlap can join a different fact into the middle of a row whose
+first and latest wording agree; Deep counts only the nights whose wording is
+the same fact as its candidate.
+
+usage: dream-held-nights --memdir DIR --today YYYY-MM-DD [--lookback-days 14] [--min-nights 5]
+"""
+import argparse
+import datetime
+import os
+import re
+import sys
+
+STOP = frozenset(
+    "a an and are as at be but by can for from has have in into is it its of on or "
+    "so than that the their then there this to was were when which while with "
+    "via over not no never seen held first sighting reference raw candidate".split()
+)
+JACCARD_MIN = 0.5   # strictly greater than this
+CONTAIN_MIN = 0.85  # or the smaller title (3+ tokens) lies almost wholly inside the larger
+DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
+BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def tokens(text):
+    out = set()
+    for raw in re.split(r"[^a-z0-9]+", text.lower()):
+        if not raw or raw in STOP:
+            continue
+        if len(raw) > 3 and raw.endswith("s") and not raw.endswith("ss"):
+            raw = raw[:-1]
+        if len(raw) >= 3 or raw.isdigit():
+            out.add(raw)
+    return out
+
+
+def similar(a, b):
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    if inter == 0:
+        return False
+    if inter / float(len(a | b)) > JACCARD_MIN:
+        return True
+    small = min(len(a), len(b))
+    return small >= 3 and inter / float(small) >= CONTAIN_MIN
+
+
+def rejected_candidates(path):
+    """[(title, reason)] from the '## Rejected' section of one Deep report."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    out, inside = [], False
+    for line in lines:
+        if line.startswith("## "):
+            inside = line.lower().startswith("## rejected")
+            continue
+        if not inside or not line.startswith("- "):
+            continue
+        body = line[2:].strip()
+        if body.lower().startswith(("none", "nothing")):
+            continue
+        m = BOLD_RE.match(body)
+        if m:
+            title = m.group(1).strip().rstrip(":").strip()
+            reason = body[m.end():].lstrip(": ").strip()
+        else:
+            title, _, reason = body.partition(": ")
+            title = title.strip()
+        if title:
+            out.append((title, reason))
+    return out
+
+
+def collect(memdir, today, lookback_days):
+    deep_dir = os.path.join(memdir, "dreaming", "deep")
+    try:
+        names = os.listdir(deep_dir)
+    except OSError:
+        return [], []
+    start = today - datetime.timedelta(days=lookback_days)
+    dated = []
+    for n in names:
+        m = DATE_RE.match(n)
+        if not m:
+            continue
+        try:
+            d = datetime.date.fromisoformat(m.group(1))
+        except ValueError:  # e.g. 2026-02-30.md
+            continue
+        if start <= d < today:  # today's own report (a rerun) never counts
+            dated.append((d, os.path.join(deep_dir, n)))
+    dated.sort()
+    clusters = []  # each: {anchor:set, first_title, nights:[date], title (latest), reason (latest)}
+    for d, path in dated:
+        seen_here = set()
+        for title, reason in rejected_candidates(path):
+            tk = tokens(title)
+            best, best_score = None, -1.0
+            for idx, c in enumerate(clusters):
+                if similar(tk, c["anchor"]):
+                    score = len(tk & c["anchor"]) / float(len(tk | c["anchor"]) or 1)
+                    if score > best_score:
+                        best, best_score = idx, score
+            if best is None:
+                clusters.append({"anchor": tk, "first_title": title, "nights": [d], "title": title, "reason": reason,
+                                 "wordings": {cell(title): [d]}})
+                seen_here.add(len(clusters) - 1)
+                continue
+            c = clusters[best]
+            if best not in seen_here:
+                c["nights"].append(d)
+                seen_here.add(best)
+            dates = c["wordings"].setdefault(cell(title), [])
+            if d not in dates:
+                dates.append(d)
+            c["title"], c["reason"] = title, reason
+    return clusters, [d for d, _ in dated]
+
+
+def consecutive_tail(nights, report_dates):
+    """Run length of reports, ending at the newest report, that contain the candidate."""
+    have = set(nights)
+    run = 0
+    for d in reversed(report_dates):
+        if d in have:
+            run += 1
+        else:
+            break
+    return run
+
+
+def cell(text):
+    return " ".join(text.split()).replace("|", "/")
+
+
+def render(clusters, report_dates, today, lookback_days, min_nights=5):
+    out = ["# Held-nights (script-computed from previous Deep reports)", ""]
+    out.append("Window: %d day(s) before %s; %d prior Deep report(s) read."
+               % (lookback_days, today.isoformat(), len(report_dates)))
+    if report_dates:
+        out.append("Latest prior report: %s (a row whose \"last\" is this date was held last night)."
+                   % report_dates[-1].isoformat())
+    out.append("A row counts the nights a candidate sat in a report's Rejected list. Rows are grouped by wording"
+               " overlap with the row's first wording, which can still join two different facts that share"
+               " vocabulary: use a row only when today's candidate is the same fact as BOTH its first and latest wording.")
+    out.append("")
+    rows = [c for c in clusters if len(c["nights"]) >= 2]
+    if not rows:
+        out.append("No candidate has been held on 2 or more prior nights.")
+        return "\n".join(out) + "\n"
+    rows.sort(key=lambda c: (-len(c["nights"]), c["title"].lower()))
+    out.append("| row | nights held | consecutive to latest | first | last | first wording | latest wording | latest hold reason |")
+    out.append("|---|---|---|---|---|---|---|---|")
+    for n, c in enumerate(rows, 1):
+        reason = " ".join(c["reason"].split())
+        if len(reason) > 170:
+            reason = reason[:167].rstrip() + "..."
+        first = cell(c["first_title"])
+        latest = cell(c["title"])
+        out.append("| H%d | %d | %d | %s | %s | %s | %s | %s |" % (
+            n, len(c["nights"]), consecutive_tail(c["nights"], report_dates),
+            min(c["nights"]).isoformat(), max(c["nights"]).isoformat(),
+            first, "(same)" if latest == first else latest, reason.replace("|", "/")))
+    ledger = [(n, c) for n, c in enumerate(rows, 1) if len(c["nights"]) >= min_nights]
+    if ledger:
+        out.append("")
+        out.append("## Wordings behind rows held %d+ nights" % min_nights)
+        out.append("Each line is one wording and the nights it was held. Different wordings in one row may be"
+                   " different facts: count only the nights whose wording is the same fact as today's candidate.")
+        for n, c in ledger:
+            out.append("")
+            out.append("### H%d (%d nights)" % (n, len(c["nights"])))
+            for wording, dates in sorted(c["wordings"].items(), key=lambda kv: min(kv[1])):
+                out.append("- %s: %s" % (", ".join(x.isoformat() for x in sorted(dates)), wording))
+    return "\n".join(out) + "\n"
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--memdir", required=True)
+    ap.add_argument("--today", required=True)
+    ap.add_argument("--lookback-days", type=int, default=14)
+    ap.add_argument("--min-nights", type=int, default=5)
+    a = ap.parse_args(argv)
+    try:
+        today = datetime.date.fromisoformat(a.today)
+    except ValueError:
+        sys.stderr.write("dream-held-nights: --today must be YYYY-MM-DD\n")
+        return 2
+    clusters, report_dates = collect(a.memdir, today, max(1, a.lookback_days))
+    sys.stdout.write(render(clusters, report_dates, today, max(1, a.lookback_days), max(2, a.min_nights)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+# dream — orchestrator for the dreaming memory-consolidation sweep.
+# Subcommands: sweep, light, rem, deep, status, diary, enable, disable, help.
+#
+# Dreaming is an independent implementation of the three-phase background
+# memory consolidation that OpenClaw's dreaming describes (see NOTICE.md).
+# Phases run in order light -> REM -> deep. Only deep writes to MEMORY.md.
+# Light and REM write to DREAMS.md and internal state.
+# See ~/.dotfiles/docs/memory/README.md.
+#
+#   - Reads .analysis inputs from and writes promotions to the SYNCED memory
+#     home (via lib/memory-homes.sh), not the per-machine transcript dir, so
+#     promotions reach every machine.
+#   - enabled_repos are repo shortnames from memory-homes.conf.
+#   - The promoting phases run only on a hub host (dream_machines gate); every
+#     machine still stages its own .analysis (dream-prep, session-analyzer).
+#   - Aggregates .analysis/<host>/ subdirs so the hub consolidates every machine.
+
+set -uo pipefail
+
+DREAMCONF="${DREAMCONF:-$HOME/.dotfiles/claude/dreaming.conf}"
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
+# shellcheck source=lib/memory-homes.sh
+source "$SCRIPT_DIR/lib/memory-homes.sh"
+
+log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+load_conf() {
+  [[ -f "$DREAMCONF" ]] || { log "missing config: $DREAMCONF"; return 1; }
+  # shellcheck source=/dev/null
+  source "$DREAMCONF"
+  # Back-compat: accept the old enabled_canonicals name if a stale conf is read.
+  if [[ -z "${enabled_repos+x}" && -n "${enabled_canonicals+x}" ]]; then
+    enabled_repos=("${enabled_canonicals[@]}")
+  fi
+}
+
+# Map an enabled repo shortname to its synced memory home. Echoes the dir, or
+# nothing if unresolvable.
+resolve_memhome() {
+  memory_home_for "$1"
+}
+
+# True if this host is allowed to run the promoting phases.
+is_dreamer() {
+  # Empty gate = every box dreams (legacy behavior).
+  [[ -z "${dream_machines:-}" ]] && return 0
+  host_in_list "$dream_machines"
+}
+
+# Per-repo dreamer gate (dream_machines_<repo>), falling back to the global
+# dream_machines. Repos can need DIFFERENT hubs because provider eligibility is
+# per-host, not per-repo: a machine may hold credentials for only one model
+# route, and a repo whose material must stay on that route dreams there.
+#
+# Still exactly one writer per repo — that is what keeps concurrent whole-file
+# MEMORY.md rewrites from racing the sync's git merge.
+is_dreamer_for() {
+  local repo="$1"
+  local key="dream_machines_${repo//[^A-Za-z0-9_]/_}"
+  local gate="${!key:-}"
+  [[ -z "$gate" ]] && { is_dreamer; return $?; }
+  host_in_list "$gate"
+}
+
+cmd_status() {
+  load_conf || return 1
+  printf 'dreaming status\n===============\n'
+  printf '  config: %s\n' "$DREAMCONF"
+  printf '  host: %s (dreamer: %s; gate: %s)\n' \
+    "$(hostname -s)" "$(is_dreamer && echo yes || echo no)" "${dream_machines:-<any>}"
+  printf '  models:\n'
+  printf '    light: %s\n' "${light_model:-${dreaming_model:-sonnet}}"
+  printf '    rem:   %s\n' "${rem_model:-${dreaming_model:-sonnet}}"
+  printf '    deep:  %s\n' "${deep_model:-${dreaming_model:-sonnet}}"
+  printf '  enabled repos:\n'
+  if [[ ${#enabled_repos[@]} -eq 0 ]]; then
+    printf '    (none — use `dream enable <repo>`)\n'
+    return 0
+  fi
+  for repo in "${enabled_repos[@]}"; do
+    local memdir; memdir="$(resolve_memhome "$repo")"
+    if [[ -z "$memdir" ]]; then
+      printf '    - %s (UNRESOLVED — add to memory-homes.conf)\n' "$repo"; continue
+    fi
+    local dreams="$memdir/DREAMS.md" mem="$memdir/MEMORY.md"
+    if [[ -f "$dreams" ]]; then
+      local entries last
+      entries="$(grep -c '^## ' "$dreams" 2>/dev/null || echo 0)"
+      last="$(grep '^## ' "$dreams" 2>/dev/null | tail -1)"
+      printf '    - %s → %s (diary: %s entries; last: %s)\n' "$repo" "$memdir" "$entries" "$last"
+    else
+      printf '    - %s → %s (no DREAMS.md yet)\n' "$repo" "$memdir"
+    fi
+    # Surface per-repo overrides; without these the models/host lines above read
+    # as authoritative for every repo when they are not.
+    local _sk="model_${repo//[^A-Za-z0-9_]/_}"
+    if [[ -n "${!_sk:-}" ]]; then
+      printf '      model override: %s (all phases)\n' "${!_sk}"
+    fi
+    local _hk="dream_machines_${repo//[^A-Za-z0-9_]/_}"
+    printf '      dreamer host: %s (this host: %s)\n' \
+      "${!_hk:-${dream_machines:-<any>}}" \
+      "$(is_dreamer_for "$repo" && echo yes || echo no)"
+    if [[ -f "$mem" ]]; then
+      printf '      MEMORY.md: %s index entries\n' "$(grep -c '^- \[' "$mem" 2>/dev/null || echo 0)"
+    fi
+    local nhosts
+    nhosts="$(find "$memdir/.analysis" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    printf '      .analysis host-dirs staged: %s\n' "$nhosts"
+  done
+}
+
+cmd_enable() {
+  local repo="${1:-}"
+  [[ -n "$repo" ]] || { log "usage: dream enable <repo>"; return 2; }
+  if grep -q "^\s*\"$repo\"" "$DREAMCONF" 2>/dev/null; then
+    log "already enabled: $repo"; return 0
+  fi
+  awk -v c="$repo" '
+    /^enabled_repos=\(/ { print; ins=1; next }
+    ins && /^\)/ { printf "  \"%s\"\n", c; ins=0; print; next }
+    { print }
+  ' "$DREAMCONF" > "$DREAMCONF.tmp" && mv "$DREAMCONF.tmp" "$DREAMCONF"
+  log "enabled: $repo"
+}
+
+cmd_disable() {
+  local repo="${1:-}"
+  [[ -n "$repo" ]] || { log "usage: dream disable <repo>"; return 2; }
+  local tmp
+  tmp=$(mktemp "${DREAMCONF}.XXXXXX")
+  sed "/^[[:space:]]*\"$repo\"[[:space:]]*$/d" "$DREAMCONF" > "$tmp" \
+    && mv "$tmp" "$DREAMCONF" \
+    || { rm -f "$tmp"; return 1; }
+  log "disabled: $repo"
+}
+
+cmd_diary() {
+  load_conf || return 1
+  local repo="${1:-}"
+  if [[ -z "$repo" ]] && [[ ${#enabled_repos[@]} -eq 1 ]]; then
+    repo="${enabled_repos[0]}"
+  fi
+  [[ -n "$repo" ]] || { log "usage: dream diary <repo>"; return 2; }
+  local memdir; memdir="$(resolve_memhome "$repo")"
+  local dreams="$memdir/DREAMS.md"
+  [[ -f "$dreams" ]] || { log "no DREAMS.md at $dreams (run dream now first)"; return 1; }
+  "${PAGER:-less}" "$dreams"
+}
+
+# Collect every input file named "$1" anywhere under "$memdir/.analysis"
+# (flat legacy layout + per-host <label>/ subdirs), appending each as a
+# separate --input arg to the named array variable.
+_gather_analysis() {
+  local base="$1" arrname="$2" memdir="$3" f
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    eval "$arrname+=(--input \"\$f\")"
+  done < <(find "$memdir/.analysis" -type f -name "$base" 2>/dev/null | sort)
+}
+
+# _dream_rotate_diary <dreams_md>
+# Keep DREAMS.md under Claude Code's memory-file caps by archiving its OLDEST
+# entries once it grows past a threshold.
+#
+# Three fragments are appended every night (light/REM/deep) with no rotation, so it
+# grows ~12 lines/day and crosses Claude Code's 200-line memory-file cap within weeks.
+# It is not loaded only while nothing links it from MEMORY.md; the moment anyone adds
+# `- [Dream diary](DREAMS.md)` it becomes a capped memory file whose TAIL — the
+# newest and most interesting dreams — is silently discarded (Claude Code loads at
+# most 200 lines / 25000 bytes and keeps the head). Rotating means that link is
+# always safe to add.
+#
+# Oldest entries move to DREAMS-archive-<year>.md, newest are kept in place, and the
+# archive is never read by CC (not linked from the index) so it can grow freely.
+# Section boundaries are `## <date> · <PHASE>` headings written just above.
+_dream_rotate_diary() {
+  local dm="$1" keep_lines="${dreams_md_keep_lines:-160}" cur
+  [[ -f "$dm" ]] || return 0
+  cur=$(python3 -c 'import sys;s=open(sys.argv[1],encoding="utf-8",errors="replace").read().strip();print(len(s.split(chr(10))))' "$dm" 2>/dev/null || echo "")
+  case "$cur" in ''|*[!0-9]*) return 0 ;; esac
+  [[ "$cur" -le "$keep_lines" ]] && return 0
+  local archive year
+  year=$(date -u +%Y)
+  archive="$(dirname "$dm")/DREAMS-archive-${year}.md"
+  # Split on the LAST heading boundary at or before keep_lines so an entry is never
+  # cut in half. Everything before it is archived; the header block plus the newest
+  # entries stay. Fails safe: on any error the file is left exactly as it was.
+  python3 - "$dm" "$archive" "$keep_lines" <<'PYEOF' || return 0
+import sys, os, re
+dm, archive, keep = sys.argv[1], sys.argv[2], int(sys.argv[3])
+text = open(dm, encoding='utf-8', errors='replace').read()
+lines = text.split('\n')
+# Heading indices for dated entries.
+heads = [i for i, l in enumerate(lines) if re.match(r'^## \d{4}-\d{2}-\d{2} ', l)]
+if not heads:
+    sys.exit(1)
+# Preamble = everything before the first dated heading (title + intro).
+pre_end = heads[0]
+# Choose a cut so the RETAINED part (preamble + tail) is <= keep lines.
+cut = None
+for h in heads:
+    if (pre_end + (len(lines) - h)) <= keep:
+        cut = h
+        break
+if cut is None or cut == heads[0]:
+    sys.exit(1)          # nothing safe to move
+moved = lines[pre_end:cut]
+if not any(l.strip() for l in moved):
+    sys.exit(1)
+hdr = ('# Dream diary archive\n\nOlder entries rotated out of DREAMS.md by `dream` to keep it under\n'
+       "Claude Code's 200-line / 25000-byte memory-file caps. Not linked from\nMEMORY.md, so it is never load-capped.\n")
+with open(archive, 'a', encoding='utf-8') as fh:
+    if fh.tell() == 0:
+        fh.write(hdr)
+    fh.write('\n' + '\n'.join(moved).strip() + '\n')
+open(dm, 'w', encoding='utf-8').write('\n'.join(lines[:pre_end] + lines[cut:]).rstrip() + '\n')
+print(f'rotated {len([l for l in moved if l.startswith("## ")])} entr(ies) to {os.path.basename(archive)}')
+PYEOF
+  log "  ${phase:-dream}: rotated DREAMS.md (was ${cur}L, keep<=${keep_lines}L) -> DREAMS-archive-${year}.md"
+}
+
+# _dream_unpromote <memdir> <slugs> <reason>
+# Roll back promoted FILES when their index line will not be written.
+#
+# Patch 1 logged "index append SKIPPED (promoted files kept)" — a guaranteed
+# ORPHAN every time a guard engages: the file lands in the memory home while
+# nothing references it, and Claude Code only ever loads the index, so the content
+# is invisible AND permanent. Since a promotion is only meaningful once it is
+# indexed, the correct rollback is to remove the file, not to keep it.
+#
+# Only files this sweep just created are removed (they were `cp`-ed moments ago and
+# the writer refuses to overwrite anything pre-existing), so this can never delete
+# a curated memory.
+_dream_unpromote() {
+  local _md="$1" _slugs="$2" _why="$3" _s
+  for _s in $_slugs; do
+    [[ -n "$_s" ]] || continue
+    if [[ -f "$_md/$_s" ]]; then
+      rm -f "$_md/$_s"
+      log "  deep: UNPROMOTED $_s (${_why}) — would have been an unindexed orphan"
+    fi
+  done
+}
+
+run_phase() {
+  local phase="$1" repo="$2"
+  local memdir; memdir="$(resolve_memhome "$repo")"
+  if [[ -z "$memdir" ]]; then
+    log "  $phase: repo '$repo' has no memory home (see memory-homes.conf); skipping"
+    return 0
+  fi
+  mkdir -p "$memdir"
+
+  local dreams_md="$memdir/DREAMS.md"
+  [[ -f "$dreams_md" ]] || {
+    cat >"$dreams_md" <<'EOF'
+# Dream Diary
+
+Narrative consolidation of session memory. Written by the dreamer, not the
+code author. For human reading, not promotion.
+
+EOF
+  }
+
+  local today
+  today="$(date -u +%F)"
+  local phase_report="$memdir/dreaming/$phase/$today.md"
+  mkdir -p "$(dirname "$phase_report")"
+
+  # Gather phase inputs from the SYNCED memory home (aggregating all hosts).
+  local -a inputs=()
+  case "$phase" in
+    light)
+      _gather_analysis "unfinished.md" inputs "$memdir"
+      _gather_analysis "memory-candidates.raw.md" inputs "$memdir"
+      # Optional Codex-side signals: a per-host distillate of rollout summaries
+      # and user asks, if a tool stages one. Same candidate shape as the Claude
+      # analysis, so Light scores both agents' sessions together.
+      _gather_analysis "codex-signals.md" inputs "$memdir"
+      ;;
+    rem)
+      _gather_analysis "workflow-tips.md" inputs "$memdir"
+      [[ -f "$memdir/MEMORY.md" ]] && inputs+=("--input" "$memdir/MEMORY.md")
+      [[ -f "$memdir/dreaming/light/$today.md" ]] && inputs+=("--input" "$memdir/dreaming/light/$today.md")
+      ;;
+    deep)
+      [[ -f "$memdir/MEMORY.md" ]] && inputs+=("--input" "$memdir/MEMORY.md")
+      [[ -f "$memdir/dreaming/light/$today.md" ]] && inputs+=("--input" "$memdir/dreaming/light/$today.md")
+      [[ -f "$memdir/dreaming/rem/$today.md" ]] && inputs+=("--input" "$memdir/dreaming/rem/$today.md")
+      _gather_analysis "memory-candidates.md" inputs "$memdir"
+      ;;
+  esac
+
+  [[ ${#inputs[@]} -gt 0 ]] || { log "  $phase: no inputs, skipping"; return 0; }
+
+  # Cross-night persistence for Deep: Light sees one night's inputs, so a durable
+  # one-off gotcha stays "a first sighting" forever. dream-held-nights groups the
+  # previous Deep reports' Rejected candidates by wording and counts the nights each
+  # was held. A temp file, never the synced memory home; a failure only drops the input.
+  local held_file=""
+  if [[ "$phase" == deep ]]; then
+    held_file=$(mktemp)
+    if "$SCRIPT_DIR/dream-held-nights" --memdir "$memdir" --today "$today" \
+         --lookback-days "${deep_held_lookback_days:-14}" --min-nights "${deep_min_held_nights:-5}" \
+         >"$held_file" 2>/dev/null && [[ -s "$held_file" ]]; then
+      inputs+=("--input" "$held_file")
+    else
+      log "  deep: held-nights unavailable; persistence signal skipped"
+      rm -f "$held_file"; held_file=""
+    fi
+  fi
+
+  local prompt
+  prompt=$(mktemp)
+
+  case "$phase" in
+    light)
+      cat >"$prompt" <<EOF
+LIGHT SLEEP PHASE. You are the light-sleep phase of a memory
+consolidation system. Your job:
+  1. Read the inputs (recent short-term signals and candidate memories).
+  2. Dedupe near-duplicates.
+  3. Stage candidates for later deep promotion — but DO NOT promote.
+  4. Write a structured report and a brief dream narrative.
+
+Output format (exactly these sections):
+
+# Light — $today
+
+## Staged candidates
+- <one bullet per candidate, with a hint of frequency / recency>
+
+## Signal observations
+- <non-obvious patterns you noticed, one per bullet>
+
+## Dream fragment (Light)
+<A single paragraph of abstract, second-person prose, 2-4 sentences.
+Do not enumerate files. Themes over facts. Leave tension unresolved.>
+EOF
+      ;;
+    rem)
+      cat >"$prompt" <<EOF
+REM SLEEP PHASE. You are the REM phase. Your job:
+  1. Extract themes and recurring ideas from the inputs.
+  2. Reflect on tensions and contradictions.
+  3. Do NOT promote anything.
+  4. Write a short narrative and a themes list.
+
+Output format:
+
+# REM — $today
+
+## Themes
+- <theme>: <one-line reflection>
+
+## Tensions
+- <unresolved contradiction or trade-off, one per bullet>
+
+## Dream fragment (REM)
+<Second person, present tense, 2-4 sentences. Dreamlike.
+Capture a recurring pattern as imagery, not as a fact.>
+EOF
+      ;;
+    deep)
+      cat >"$prompt" <<EOF
+DEEP SLEEP PHASE. You are the deep phase of a memory consolidation system,
+writing a daily report. You are NOT a conversational assistant. Produce
+the report even if the inputs are sparse — sparse inputs mean a sparse
+but still valid report with zero promotions. Do not ask questions. Do
+not explain what you lack. Just write the sections.
+
+You look at candidates that Light staged and themes REM surfaced. Most
+days nothing is strong enough to promote. That is normal and expected.
+The report still gets written.
+
+PROMOTION GATE. You have NO recall/query telemetry — none is produced
+anywhere in this system, so do not invent it and never reject on it.
+Judge only on evidence present in these inputs:
+  - min_score=${deep_min_score:-0.55} — your own durability judgement.
+  - RECURRENCE, met by EITHER signal:
+    (a) the Light report explicitly marks the candidate as recurring
+        across multiple sessions, days, or hosts; or
+    (b) PERSISTENCE: the "Held-nights" input (computed by a script from
+        the previous Deep reports, not by a model) has a row where ALL of:
+          - today's candidate is the same fact as BOTH the row's first
+            wording and its latest wording (rows are grouped by word
+            overlap, which can join two facts that share vocabulary; if
+            either wording is a different fact, the row does not count);
+          - at least ${deep_min_held_nights:-5} nights, counting ONLY the
+            nights listed under that row's "Wordings behind rows" whose
+            wording is the same fact as today's candidate (a row's total
+            can include a different fact that shares its vocabulary);
+          - its "last" date is the latest prior report's date (it is
+            still live, held last night).
+        A candidate that keeps resurfacing night after night has
+        persisted; that IS the recurrence a one-off gotcha can show. Name
+        the row ("H3, held N nights") in your reason when you rely on it.
+        At most ${deep_max_persistence_promotions:-1} promotion(s) per
+        sweep may rest on persistence alone: take the longest-held
+        qualifying row and leave the rest held for later nights.
+    With neither signal, treat it as a first sighting and hold it.
+    Persistence never overrides the other gates: work-state that has been
+    held for weeks is still work-state, and the row's "latest hold
+    reason" tells you why it was held before.
+  - NOT already covered by an existing MEMORY.md index line (dedupe first;
+    MEMORY.md is one of your inputs and lists every existing slug).
+  - DURABLE: a standing preference, a non-obvious gotcha, or a stable
+    reference fact. NEVER promote transient work-state (branch tips, open
+    issue numbers, "in flight", today's todo list) — that belongs in
+    unfinished.md, not the always-on index.
+Slug rules, enforced by the writer: "<type>_<slug>.md", ALL LOWERCASE,
+characters a-z 0-9 dot underscore hyphen only, starting with a letter or
+digit, no directories, and NEVER the reserved names MEMORY.md or
+DREAMS.md in any capitalisation (Linux filesystems are case-sensitive and
+macOS ones usually are not, so a case variant corrupts one of them). A slug that already exists on
+disk is SKIPPED, not overwritten — to revise an existing memory, say so
+in Rejected and leave the file alone. Max ${deep_max_promotions:-5}
+promotions per sweep; prefer 0-1. When in doubt, reject and say it
+recurred-but-was-held: a candidate that matters will resurface, and Light
+or the held-nights count will show it.
+
+Output exactly these sections (no meta-commentary, no questions):
+
+# Deep — $today
+
+## Promoted (N)
+<Either "None today — nothing met the threshold." OR
+for each promotion emit two blocks:
+=== FILE: <slug>.md ===
+---
+name: <title>
+description: <one-line>
+type: feedback|project|reference|user
+---
+<body>
+
+=== MEMORY.md append ===
+- [<title>](<slug>.md) <one-line hook>
+>
+
+## Rejected (reasons)
+- <candidate>: <threshold that failed>
+OR "None — nothing was even a candidate."
+
+## Dream fragment (Deep)
+<Second person, 2-4 sentences. Reflective. Gentle. Do NOT list files or
+facts. Write it even if nothing was promoted — the act of looking is
+itself worth narrating.>
+EOF
+      ;;
+  esac
+
+  # Per-phase model selection. Falls back to dreaming_model for back-compat.
+  local phase_model
+  case "$phase" in
+    light) phase_model="${light_model:-${dreaming_model:-sonnet}}" ;;
+    rem)   phase_model="${rem_model:-${dreaming_model:-sonnet}}" ;;
+    deep)  phase_model="${deep_model:-${dreaming_model:-sonnet}}" ;;
+    *)     phase_model="${dreaming_model:-sonnet}" ;;
+  esac
+
+  # Per-repo override, e.g. model_webapp in dreaming.conf, for a repo whose
+  # material must stay on one model route. Indirect expansion so the conf
+  # stays declarative — no per-repo branching in this script.
+  local _repo_key="model_${repo//[^A-Za-z0-9_]/_}"
+  if [[ -n "${!_repo_key:-}" ]]; then
+    phase_model="${!_repo_key}"
+  fi
+
+  local reply="$phase_report"
+  log "  $phase: model=$phase_model inputs=${#inputs[@]}"
+  if ! "$SCRIPT_DIR/claude-consolidate" \
+        --prompt "$prompt" --output "$reply" --model "$phase_model" \
+        "${inputs[@]}"; then
+    log "  $phase: claude-consolidate failed. skipping write."
+    rm -f "$prompt" ${held_file:+"$held_file"}
+    return 1
+  fi
+  rm -f ${held_file:+"$held_file"}
+
+  # Append dream fragment to DREAMS.md. Stop at the next H1/H2 header or
+  # horizontal rule to avoid capturing post-fragment notes.
+  local frag
+  frag=$(awk '
+    /^## Dream fragment/ { flag=1; next }
+    flag && (/^## / || /^# / || /^---$/ || /^\*\*/) { exit }
+    flag { print }
+  ' "$reply" | sed -e '/^$/d')
+  if [[ -n "$frag" ]]; then
+    {
+      printf '\n## %s · %s\n\n' "$today" "$(echo "$phase" | tr a-z A-Z)"
+      printf '%s\n' "$frag"
+    } >> "$dreams_md"
+    _dream_rotate_diary "$dreams_md"
+  fi
+
+  # Deep phase: parse promoted files and write to the memory home.
+  if [[ "$phase" == "deep" ]]; then
+    local staging
+    staging=$(mktemp -d)
+    # Section parser. Hardened because this branch had never executed in
+    # anger: every section must TERMINATE, every slug must be validated, and
+    # no reserved name may be written.
+    awk -v outdir="$staging" '
+      /^=== FILE: / {
+        sub(/^=== FILE: /, ""); sub(/ ===$/, "");
+        # Reject outright (do NOT rewrite): anything with a path separator,
+        # a traversal, an odd character, or a reserved name.
+        # Lowercase-only, and reject reserved names CASE-INSENSITIVELY.
+        # `^[A-Za-z0-9._-]+\.md$` (the original) ACCEPTS "Memory.md", and the
+        # no-clobber `[[ -e ]]` check downstream is case-sensitive — so on ext4 that
+        # writes a SECOND index file, while on APFS (case-insensitive by default) it
+        # silently overwrites the real MEMORY.md. Verified on both. Nearly every real
+        # slug is lowercase already, so this costs nothing; the prompt states the
+        # lowercase rule rather than permitting A-Z.
+        lower = tolower($0)
+        if ($0 !~ /^[a-z0-9][a-z0-9._-]*\.md$/ || lower == "memory.md" || lower == "dreams.md") {
+          f = ""; next
+        }
+        f = outdir "/" $0; next
+      }
+      /^=== MEMORY.md append ===/ { f = outdir "/__memory_index_append.md"; next }
+      /^=== / { f = ""; next }
+      /^## (Rejected|Dream fragment)/ { f = ""; next }
+      f { print >> f }
+    ' "$reply"
+
+    local nf base npromo=0 promoted_slugs=""
+    for nf in "$staging"/*.md; do
+      [[ -f "$nf" ]] || continue
+      base="$(basename "$nf")"
+      [[ "$base" == "__memory_index_append.md" ]] && continue
+      if [[ -e "$memdir/$base" ]]; then
+        log "  deep: SKIP $base (already exists — refusing to clobber curated memory)"
+        continue
+      fi
+      if [[ $npromo -ge ${deep_max_promotions:-5} ]]; then
+        log "  deep: SKIP $base (deep_max_promotions reached)"
+        continue
+      fi
+      cp "$nf" "$memdir/$base"
+      npromo=$((npromo + 1))
+      promoted_slugs="$promoted_slugs $base"
+      log "  deep: promoted $base"
+    done
+
+    # Index append is DERIVED from what was actually written, so a skip can
+    # never leave a dangling link in the always-on index.
+    if [[ $npromo -gt 0 && -f "$staging/__memory_index_append.md" ]]; then
+      local line kept="" cur add cap cap_lines cur_lines add_lines
+      while IFS= read -r line; do
+        case "$line" in '- ['*) ;; *) continue ;; esac
+        # Keep the line only if EVERY link target on it resolves — to a file we
+        # just promoted, or to one already in the memdir.
+        #
+        # `${line##*](}` (the original) is a GREEDY strip that sees only the LAST
+        # link. Reproduced against the live index: a line whose FIRST link was
+        # never promoted got appended anyway, creating a dangling link against a
+        # 0-dangling baseline; the inverse dropped the line and orphaned the file
+        # it did promote. Not exotic — real indexes carry lines with several links,
+        # and MEMORY.md is a deep INPUT, so the model is shown that style and will
+        # imitate it.
+        #
+        # A leading ./ is stripped because some memory tools emit that form.
+        # At least one link must be a file this sweep promoted: a line whose
+        # targets all existed already re-indexes a memory (the model trying to
+        # revise one, whose file write was refused above) and would duplicate it.
+        local _all_ok=1 _t _seen=0 _new=0
+        while IFS= read -r _t; do
+          [[ -n "$_t" ]] || continue
+          _seen=1
+          _t="${_t#./}"
+          case " $promoted_slugs " in
+            *" $_t "*) _new=1; continue ;;
+          esac
+          [[ -e "$memdir/$_t" ]] || { _all_ok=0; break; }
+        done < <(printf '%s\n' "$line" | grep -oE '\]\([^)]+\.md\)' | sed -E 's/^\]\(//; s/\)$//')
+        # A line with no link at all is not an index line; drop it.
+        [[ $_seen -eq 1 && $_all_ok -eq 1 && $_new -eq 1 ]] && kept="${kept}${line}"$'\n'
+      done < "$staging/__memory_index_append.md"
+      cap="${deep_memory_md_max_bytes:-24000}"
+      cap_lines="${deep_memory_md_max_lines:-190}"
+      if [[ -z "$kept" ]]; then
+        log "  deep: no index line matched a promoted file — MEMORY.md untouched"
+        _dream_unpromote "$memdir" "$promoted_slugs" "no index line matched"
+      elif [[ ! -f "$memdir/MEMORY.md" ]]; then
+        # FAIL CLOSED. With MEMORY.md absent, `wc -c` errors to stderr, cur becomes
+        # "", and $(( "" + 1 )) evaluates to 1 — which passes ANY cap. Reproduced:
+        # the writer promoted and created a 37-byte MEMORY.md from nothing. An
+        # absent index means something is already wrong; do not write into it.
+        log "  deep: MEMORY.md ABSENT at $memdir — refusing to create it from a promotion"
+        _dream_unpromote "$memdir" "$promoted_slugs" "index absent"
+      else
+        cur=$(wc -c < "$memdir/MEMORY.md" | tr -d ' ')
+        add=$(printf '%s' "$kept" | wc -c | tr -d ' ')
+        # Count lines the way Claude Code does (trimmed content, split on \n).
+        # `wc -l` disagrees by one at a trailing newline, which is exactly where a
+        # hard cap bites.
+        cur_lines=$(python3 -c 'import sys;s=open(sys.argv[1],encoding="utf-8",errors="replace").read().strip();print(len(s.split(chr(10))))' "$memdir/MEMORY.md" 2>/dev/null || echo "")
+        add_lines=$(printf '%s' "$kept" | grep -c '^- \[')
+        case "$cur_lines" in ''|*[!0-9]*)
+          log "  deep: could not measure MEMORY.md line count — refusing to append"
+          _dream_unpromote "$memdir" "$promoted_slugs" "line count unmeasurable"
+          cur_lines="" ;;
+        esac
+        if [[ -n "$cur_lines" ]]; then
+          if [[ $((cur + add)) -gt $cap ]]; then
+            log "  deep: MEMORY.md at ${cur}B + ${add}B exceeds ${cap}B — append REFUSED"
+            _dream_unpromote "$memdir" "$promoted_slugs" "byte cap ${cap}"
+          elif [[ $((cur_lines + add_lines)) -gt $cap_lines ]]; then
+            # The BYTE guard alone is not enough. With short index lines (the
+            # compacted "Short ones:" digest style, ~40-60B) the 200-line cap binds
+            # while the byte guard never fires — measured 204 lines at 21251 bytes.
+            log "  deep: MEMORY.md at ${cur_lines}L + ${add_lines}L exceeds ${cap_lines}L — append REFUSED"
+            _dream_unpromote "$memdir" "$promoted_slugs" "line cap ${cap_lines}"
+          else
+            printf '%s' "$kept" >> "$memdir/MEMORY.md"
+            log "  deep: appended ${add_lines} index line(s) to MEMORY.md (now ~$((cur_lines + add_lines))L/$((cur + add))B)"
+          fi
+        fi
+      fi
+    fi
+    rm -rf "$staging"
+  fi
+
+  log "  $phase: wrote $phase_report"
+  rm -f "$prompt"
+}
+
+cmd_sweep() {
+  load_conf || return 1
+  local only_repo="${1:-}"
+  if [[ ${#enabled_repos[@]} -eq 0 ]]; then
+    log "no repos enabled. run 'dream enable <repo>'."
+    return 0
+  fi
+  # Gating moved INSIDE the repo loop: repos can have different hubs (see
+  # is_dreamer_for). Bail early only when this host dreams for none of them, so
+  # the "not a dreamer" log still appears on non-hub boxes.
+  local _any=0 _r
+  for _r in "${enabled_repos[@]}"; do
+    [[ -n "$only_repo" && "$only_repo" != "$_r" ]] && continue
+    is_dreamer_for "$_r" && { _any=1; break; }
+  done
+  if [[ "$_any" -eq 0 ]]; then
+    log "host $(hostname -s) is not a dreamer for any enabled repo; skipping promoting phases."
+    log "(dream-prep still stages this machine's .analysis for the hub.)"
+    return 0
+  fi
+  # Propagate phase failures. If run_phase's status were discarded, the function
+  # would fall off the end at exit 0 and a failing sweep would report success to
+  # its timer, so a pipeline that promotes nothing would look healthy.
+  local _failed=0 _phase
+  for repo in "${enabled_repos[@]}"; do
+    [[ -n "$only_repo" && "$only_repo" != "$repo" ]] && continue
+    if ! is_dreamer_for "$repo"; then
+      log "sweep: $repo — not this host's repo to dream; skipping"
+      continue
+    fi
+    log "sweep: $repo"
+    for _phase in light rem deep; do
+      if ! run_phase "$_phase" "$repo"; then
+        _failed=$((_failed + 1))
+        log "  !! $_phase FAILED for $repo"
+      fi
+    done
+  done
+  if [[ $_failed -gt 0 ]]; then
+    log "sweep done with $_failed FAILED phase(s) — exiting nonzero so the timer records it"
+    return 1
+  fi
+  log "sweep done"
+}
+
+case "${1:-help}" in
+  sweep|now)    shift; cmd_sweep "$@" ;;
+  light)        load_conf && { _rc=0; for r in "${enabled_repos[@]:-}"; do is_dreamer_for "$r" || continue; run_phase light "$r" || _rc=1; done; exit "$_rc"; } ;;
+  rem)          load_conf && { _rc=0; for r in "${enabled_repos[@]:-}"; do is_dreamer_for "$r" || continue; run_phase rem "$r" || _rc=1; done; exit "$_rc"; } ;;
+  deep)         load_conf && { _rc=0; for r in "${enabled_repos[@]:-}"; do is_dreamer_for "$r" || continue; run_phase deep "$r" || _rc=1; done; exit "$_rc"; } ;;
+  status)       cmd_status ;;
+  diary)        shift; cmd_diary "$@" ;;
+  enable)       shift; cmd_enable "$@" ;;
+  disable)      shift; cmd_disable "$@" ;;
+  help|-h|--help)
+    cat <<EOF
+dream — memory consolidation sweep (OpenClaw-inspired)
+
+Usage:
+  dream sweep [repo]     run full light->REM->deep pass (hub only)
+  dream now             alias for sweep
+  dream light|rem|deep  run a single phase
+  dream status          show enabled repos + diary stats + dreamer gate
+  dream diary [repo]    page DREAMS.md
+  dream enable <repo>   opt a repo into dreaming
+  dream disable <repo>  opt out
+  dream help            this
+
+Config: $DREAMCONF
+Homes:  ${MEMORY_HOMES_CONF:-~/.dotfiles/claude/memory-homes.conf}
+Docs:   ~/.dotfiles/docs/memory/README.md
+EOF
+    ;;
+  *) echo "dream: unknown subcommand: $1. try 'dream help'." >&2; exit 2 ;;
+esac

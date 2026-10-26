@@ -1,0 +1,22 @@
+# memory-homes.conf — per-repo CANONICAL memory dir (machine-INDEPENDENT).
+# Copy to claude/memory-homes.conf (or point MEMORY_HOMES_CONF at your copy).
+#
+# Format: <repo-shortname> <memory-dir>   (one per line, # = comment)
+# <memory-dir> may use ~ or $HOME; both expand to the real home.
+#
+# This is the dir Claude Code loads as its autoMemoryDirectory. Keep it inside
+# your dotfiles tree and the layout is identical on every machine, so ONE value
+# works everywhere (unlike transcript dirs, which encode the per-user cwd and
+# live in memory-canonicals.conf).
+#
+# dream promotes here; session-analyzer writes <memory-dir>/.analysis/ here;
+# reflections keeps <memory-dir>/reflections/<host>.jsonl here. Repos absent
+# from this file use identities/<DF_IDENTITY>/claude/memory/<repo>/ for
+# reflections, and the legacy <transcript-dir>/memory for dream/analyzer output.
+#
+# The memory tree holds what your agents learned about your work: sync it only
+# through a PRIVATE repository (the public .gitignore keeps it out of a fork).
+# See docs/memory/README.md.
+
+webapp   ~/.dotfiles/identities/example/claude/memory/webapp
+dotfiles ~/.dotfiles/identities/example/claude/memory/dotfiles

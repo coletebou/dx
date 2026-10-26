@@ -1,0 +1,18 @@
+# memory-canonicals.conf — per-machine transcript dir for each logical repo.
+# Copy to claude/memory-canonicals.conf (or point MEMORY_CANONICALS_CONF at it).
+#
+# Format: <repo-shortname> <machine-hostname-short>:<escaped-cwd>
+# One line per (repo, machine) pair. Lines starting with `#` are comments.
+#
+# Machine name = `hostname -s | tr '[:upper:]' '[:lower:]'` (check it on each
+# machine: macOS often reports something other than the name you gave it).
+# Escaped-cwd = the dir under ~/.claude/projects/ whose name encodes the cwd:
+# every character that is not a letter or digit becomes `-`.
+#
+# session-analyzer reads the rows for this machine (or --machine NAME).
+# The repo shortname is the key memory-homes.conf uses.
+
+# repo     machine:canonical-dir
+webapp     laptop:-Users-you-code-webapp
+webapp     devbox:-home-you-code-webapp
+dotfiles   laptop:-Users-you--dotfiles

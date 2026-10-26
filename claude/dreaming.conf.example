@@ -1,0 +1,44 @@
+# dreaming.conf — opt-in and tuning for the dreaming sweep (scripts/dream).
+# Copy to claude/dreaming.conf (or point DREAMCONF at your copy).
+#
+# Format: shell-sourced. Keep it boring. Lines starting with `#` are comments.
+# See docs/memory/README.md.
+
+# Repos (shortnames from memory-homes.conf) that opt in to dreaming. dream
+# resolves each to its synced memory home; the .analysis/ inputs staged there
+# (by session-analyzer, possibly from several hosts) get consolidated and
+# promotions land in that home's MEMORY.md. Leave empty to disable entirely.
+# `dream enable <repo>` / `dream disable <repo>` edit this list.
+enabled_repos=(
+)
+
+# HUB GATE — only these hosts (`hostname -s`, space or comma separated) run the
+# promoting light/REM/deep pass. A single dreamer promotes to MEMORY.md so there
+# are never concurrent whole-file rewrites racing your sync's git merge.
+# Empty = every machine dreams (fine for one machine).
+dream_machines=""
+# Per-repo hub, when a repo must dream on a particular machine:
+# dream_machines_webapp="devbox"
+
+# Per-phase model: an alias, a first-party id, or a provider id
+# claude-consolidate knows how to route (anthropic.* = Bedrock Mantle,
+# us.anthropic.* / global.anthropic.* = Bedrock Runtime).
+light_model="haiku"
+rem_model="sonnet"
+deep_model="sonnet"
+# Fallback for any phase left unset above.
+dreaming_model="sonnet"
+# Per-repo override for every phase (model_<repo>):
+# model_webapp="opus"
+
+# Deep-phase promotion gate.
+deep_min_score=0.55                 # the model's own durability judgement, 0-1
+deep_max_promotions=5               # hard cap per sweep (the prompt asks for 0-1)
+deep_min_held_nights=5              # nights a held candidate needs to count as recurring
+deep_held_lookback_days=14          # how far back dream-held-nights reads Deep reports
+deep_max_persistence_promotions=1   # promotions per sweep that may rest on persistence alone
+# MEMORY.md caps (Claude Code loads at most 200 lines / 25000 bytes of it).
+deep_memory_md_max_bytes=24000
+deep_memory_md_max_lines=190
+# DREAMS.md keeps this many lines; older entries move to DREAMS-archive-<year>.md.
+dreams_md_keep_lines=160
