@@ -1,0 +1,93 @@
+# Starship prompt configuration
+# Docs: https://starship.rs/config/
+
+# Timeout for commands (ms)
+command_timeout = 1000
+
+# A module that detects files (any language module, any custom module) makes
+# starship scan the working directory, and following symlinks there stats
+# their targets: a ~/code that links into external drives makes cold stats blow
+# the 30 ms scan_timeout. Nothing in the format below scans; this guard is for a
+# module added later.
+follow_symlinks = false
+
+# Newline before prompt
+add_newline = true
+
+# Prompt format
+# $aws, $jobs and the identity badge only render when their trigger conditions
+# fire (active AWS, background jobs, a work identity) — invisible when not
+# applicable.
+format = """
+${env_var.DF_PROMPT_BADGE}\
+${env_var.DF_PROMPT_HOST}\
+$directory\
+$git_branch\
+$git_status\
+$jobs\
+$aws\
+$cmd_duration\
+$line_break\
+$character"""
+
+[aws]
+symbol = "☁ "
+style = "bold orange"
+format = '[on $symbol$profile( \($region\))]($style) '
+
+[jobs]
+symbol = "✦ "
+style = "bold blue"
+number_threshold = 1
+format = '[$symbol$number]($style) '
+
+# DF_IDENTITY badge. base/zshrc sets DF_PROMPT_BADGE only for a work identity
+# (DF_WORK_IDENTITIES, default "work"), so every other identity shows nothing
+# and a work badge pops in orange.
+# The prompt reads environment variables rather than running custom modules:
+# each custom module forked bash on every prompt and made starship scan the
+# whole directory first.
+[env_var.DF_PROMPT_BADGE]
+format = '[\[$env_value\]]($style) '
+style = 'bg:208 fg:white bold'
+
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"
+
+[directory]
+truncation_length = 3
+truncate_to_repo = true
+style = "bold cyan"
+
+[git_branch]
+style = "bold purple"
+# use default format "on [$symbol$branch]($style) " + default branch nerd-font icon
+
+[git_status]
+style = "bold yellow"
+format = '([\[$all_status$ahead_behind\]]($style) )'
+staged = '+${count}'
+modified = '!${count}'
+untracked = '?${count}'
+deleted = '✘${count}'
+renamed = '»${count}'
+stashed = '\$${count}'
+conflicted = '=${count}'
+ahead = '⇡${count}'
+behind = '⇣${count}'
+diverged = '⇡${ahead_count}⇣${behind_count}'
+
+[cmd_duration]
+min_time = 250            # was 500; catch "huh that was slow" more often
+style = "bold yellow"
+format = "took [$duration]($style) "
+
+# Host label, the same one tmux and the Claude Code statusline show (DF_HOST_LABEL,
+# else the first glob that matches in your identity's hosts file, else the short
+# hostname; see base/host-label.sh). base/zshrc computes DF_PROMPT_HOST once per
+# shell, which is where the lookup lives. The built-in [hostname] module is replaced — see
+# ${env_var.DF_PROMPT_HOST} in the format string above.
+[env_var.DF_PROMPT_HOST]
+style = "bold dimmed white"
+format = "[@$env_value]($style) "
