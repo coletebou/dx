@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Block pushes unless every outgoing commit passes gitleaks.
+#
+# core.hooksPath points at this directory (base/gitconfig.base), so it guards
+# every repository on the machine. This hook deliberately fails closed when
+# gitleaks is missing or when an old remote tip is unavailable locally (the
+# history-rewrite case scans the full new tip). A repo-local hook of the same
+# name is NOT run: core.hooksPath replaces .git/hooks.
+#
+# Optional: if scripts/pre-push-memory exists in this checkout it also runs,
+# alongside the scan, for repositories that commit agent memory.
+
+set -euo pipefail
+
+# $1 is the remote name (or URL when pushing by URL, in which case the
+# --remotes fallback below matches nothing and we fall back to a full-tip scan).
+# $2 is the URL git is actually pushing to (the pushurl when one is set).
+remote_name="${1:-origin}"
+remote_url="${2:-}"
+
+GITLEAKS_BIN="${GITLEAKS_BIN:-$(command -v gitleaks || true)}"
+
+if [[ -z "$GITLEAKS_BIN" || ! -x "$GITLEAKS_BIN" ]]; then
+  echo "pre-push: gitleaks is required; push blocked" >&2
+  exit 1
+fi
+
+scanned=0
+
+is_zero_oid() {
+  [[ "$1" =~ ^0+$ ]]
+}
+
+# Commits the DESTINATION already has are not outgoing and need no scan. The
+# destination's own advertisement (ls-remote on the push URL) is authoritative;
+# local refs/remotes/* are a cache that goes stale when a remote is reset to
+# drop a leaked commit, and describes a different repository when pushurl
+# differs from url. The advertised tips that exist locally are pinned under a
+# per-run temporary namespace so they can be excluded with --glob without
+# putting thousands of SHAs on the command line.
+advertised_ns="refs/pre-push-scan/$$"
+advertised_state=unknown # unknown | ready | unavailable
+advertised_pinned=0
+memory_pid=""
+memory_out=""
+
+cleanup_advertised() {
+  git for-each-ref --format='delete %(refname)' "$advertised_ns/" |
+    git update-ref --stdin >/dev/null 2>&1 || true
+}
+
+# Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2329
+cleanup() {
+  # Wait rather than kill: a killed gate would leave its temporary copy of the
+  # memory tree behind.
+  if [[ -n "$memory_pid" ]]; then wait "$memory_pid" 2>/dev/null || true; fi
+  [[ -z "$memory_out" ]] || command rm -f "$memory_out"
+  [[ "$advertised_pinned" -eq 0 ]] || cleanup_advertised
+}
+trap cleanup EXIT
+
+load_advertised() {
+  [[ "$advertised_state" == unknown ]] || return 0
+  advertised_state=unavailable
+  [[ -n "$remote_url" ]] || return 0
+  local listing
+  listing="$(git ls-remote "$remote_url" </dev/null 2>/dev/null)" || return 0
+  advertised_pinned=1
+  # A killed earlier run with a reused PID could have left pins here; they
+  # must not widen this run's exclusion.
+  cleanup_advertised
+  # Peeled (^{}) lines duplicate their tag; objects the local repo lacks cannot
+  # be reachable from anything outgoing, so skip them.
+  if ! printf '%s\n' "$listing" | awk 'NF == 2 && $2 !~ /\^\{\}$/ { print $1 }' | sort -u |
+      git cat-file --batch-check='%(objectname) %(objecttype)' |
+      awk -v ns="$advertised_ns" '$2 == "commit" || $2 == "tag" { printf "create %s/%d %s\n", ns, NR, $1 }' |
+      git update-ref --stdin; then
+    cleanup_advertised
+    return 0
+  fi
+  advertised_state=ready
+}
+
+memory_gate="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/pre-push-memory"
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [[ -n "${local_sha:-}" ]] || continue
+  is_zero_oid "$local_sha" && continue
+  # Check only committed memory content in this outgoing ref (when the optional
+  # gate is installed). It needs neither the advertisement nor the secret scan,
+  # so it runs alongside them and its output follows the scan's. The secret
+  # scan stays independent and fail-closed.
+  if [[ -x "$memory_gate" ]]; then
+    memory_out="$(mktemp "${TMPDIR:-/tmp}/pre-push-memory.XXXXXX")"
+    "$memory_gate" "$local_sha" "$remote_sha" "$remote_name" </dev/null >"$memory_out" 2>&1 &
+    memory_pid="$!"
+  fi
+  load_advertised
+
+  if is_zero_oid "$remote_sha"; then
+    # New ref on the destination: scan only commits the destination does not
+    # already have. Scanning the full tip here blocked every new-branch push in
+    # large repos with old findings in their history. An empty
+    # destination advertises nothing, so --glob matches nothing and this is the
+    # fail-closed full-tip scan. If the advertisement is unavailable, keep the
+    # prior tracking-ref exclusion (stale-able, but the push itself needs the
+    # same remote to be reachable).
+    if [[ "$advertised_state" == ready ]]; then
+      log_opts="$local_sha --not --glob=$advertised_ns/*"
+    else
+      log_opts="$local_sha --not --remotes=$remote_name"
+    fi
+  elif git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    # Existing ref: exclude the old tip plus everything the destination
+    # advertises. A bare remote_sha..local_sha rescanned every commit merged in
+    # from another branch the destination already has (merging a long-lived
+    # branch rescanned hundreds of published commits, and a false positive there
+    # blocked the push). Never wider than remote_sha..local_sha, which remains
+    # the fallback when the advertisement is unavailable.
+    if [[ "$advertised_state" == ready ]]; then
+      log_opts="$local_sha --not $remote_sha --glob=$advertised_ns/*"
+    else
+      log_opts="$remote_sha..$local_sha"
+    fi
+  else
+    # The remote tip is absent locally: either another clone pushed first (the
+    # push will be rejected as non-fast-forward) or the remote was rewritten,
+    # which a sanitized local object database deliberately lacks. Exclude only
+    # what the destination advertises and this repo has; the absent tip drops
+    # out of the advertisement, so a rewrite still scans its replacement. A raced
+    # push otherwise rescanned the whole history (thousands of commits) only to be
+    # rejected. Without an advertisement, scan the full tip.
+    if [[ "$advertised_state" == ready ]]; then
+      log_opts="$local_sha --not --glob=$advertised_ns/*"
+    else
+      log_opts="$local_sha"
+    fi
+  fi
+
+  echo "pre-push: scanning outgoing history with gitleaks" >&2
+  if ! "$GITLEAKS_BIN" git --no-banner --no-color --redact \
+      --log-opts="$log_opts" .; then
+    echo "pre-push: gitleaks found a potential secret; push blocked" >&2
+    exit 1
+  fi
+  if [[ -n "$memory_pid" ]]; then
+    memory_rc=0
+    wait "$memory_pid" || memory_rc=$?
+    memory_pid=""
+    cat "$memory_out" >&2
+    command rm -f "$memory_out"
+    memory_out=""
+    [[ "$memory_rc" -eq 0 ]] || exit "$memory_rc"
+  fi
+  scanned=1
+done
+
+if [[ "$scanned" -eq 0 ]]; then
+  echo "pre-push: no outgoing commits to scan" >&2
+else
+  echo "pre-push: clean" >&2
+fi
