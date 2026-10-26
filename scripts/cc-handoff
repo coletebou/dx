@@ -1,0 +1,915 @@
+#!/usr/bin/env bash
+# cc-handoff: hand a Claude Code session's work to a fresh session in a new tmux window,
+# as one generation of a handoff chain. docs/handoff.md has the design; the
+# fresh-session-handoff skill tells agents when and how to use it.
+#
+#   cc-handoff init [--chain <dir>] [--name <chain-name>] [--force]
+#       Start (or continue) this session's chain and write this generation's brief skeleton
+#       (fixed sections, live ids, background jobs and transcript facts filled in). Prints
+#       the brief path. Replace every FILL placeholder, then launch.
+#   cc-handoff launch [--go] [--host <alias>|auto] [--away] [--cwd <dir>] [--name <session>]
+#                     [--notify <session>] [--no-kill] [--no-goal | --goal <text>]
+#                     [--claude-arg <arg>]... [--print] [<brief>]
+#       Open the successor: a tmux window (on this host, or on <alias> over ssh) that echoes
+#       the chain's linear history (briefs 1..n-1, then this session's rendered transcript),
+#       copies the rendered transcript to a tmux buffer (and the macOS clipboard), then
+#       starts Claude Code with a session-specific inline prompt passed as an argument (never
+#       typed into the pane). A watcher closes this session's window after the successor's
+#       first reply, but only when no background job of this session is still running or
+#       the successor adopted them. This session's id stays resumable (claude --resume).
+#   cc-handoff adopt [--all | <job-id>...]   (in the successor) take over the passer's jobs
+#   cc-handoff keep                           (in the passer) never close this window
+#   cc-handoff status [<chain-dir>]           the chain, one line per generation
+#   cc-handoff jobs                           this session's background jobs
+#   cc-handoff render <transcript.jsonl> [-o <file>]   a transcript, rendered and redacted
+#   cc-handoff --version
+# Internal: successor-run, watch, probe, get, set, remote-preflight, remote-open.
+#
+# Exit codes (launch): 0 the successor started and replied; 2 bad arguments or an
+# incomplete brief (nothing started); 3 tmux or python3 missing; 4 this brief or chain
+# step already has a live successor (never relaunch); 5 tmux failed or Claude Code did
+# not start (the window is LEFT RUNNING when it opened); 7 the successor started but
+# had not replied within FSH_ENGAGE_TIMEOUT (it is LEFT RUNNING, the watcher keeps
+# waiting); 8 no launcher here reproduces this session's provider route (nothing
+# started); 9 the --host preflight failed (nothing started).
+#
+# Env: FSH_BRIEFS_DIR (~/code/.briefs), FSH_SESSION (handoffs: the shared tmux session
+# outside tmux and on remote hosts), FSH_PLACEMENT (adjacent|shared), FSH_LAUNCH_CMD,
+# FSH_LAUNCHERS, FSH_DEFAULT_LAUNCHER (see "launcher" below), FSH_BYPASS (0|1: start the
+# successor with permission checks off; default: when this session's claude runs that way),
+# FSH_MODEL, FSH_EFFORT, FSH_AUTHORIZED (0|1, same as --go), FSH_ENGAGE_TIMEOUT (180),
+# FSH_KILL (1; 0 = never close the passer), FSH_FIRST_RESPONSE_TIMEOUT (1800),
+# FSH_HOLD_MAX (43200), FSH_QUIET_SECS (10), FSH_QUIET_MAX (300), FSH_WATCH_POLL (3),
+# FSH_SUCCESSOR_ENV (NAME=value words for the successor's environment, e.g. IS_SANDBOX=1 for a
+# root target), FSH_POLL (1), FSH_REMOTE_BRIEFS_DIR (the target's briefs dir for --host), FSH_REMOTE_CCH
+# (cc-handoff's path on a --host target, default $HOME/.dotfiles/scripts/cc-handoff),
+# HANDOFF_STATE_DIR, HANDOFF_CHAIN_STATE_DIR (statusline markers).
+set -euo pipefail
+
+VERSION=1
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+self="$here/$(basename "${BASH_SOURCE[0]}")"
+lib="$here/lib/cc_handoff.py"
+briefs_root="${FSH_BRIEFS_DIR:-$HOME/code/.briefs}"
+# cc-handoff on a --host target, as its login shell expands it (FSH_REMOTE_CCH overrides it,
+# e.g. to try an unreleased copy).
+remote_cch="${FSH_REMOTE_CCH:-\$HOME/.dotfiles/scripts/cc-handoff}"
+shared_session="${FSH_SESSION:-handoffs}"
+poll="${FSH_POLL:-1}"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'cc-handoff: %s\n' "$*" >&2; }
+die()  { local code="$1"; shift; warn "$*"; exit "$code"; }
+py()   { "$python" "$lib" "$@"; }
+
+python="$(command -v python3 || true)"
+need_python() { [[ -n "$python" ]] || die 3 "python3 is required (it renders transcripts and keeps the chain records)"; }
+
+usage() { sed -n '2,/^# Internal/p' "$self" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+host_id() {
+  local m="${DF_MACHINE:-${CLAUDE_MACHINE:-}}"
+  if [[ -z "$m" && -r "$HOME/.df-profile" ]]; then
+    m="$(awk -F= '/^export DF_MACHINE=/ { print $2; exit }' "$HOME/.df-profile" | tr -d "'\"")"
+  fi
+  [[ -n "$m" ]] || m="$(hostname | cut -d. -f1 | tr '[:upper:]' '[:lower:]')"
+  printf '%s' "$m"
+}
+identity() {
+  local i="${DF_IDENTITY:-}"
+  if [[ -z "$i" && -r "$HOME/.df-profile" ]]; then
+    i="$(awk -F= '/^export DF_IDENTITY=/ { print $2; exit }' "$HOME/.df-profile" | tr -d "'\"")"
+  fi
+  printf '%s' "${i:-unknown}"
+}
+new_uuid() {
+  local u
+  u="$(uuidgen 2>/dev/null || "$python" -c 'import uuid; print(uuid.uuid4())')"
+  printf '%s' "$u" | tr '[:upper:]' '[:lower:]'
+}
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//'; }
+# The chain lives in a brief's parent's parent: <chain>/gen-NN/brief.md.
+chain_of_brief() { (cd "$(dirname "$1")/.." && pwd -P); }
+gen_of_brief() {
+  local d; d="$(basename "$(dirname "$1")")"
+  [[ "$d" =~ ^gen-([0-9]+)$ ]] || return 1
+  printf '%d' "$((10#${BASH_REMATCH[1]}))"
+}
+transcript_of() { "$python" -c 'import sys; sys.path.insert(0, sys.argv[1]); import cc_handoff as c; print(c.find_transcript(sys.argv[2]) or "")' "$here/lib" "$1"; }
+pane_field() { tmux display-message -p -t "$1" "$2" 2>/dev/null || true; }
+# Every tmux call in this file goes through here. cc-handoff never kills a server or a
+# session (a stray kill-server took a whole host's sessions down on 2026-10-23); closing
+# the passer's window is the watcher's job, by explicit %pane target only.
+tmux() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      kill-ser|kill-serv|kill-serve|kill-server|kill-ses|kill-sess|kill-sessi|kill-sessio|kill-session|kill-window|kill-pane)
+        die 5 "refusing \`tmux $a\`: the launcher never kills a server, a session, a window or a pane" ;;
+    esac
+  done
+  command tmux "$@"
+}
+
+# ---------------------------------------------------------------- launcher ----
+# The successor runs on this session's provider route: read the CLAUDE_CODE_USE_* flags the
+# way Claude Code does, then pick the launcher that starts that route; exit 8 when none does.
+#   FSH_LAUNCHERS         route=command words (default "mantle=yuma"). Routes: anthropic,
+#                         mantle, bedrock, bedrock+mantle, foundry, anthropic-aws,
+#                         anthropic-gcp, vertex, endpoint (a custom ANTHROPIC_BASE_URL).
+#   FSH_DEFAULT_LAUNCHER  for a route FSH_LAUNCHERS does not name, when it starts that same
+#                         route on this machine (read from ~/.claude/settings.json and the
+#                         repo's .claude/settings*.json); default claude.
+#   FSH_LAUNCH_CMD        skips the detection: always this launcher.
+# A launcher is a bare command name: claude, a command on PATH, or a zsh function from your
+# login profile (yu and yuma come from base/aliases.sh).
+flag_on() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  case "$v" in 1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0 ;; esac
+  return 1
+}
+route_of() {  # <BEDROCK> <FOUNDRY> <ANTHROPIC_AWS> <ANTHROPIC_GOOGLE_CLOUD> <MANTLE> <VERTEX> <ANTHROPIC_BASE_URL>
+  if flag_on "$1"; then
+    if flag_on "$5"; then printf 'bedrock+mantle'; else printf 'bedrock'; fi
+  elif flag_on "$2"; then printf foundry
+  elif flag_on "$3"; then printf anthropic-aws
+  elif flag_on "$4"; then printf anthropic-gcp
+  elif flag_on "$5"; then printf 'mantle'
+  elif flag_on "$6"; then printf vertex
+  elif [[ -n "$7" ]]; then printf 'endpoint=%s' "$7"
+  else printf anthropic
+  fi
+}
+url_host() { local h="${1#*://}"; h="${h%%/*}"; printf '%s' "${h##*@}"; }
+describe_route() {
+  case "$1" in
+    anthropic) printf 'the Anthropic API (Claude subscription or API key)' ;;
+    endpoint=*) printf 'a custom endpoint at %s' "$(url_host "${1#endpoint=}")" ;;
+    mantle) printf 'Bedrock Mantle' ;;
+    bedrock) printf 'Bedrock Runtime' ;;
+    bedrock+mantle) printf 'Bedrock with Mantle serving the anthropic.* ids' ;;
+    foundry) printf 'Microsoft Foundry' ;;
+    anthropic-aws) printf "Claude Code's anthropicAws provider" ;;
+    anthropic-gcp) printf "Claude Code's anthropicGoogleCloud provider" ;;
+    vertex) printf 'Vertex AI' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+default_route() {  # the route plain claude starts in $1, or ? when that cannot be read
+  local repo="$1" user="$HOME/.claude/settings.json" f vals b fo aa ag m vx u
+  local -a layers=()
+  if ! command -v jq >/dev/null 2>&1 || [[ ! -r "$user" ]]; then printf '?'; return 0; fi
+  layers=("$user")
+  for f in "$repo/.claude/settings.json" "$repo/.claude/settings.local.json"; do
+    if [[ -r "$f" ]]; then layers+=("$f"); fi
+  done
+  vals="$(jq -rs '(map(.env // {}) | add // {}) as $e
+      | [$e.CLAUDE_CODE_USE_BEDROCK, $e.CLAUDE_CODE_USE_FOUNDRY, $e.CLAUDE_CODE_USE_ANTHROPIC_AWS,
+         $e.CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD, $e.CLAUDE_CODE_USE_MANTLE, $e.CLAUDE_CODE_USE_VERTEX,
+         $e.ANTHROPIC_BASE_URL] | map(. // "" | tostring) | join("\u001f")' \
+      "${layers[@]}" 2>/dev/null)" || { printf '?'; return 0; }
+  IFS=$'\x1f' read -r b fo aa ag m vx u <<<"$vals"
+  route_of "$b" "$fo" "$aa" "$ag" "$m" "$vx" "$u"
+}
+mapped_launcher() {  # the FSH_LAUNCHERS entry for route $1, or status 1
+  local w key
+  for w in ${FSH_LAUNCHERS-mantle=yuma}; do
+    key="${w%%=*}"
+    if [[ "$key" == "$1" || ( "$key" == endpoint && "$1" == endpoint=* ) ]]; then printf '%s' "${w#*=}"; return 0; fi
+  done
+  return 1
+}
+pick_launcher() {  # sets launch_cmd, launcher_why, model; exits 8 when no launcher fits
+  local repo="$1" route var evidence="" this dflt="${FSH_DEFAULT_LAUNCHER:-claude}" plain mapped
+  local auto_cmd="" auto_why="" auto_no=""
+  route="$(route_of "${CLAUDE_CODE_USE_BEDROCK:-}" "${CLAUDE_CODE_USE_FOUNDRY:-}" \
+    "${CLAUDE_CODE_USE_ANTHROPIC_AWS:-}" "${CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD:-}" \
+    "${CLAUDE_CODE_USE_MANTLE:-}" "${CLAUDE_CODE_USE_VERTEX:-}" "${ANTHROPIC_BASE_URL:-}")"
+  for var in CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS \
+      CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_VERTEX; do
+    [[ -z "${!var:-}" ]] || evidence="$evidence $var=${!var}"
+  done
+  case "$route" in
+    bedrock*|mantle*) evidence="$evidence AWS_REGION=${AWS_REGION:-(unset)}" ;;
+    endpoint=*) evidence="$evidence ANTHROPIC_BASE_URL=$(url_host "$ANTHROPIC_BASE_URL")" ;;
+  esac
+  this="this session is on $(describe_route "$route")${evidence:+ [${evidence# }]}"
+  plain="$(default_route "$repo")"
+  if mapped="$(mapped_launcher "$route")"; then
+    auto_cmd="$mapped" auto_why="$this, which FSH_LAUNCHERS maps to $mapped"
+  elif [[ "$route" == anthropic && -z "${CLAUDECODE:-}" ]]; then
+    auto_cmd="$dflt" auto_why="this was not run from a Claude Code session (CLAUDECODE unset), so it takes the machine default"
+  elif [[ "$route" == "$plain" ]]; then
+    auto_cmd="$dflt" auto_why="$this, the route claude starts on this machine"
+  elif [[ "$route" == anthropic && "$plain" == '?' ]]; then
+    auto_cmd="$dflt" auto_why="$this, the default route (what claude starts on this machine could not be read)"
+  elif [[ "$plain" == '?' ]]; then
+    auto_no="$this, and what claude starts on this machine could not be read (that needs jq and a readable $HOME/.claude/settings.json)"
+  else
+    auto_no="$this, but claude on this machine starts $(describe_route "$plain"), and FSH_LAUNCHERS maps no launcher to this route"
+  fi
+  launch_cmd="${FSH_LAUNCH_CMD:-}"
+  if [[ -n "$launch_cmd" ]]; then
+    if [[ -n "$auto_cmd" ]]; then
+      launcher_why="$launch_cmd, set by FSH_LAUNCH_CMD (detection would pick $auto_cmd, because $auto_why)"
+    else
+      launcher_why="$launch_cmd, set by FSH_LAUNCH_CMD (detection found no launcher: $auto_no)"
+    fi
+  elif [[ -n "$auto_cmd" ]]; then
+    launch_cmd="$auto_cmd" launcher_why="$auto_cmd, because $auto_why"
+  else
+    die 8 "no launcher here reproduces this session's provider route: $auto_no. Nothing was started. Pick the route (ask the user when it is not clear) and rerun with FSH_LAUNCH_CMD=<launcher>, or map it for good: FSH_LAUNCHERS=\"<route>=<launcher> ...\"."
+  fi
+  [[ "$launch_cmd" =~ ^[A-Za-z0-9_.-]+$ ]] || die 2 "the launcher must be a bare command name (got '$launch_cmd')"
+  if [[ -n "${FSH_MODEL+x}" ]]; then
+    model="$FSH_MODEL"
+  elif [[ "$launch_cmd" == "$auto_cmd" ]]; then
+    model="${ANTHROPIC_DEFAULT_OPUS_MODEL:-opus}"
+  else
+    model=opus
+    launcher_why="$launcher_why; model: the opus alias, as this session's pinned id belongs to its own route"
+  fi
+  [[ -z "$model" || "$model" =~ ^[][A-Za-z0-9._:/-]+$ ]] || die 2 "FSH_MODEL may only contain letters, digits and . _ : / [ ] -: $model"
+}
+
+# passer_bypass: true when this session's own claude runs with permission checks off. The
+# successor started with plain claude gets the same, never more: FSH_BYPASS=1|0 overrides.
+# (A session in bypass through settings needs no flag: the successor reads the same settings.)
+passer_bypass() {
+  local pid="${CLAUDE_PID:-}" tok prev="" ; local -a toks=()
+  [[ -n "$pid" ]] || return 1
+  if [[ -r "/proc/$pid/cmdline" ]]; then
+    while IFS= read -r -d '' tok; do toks+=("$tok"); done < "/proc/$pid/cmdline"
+  else
+    # shellcheck disable=SC2207 # best effort: split the ps line on whitespace
+    toks=($(ps -o args= -p "$pid" 2>/dev/null || true))
+  fi
+  for tok in ${toks[@]+"${toks[@]}"}; do
+    case "$tok" in
+      --dangerously-skip-permissions|--permission-mode=bypassPermissions) return 0 ;;
+      bypassPermissions) [[ "$prev" == --permission-mode ]] && return 0 ;;
+    esac
+    prev="$tok"
+  done
+  return 1
+}
+
+# Flags of this session's own claude process worth keeping in the successor (an MCP
+# config chosen for this host's memory, extra dirs, plugin dirs). Linux reads the exact
+# argv from /proc; elsewhere ps joins it with spaces, so values with spaces are skipped.
+carried_args() {
+  local pid="${CLAUDE_PID:-}" tok want="" ; local -a toks=()
+  [[ -n "$pid" ]] || return 0
+  if [[ -r "/proc/$pid/cmdline" ]]; then
+    while IFS= read -r -d '' tok; do toks+=("$tok"); done < "/proc/$pid/cmdline"
+  else
+    # shellcheck disable=SC2207 # best effort: split the ps line on whitespace
+    toks=($(ps -o args= -p "$pid" 2>/dev/null || true))
+  fi
+  for tok in ${toks[@]+"${toks[@]}"}; do
+    case "$want" in
+      mcp) if [[ "$tok" != -* && ( "$tok" == *.json || "$tok" == '{'* ) ]]; then printf '%s\0%s\0' --mcp-config "$tok"; continue; fi; want="" ;;
+      dir) want=""; [[ "$tok" != -* ]] && printf '%s\0%s\0' "$flag" "$tok"; continue ;;
+    esac
+    case "$tok" in
+      --strict-mcp-config) printf '%s\0' "$tok" ;;
+      --mcp-config) want=mcp ;;
+      --mcp-config=*) printf '%s\0%s\0' --mcp-config "${tok#*=}" ;;
+      --add-dir|--plugin-dir) want=dir flag="$tok" ;;
+      --add-dir=*|--plugin-dir=*) printf '%s\0%s\0' "${tok%%=*}" "${tok#*=}" ;;
+    esac
+  done
+}
+
+# is_trusted <dir>: Claude Code shows its trust dialog in a folder it has not trusted, even
+# in bypass mode (seen 2026-10-24), and nobody would be there to answer it. Its rule: the
+# folder or an ancestor is trusted in ~/.claude.json, the walk stopping at the git root, and
+# a worktree is trusted through its main checkout.
+is_trusted() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$HOME/.claude.json" "$1" <<'PY'
+import json, os, subprocess, sys
+try:
+    projects = json.load(open(sys.argv[1])).get("projects") or {}
+except (OSError, ValueError):
+    sys.exit(1)
+def git(*args):
+    try:
+        return subprocess.run(["git", "-C", sys.argv[2], *args], capture_output=True, text=True,
+                              timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+trusted = lambda d: (projects.get(d) or {}).get("hasTrustDialogAccepted") is True
+top = git("rev-parse", "--show-toplevel")
+common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+main = os.path.dirname(common) if common.endswith("/.git") else ""
+if main and trusted(main):          # a worktree is trusted through its main checkout
+    sys.exit(0)
+p = sys.argv[2]
+while True:                          # the folder or an ancestor, up to the git root
+    if trusted(p):
+        sys.exit(0)
+    if p in ("/", "") or (top and p == top):
+        sys.exit(1)
+    p = os.path.dirname(p)
+PY
+}
+
+# -------------------------------------------------------------------- init ----
+cmd_init() {
+  local chain="" cname="" force=""
+  while (( $# )); do
+    case "$1" in
+      --chain) chain="${2:?--chain needs a directory}"; shift ;;
+      --name) cname="${2:?--name needs a chain name}"; shift ;;
+      --force) force=--force ;;
+      -h|--help) usage ;;
+      *) die 2 "init: unknown argument $1" ;;
+    esac
+    shift
+  done
+  need_python
+  local sid="${CLAUDE_CODE_SESSION_ID:-}"
+  [[ -n "$sid" ]] || die 2 "init runs inside a Claude Code session (CLAUDE_CODE_SESSION_ID is unset)"
+  local transcript gen=1 chain_dir="" marker root repo
+  transcript="$(transcript_of "$sid")"
+  if marker="$(py chain-of "$sid" 2>/dev/null)"; then
+    chain_dir="${marker%%$'\t'*}"; gen="${marker##*$'\t'}"
+  fi
+  local cwd top common
+  cwd="$(pwd -P)"
+  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [[ -n "$common" && "$(basename "$common")" == .git ]]; then repo="$(basename "$(dirname "$common")")"
+  elif [[ -n "$top" ]]; then repo="$(basename "$top")"
+  else repo="$(basename "$cwd")"; fi
+  repo="$(sanitize "${repo#.}")"; [[ -n "$repo" ]] || repo=session
+  if [[ -n "$chain" ]]; then
+    chain_dir="$chain"
+  elif [[ -z "$chain_dir" ]]; then
+    cname="${cname:-$repo-handoff-$(date -u +%Y%m%d)}"
+    [[ "$cname" =~ ^[A-Za-z0-9_.-]+$ ]] || die 2 "chain name may only use [A-Za-z0-9_.-] (got '$cname')"
+    chain_dir="$briefs_root/$cname"
+    [[ ! -e "$chain_dir" ]] || chain_dir="$briefs_root/$cname-$(date -u +%H%M)"
+  fi
+  mkdir -p "$chain_dir"
+  # Owner-only: the records hold the successor's environment and the user's goal, and other
+  # accounts can share the home's group (every standard macOS user is in staff).
+  chmod 700 "$chain_dir"
+  chain_dir="$(cd "$chain_dir" && pwd -P)"
+  root="$(py info "$transcript" 2>/dev/null | jq -r '.name // ""' 2>/dev/null || true)"
+  root="$(sanitize "${root:-$repo}")"
+  local target="" window="" pane="${TMUX_PANE:-}" git=""
+  if [[ -n "$pane" ]] && command -v tmux >/dev/null 2>&1; then
+    target="$(pane_field "$pane" '#{session_name}:#{window_index}')"
+    window="$(pane_field "$pane" '#{window_id}')"
+  fi
+  if [[ -n "$top" ]]; then
+    local branch head dirty ahead
+    branch="$(git branch --show-current 2>/dev/null || true)"; head="$(git rev-parse --short HEAD 2>/dev/null || true)"
+    dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    ahead="$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo '?')"
+    git="git branch ${branch:-detached}, HEAD $head, $dirty uncommitted, $ahead unpushed"
+  fi
+  local rc=0 brief
+  brief="$(py brief-init --chain-dir "$chain_dir" --gen "$gen" --sid "$sid" --host "$(host_id)" --cwd "$cwd" \
+    --transcript "$transcript" --name "$root" --root "$root" --target "$target" --pane "$pane" --window "$window" \
+    --git "$git" ${CLAUDE_PID:+--claude-pid "$CLAUDE_PID"} --exclude-ancestors-of "$$" $force)" || rc=$?
+  if (( rc == 3 )); then
+    say "$brief"
+    warn "this generation's brief already exists (kept as is; --force rewrites the skeleton)"
+    return 0
+  fi
+  (( rc == 0 )) || die "$rc" "could not write the brief"
+  say "$brief"
+  printf 'cc-handoff: chain %s, generation %s. Replace every FILL placeholder (the text in double angle brackets) in the brief, then run: cc-handoff launch %s\n' \
+    "$(basename "$chain_dir")" "$gen" "$brief" >&2
+}
+
+# ------------------------------------------------------------------ launch ----
+cmd_launch() {
+  local go="${FSH_AUTHORIZED:-0}" host="" away="" cwd="" sname="" notify="" no_kill="" goal_opt="" print_only=0 brief=""
+  local -a extra=()
+  while (( $# )); do
+    case "$1" in
+      --go) go=1 ;;
+      --host) host="${2:?--host needs an ssh alias or auto}"; shift ;;
+      --away) away=1 ;;
+      --cwd) cwd="${2:?--cwd needs a directory}"; shift ;;
+      --name) sname="${2:?--name needs a session name}"; shift ;;
+      --notify) notify="${2:?--notify needs a session id or name}"; shift ;;
+      --no-kill) no_kill=1 ;;
+      --no-goal) goal_opt=--no-goal ;;
+      --goal) goal_opt="${2:?--goal needs the condition text}"; shift ;;
+      --claude-arg) extra+=("${2:?--claude-arg needs a value}"); shift ;;
+      --print) print_only=1 ;;
+      -h|--help) usage ;;
+      -*) die 2 "launch: unknown option $1" ;;
+      *) [[ -z "$brief" ]] || die 2 "launch: one brief only (got '$brief' and '$1')"; brief="$1" ;;
+    esac
+    shift
+  done
+  [[ "$go" == 0 || "$go" == 1 ]] || die 2 "FSH_AUTHORIZED must be 0 or 1 (got '$go')"
+  # The successor's own environment: FSH_SUCCESSOR_ENV (NAME=value words, each name once).
+  local -a succ_env=() words=()
+  local kv
+  read -r -a words <<<"${FSH_SUCCESSOR_ENV:-}"   # split on blanks; unlike a bare $VAR, no globbing
+  for kv in ${words[@]+"${words[@]}"}; do
+    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,-]*$ ]] \
+      || die 2 "FSH_SUCCESSOR_ENV takes NAME=value words with plain values (got '$kv')"
+    [[ " ${succ_env[*]-} " != *" ${kv%%=*}="* ]] || die 2 "FSH_SUCCESSOR_ENV names ${kv%%=*} twice"
+    succ_env+=("$kv")
+  done
+  need_python
+  command -v tmux >/dev/null 2>&1 || die 3 "tmux is not installed"
+  command -v jq >/dev/null 2>&1 || die 3 "jq is required"
+  local sid="${CLAUDE_CODE_SESSION_ID:-}"
+  [[ -n "$sid" ]] || die 2 "launch runs inside a Claude Code session (CLAUDE_CODE_SESSION_ID is unset)"
+  if [[ -z "$brief" ]]; then
+    local marker
+    if marker="$(py chain-of "$sid" 2>/dev/null)"; then
+      brief="${marker%%$'\t'*}/$(printf 'gen-%02d' "${marker##*$'\t'}")/brief.md"
+    else
+      die 2 "launch: which brief? run cc-handoff init first, or pass the brief path"
+    fi
+  fi
+  [[ -r "$brief" ]] || die 2 "brief not readable: $brief"
+  local chain_dir gen
+  chain_dir="$(chain_of_brief "$brief")"
+  gen="$(gen_of_brief "$brief")" || die 2 "the brief must be <chain>/gen-NN/brief.md (run cc-handoff init); got $brief"
+  [[ -r "$chain_dir/chain.json" ]] || die 2 "no chain.json in $chain_dir (run cc-handoff init)"
+  brief="$chain_dir/$(printf 'gen-%02d' "$gen")/brief.md"
+  local check
+  if ! check="$(py brief-check "$brief")"; then
+    die 2 "the brief is not ready: $(jq -r '.problems | join("; ")' <<<"$check"). Fix $brief and rerun."
+  fi
+  local passer_sid
+  passer_sid="$(py get "$chain_dir" "$gen" session_id)"
+  [[ "$passer_sid" == "$sid" ]] || die 2 "$brief belongs to session ${passer_sid:-?}, not this one ($sid)"
+  local next=$((gen + 1)) running dup
+  running="$(tmux list-windows -a -F $'#{@fsh_brief}\t#{session_name}:#{window_name}' 2>/dev/null || true)"
+  dup="$(awk -F'\t' -v b="$brief" '$1 == b { print $2; exit }' <<<"$running")"
+  [[ -z "$dup" ]] || die 4 "this brief is already running in tmux window $dup; do not relaunch it (attach: tmux attach -t $dup)"
+  local prev_succ prev_alias prev_rchain prev_state
+  prev_succ="$(py get "$chain_dir" "$next" session_id 2>/dev/null || true)"
+  if [[ -n "$prev_succ" ]]; then
+    prev_alias="$(py get "$chain_dir" "$next" ssh_alias 2>/dev/null || true)"
+    if [[ -n "$prev_alias" ]]; then
+      # A successor on another host: only that host knows whether it started.
+      prev_rchain="$(py get "$chain_dir" "$next" remote_chain_dir 2>/dev/null || true)"
+      prev_state="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$prev_alias" \
+        "$remote_cch probe $(printf '%q %q' "$prev_succ" "$prev_rchain/$(printf 'gen-%02d' "$gen")/brief.md")" 2>/dev/null)" \
+        || prev_state=unreachable
+    else
+      prev_state="$(py probe "$prev_succ")"
+    fi
+    case "$prev_state" in
+      waiting) ;;   # recorded but never started: a retry replaces it
+      unreachable|"") die 4 "generation $next was started on $prev_alias, which cannot be asked whether it still runs. Check it there (cc-handoff status), then remove $chain_dir/$(printf 'gen-%02d' "$next")/session.json to relaunch." ;;
+      *) die 4 "generation $next of this chain already started (session $prev_succ${prev_alias:+ on $prev_alias}, $prev_state); do not relaunch. cc-handoff status $chain_dir" ;;
+    esac
+  fi
+
+  # Where: this host (adjacent window, or the shared session) or another host over ssh.
+  local alias="" here_id; here_id="$(host_id)"
+  if [[ "$host" == auto ]]; then
+    local placed="" rc=0
+    if command -v fleet-place >/dev/null 2>&1; then
+      if [[ -n "$away" ]]; then placed="$(fleet-place --exclude "$here_id" claude-session 2>/dev/null | head -n 1)" || rc=$?
+      else placed="$(fleet-place claude-session 2>/dev/null | head -n 1)" || rc=$?; fi
+    else
+      rc=127
+    fi
+    if (( rc != 0 )) || [[ -z "$placed" || "$placed" == local || "$placed" == "$here_id" ]]; then
+      say "placement: this host (fleet-place ${placed:+picked $placed}${placed:-gave no other host}, exit $rc)"
+    else
+      alias="$placed"; say "placement: $alias (picked by fleet-place for a claude-session)"
+    fi
+  elif [[ -n "$host" && "$host" != local && "$host" != "$here_id" ]]; then
+    [[ "$host" =~ ^[A-Za-z0-9_.@-]+$ ]] || die 2 "--host must be an ssh alias (got '$host')"
+    alias="$host"
+  fi
+
+  local passer_cwd; passer_cwd="$(py get "$chain_dir" "$gen" cwd)"
+  [[ -n "$cwd" ]] || cwd="$passer_cwd"
+  [[ -n "$cwd" ]] || cwd="$(pwd -P)"
+  pick_launcher "$cwd"
+
+  local effort="${CLAUDE_EFFORT:-}"
+  [[ "$effort" =~ ^(low|medium|high|xhigh|max)$ ]] || effort=xhigh
+  effort="${FSH_EFFORT:-$effort}"
+  [[ "$effort" =~ ^[a-z]+$ ]] || die 2 "FSH_EFFORT must be a lowercase word (got '$effort')"
+
+  # The successor's name: <root>-<gen>, kept free of the windows already in its session.
+  local root; root="$(jq -r '.root // ""' "$chain_dir/chain.json")"
+  root="$(sanitize "${root:-session}")"
+  [[ -n "$sname" ]] || sname="$root-$next"
+  sname="$(sanitize "$sname")"
+
+  # This session's own IS_SANDBOX (bypass mode as root needs it) describes this machine, so
+  # it carries over only to a successor here; another root target is marked explicitly.
+  carry_sandbox() {
+    if [[ -n "${IS_SANDBOX:-}" && " ${succ_env[*]-} " != *" IS_SANDBOX="* ]]; then succ_env+=("IS_SANDBOX=$IS_SANDBOX"); fi
+  }
+  local remote_briefs="" remote_cwd="" remote_uid="" succ_host="$here_id"
+  if [[ -n "$alias" ]]; then
+    local pre
+    pre="$(remote_preflight "$alias" "$cwd")" || die 9 "preflight on $alias failed: ${pre:-no answer over ssh}"
+    remote_briefs="$(awk -F= '$1 == "briefs" { print $2 }' <<<"$pre")"
+    remote_cwd="$(awk -F= '$1 == "cwd" { print $2 }' <<<"$pre")"
+    succ_host="$(awk -F= '$1 == "machine" { print $2 }' <<<"$pre")"
+    remote_uid="$(awk -F= '$1 == "uid" { print $2 }' <<<"$pre")"
+    cwd="$remote_cwd"
+    [[ "$succ_host" != "$here_id" ]] || carry_sandbox
+    if [[ "$remote_uid" == 0 && " ${succ_env[*]-} " != *" IS_SANDBOX=1 "* ]]; then
+      die 9 "$alias runs Claude Code as root, where --dangerously-skip-permissions refuses to start without IS_SANDBOX=1. If that box is meant to run agents as root, rerun with FSH_SUCCESSOR_ENV=IS_SANDBOX=1."
+    fi
+    if [[ "$succ_host" == "$here_id" ]]; then
+      # The same machine: the copy must not land on (or inside, or around) this very chain.
+      local dest; dest="$(cd "$remote_briefs" 2>/dev/null && pwd -P)/$(basename "$chain_dir")"
+      case "$dest/" in "$chain_dir"/*)
+        die 9 "$alias is this machine and its briefs dir holds this very chain, so copying the chain would overwrite it in place. Hand off locally, or set FSH_REMOTE_BRIEFS_DIR to another directory." ;;
+      esac
+    fi
+    say "preflight: $alias ok (machine $succ_host, identity $(identity), cwd $cwd)"
+  else
+    carry_sandbox
+    [[ -d "$cwd" ]] || die 2 "working directory not found: $cwd"
+    if [[ "$cwd" != "$passer_cwd" ]] && ! is_trusted "$cwd"; then
+      die 2 "Claude Code has not trusted $cwd, so the new session would stop at its trust dialog. Run claude there once and answer it, or hand off in $passer_cwd."
+    fi
+  fi
+
+  # Placement on this host: right after the launching window, in its session.
+  local origin_wid="" origin_sname="" target_session="$shared_session" win="$sname" taken n=2
+  if [[ -z "$alias" ]]; then
+    if [[ "${FSH_PLACEMENT:-adjacent}" == adjacent && -n "${TMUX_PANE:-}" ]]; then
+      IFS=$'\t' read -r origin_wid origin_sname < <(pane_field "$TMUX_PANE" $'#{window_id}\t#{session_name}') || true
+    fi
+    [[ -z "$origin_sname" ]] || target_session="$origin_sname"
+    taken="$(tmux list-windows -t "=$target_session" -F '#{window_name}' 2>/dev/null || true)"
+    while grep -Fxq -- "$win" <<<"$taken"; do win="$sname-$n"; n=$((n + 1)); done
+    sname="$win"
+  fi
+
+  local succ_sid; succ_sid="$(new_uuid)"
+  local -a carry=()
+  local tok
+  while IFS= read -r -d '' tok; do carry+=("$tok"); done < <(carried_args)
+  if [[ -n "$alias" && ${#carry[@]} -gt 0 ]]; then
+    # Paths to this host's MCP config and dirs; the other host uses its own.
+    say "carried flags left behind for $alias (paths on this host): ${carry[*]}"
+    carry=()
+  fi
+  local bypass="${FSH_BYPASS:-}"
+  if [[ -z "$bypass" ]]; then bypass=0; if passer_bypass; then bypass=1; fi; fi
+  [[ "$bypass" == 0 || "$bypass" == 1 ]] || die 2 "FSH_BYPASS must be 0 or 1 (got '$bypass')"
+  local claude_args succ_env_json
+  claude_args="$("$python" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' ${carry[@]+"${carry[@]}"} ${extra[@]+"${extra[@]}"})"
+  succ_env_json="$("$python" -c 'import json, sys; print(json.dumps(dict(a.split("=", 1) for a in sys.argv[1:])))' ${succ_env[@]+"${succ_env[@]}"})"
+  local passer_target=""
+  [[ -z "${TMUX_PANE:-}" ]] || passer_target="$(pane_field "$TMUX_PANE" '#{session_name}:#{window_index}')"
+
+  local launch_line="$launch_cmd${model:+ --model \"$model\"} --effort $effort --session-id $succ_sid -n $sname"
+  say "launcher: $launcher_why"
+  if (( print_only )); then
+    say "would open: ${alias:+$alias:}$target_session:$win in $cwd (generation $next of $(basename "$chain_dir"))"
+    say "would run:  $launch_line $(jq -r 'map(@sh) | join(" ")' <<<"$claude_args") \"<the inline prompt>\""
+    say "summary:    $(jq -c '.summary' <<<"$check")"
+    return 0
+  fi
+
+  # 1. the rendered transcript of this session, next to its brief
+  local gd; gd="$chain_dir/$(printf 'gen-%02d' "$gen")"
+  local passer_transcript; passer_transcript="$(py get "$chain_dir" "$gen" transcript)"
+  [[ -n "$passer_transcript" && -r "$passer_transcript" ]] || passer_transcript="$(transcript_of "$sid")"
+  [[ -n "$passer_transcript" ]] || die 2 "cannot find this session's transcript (session $sid)"
+  py set "$chain_dir" "$gen" "$(jq -nc --arg t "$passer_transcript" --arg p "${CLAUDE_PID:-}" \
+    '{transcript: $t} + (if $p != "" then {claude_pid: ($p | tonumber)} else {} end)')"
+  local lines; lines="$(py render "$passer_transcript" --out "$gd/transcript.md" --host "$here_id")"
+  say "rendered: $gd/transcript.md ($lines lines; raw $passer_transcript)"
+
+  # 2. the successor's record and its inline prompt
+  local prep goal_args=() prep_flags=()
+  if (( go )); then prep_flags+=(--go); fi
+  if (( bypass )); then prep_flags+=(--bypass); fi
+  if [[ "$goal_opt" == --no-goal ]]; then goal_args=(--no-goal)
+  elif [[ -n "$goal_opt" ]]; then goal_args=(--goal "$goal_opt"); fi
+  local remote_chain=""
+  [[ -z "$alias" ]] || remote_chain="$remote_briefs/$(basename "$chain_dir")"
+  prep="$(py prepare --chain-dir "$chain_dir" --gen "$gen" --successor-sid "$succ_sid" --successor-name "$sname" \
+    --successor-host "$succ_host" --successor-cwd "$cwd" --launcher "$launch_cmd" --model "$model" --effort "$effort" \
+    --claude-args "$claude_args" --successor-env "$succ_env_json" \
+    --notify "$notify" --ssh-alias "$alias" --remote-chain-dir "$remote_chain" \
+    --passer-target "$passer_target" --exclude-ancestors-of "$$" \
+    ${goal_args[@]+"${goal_args[@]}"} ${no_kill:+--no-kill} ${prep_flags[@]+"${prep_flags[@]}"})" \
+    || die 2 "could not prepare generation $next"
+  local njobs; njobs="$(jq -r '.jobs' <<<"$prep")"
+
+  # 3. the window
+  local pane="" target=""
+  if [[ -n "$alias" ]]; then
+    local out
+    copy_chain "$alias" "$chain_dir" "$remote_briefs" "$gen" "$passer_transcript" \
+      || die 9 "could not copy the chain to $alias"
+    out="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$alias" \
+      "$remote_cch remote-open $(printf '%q' "$remote_chain") $next" 2>&1)" \
+      || die 5 "remote-open on $alias failed: $out"
+    pane="$(awk -F= '$1 == "pane" { print $2 }' <<<"$out")"
+    target="$(awk -F= '$1 == "target" { print $2 }' <<<"$out")"
+    [[ "$pane" == %* ]] || die 5 "remote-open on $alias gave no pane: $out"
+    py set "$chain_dir" "$next" "$(jq -nc --arg p "$pane" --arg t "$target" --arg a "$alias" '{tmux: {pane: $p, target: $t}, ssh_alias: $a}')"
+  else
+    local -a nw=(new-window -d -P -F '#{pane_id}' -e CLAUDE_CODE_RETRY_WATCHDOG=1 -n "$win" -c "$cwd")
+    local run_cmd; run_cmd="$(printf '%q successor-run %q %q' "$self" "$chain_dir" "$next")"
+    if [[ -n "$origin_wid" ]]; then
+      pane="$(tmux "${nw[@]}" -a -t "$origin_wid" "$run_cmd")" || die 5 "tmux new-window failed"
+    elif tmux has-session -t "=$target_session" 2>/dev/null; then
+      pane="$(tmux "${nw[@]}" -t "=$target_session:" "$run_cmd")" || die 5 "tmux new-window failed"
+    else
+      # No server yet: this call would start one with OUR environment, and the variables
+      # this Claude Code session injected would leak into every pane it ever opens.
+      local -a leak=()
+      local var
+      while IFS= read -r var; do
+        [[ "$var" =~ ^(CLAUDECODE|CLAUDE_CODE_.*|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_JOB_.*|ANTHROPIC_.*|AI_AGENT|GIT_EDITOR|TRACEPARENT|TRACESTATE|OTEL_.*|NoDefaultCurrentDirectoryInExePath|ENABLE_PROMPT_CACHING.*|COREPACK_ENABLE_AUTO_PIN)$ ]] \
+          && leak+=(-u "$var")
+      done < <(compgen -e)
+      pane="$(env ${leak[@]+"${leak[@]}"} tmux new-session -d -P -F '#{pane_id}' -e CLAUDE_CODE_RETRY_WATCHDOG=1 \
+        -s "$target_session" -n "$win" -c "$cwd" -x 200 -y 50 "$run_cmd" 2>/dev/null)" \
+        || pane="$(tmux "${nw[@]}" -t "=$target_session:" "$run_cmd")" || die 5 "tmux new-session failed"
+    fi
+    [[ "$pane" == %* ]] || die 5 "tmux did not return a pane id"
+    tmux set-option -w -t "$pane" @fsh_brief "$brief" 2>/dev/null || true
+    target="$target_session:$win"
+    py mark chain --sid "$succ_sid" --gen "$next" --chain-name "$(basename "$chain_dir")" --chain-dir "$chain_dir"
+    py set "$chain_dir" "$next" "$(jq -nc --arg p "$pane" --arg t "$target" \
+      --arg w "$(pane_field "$pane" '#{window_id}')" '{tmux: {pane: $p, target: $t, window: $w}}')"
+  fi
+
+  # 4. this session reads as handed off (statusline badge, tmux window badge)
+  py set "$chain_dir" "$gen" "$(jq -nc --arg t "${alias:+$alias:}$target" '{handoff: {target: $t}}')"
+  py mark passer --sid "$sid" --target "${alias:+$alias:}$target" --pane "${TMUX_PANE:-}" --brief "$brief" --state starting
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux set-option -w -t "$TMUX_PANE" @handoff_to "${alias:+$alias:}$target" 2>/dev/null || true
+    tmux set-option -w -t "$TMUX_PANE" @handoff_src "$TMUX_PANE $sid" 2>/dev/null || true
+  fi
+
+  # 5. the watcher: a tmux server job, so closing this pane cannot stop it. From here on
+  # it owns this session's marker (responded, held, ...).
+  local watching=0
+  if [[ -z "$no_kill" && "${FSH_KILL:-1}" != 0 && -n "${TMUX_PANE:-}" ]]; then
+    local envs="" v
+    for v in FSH_WATCH_POLL FSH_FIRST_RESPONSE_TIMEOUT FSH_HOLD_MAX FSH_QUIET_SECS FSH_QUIET_MAX FSH_KILL FSH_REMOTE_CCH \
+        HANDOFF_STATE_DIR HANDOFF_CHAIN_STATE_DIR CLAUDE_CONFIG_DIR CC_HANDOFF_SECRETS_FILE PATH HOME; do
+      [[ -z "${!v:-}" ]] || envs="$envs $v=$(printf '%q' "${!v}")"
+    done
+    if tmux run-shell -b "env$envs $(printf '%q %q watch %q %q' "$python" "$lib" "$chain_dir" "$gen") >> $(printf '%q' "$gd/watch.log") 2>&1"; then
+      watching=1
+    else
+      warn "could not start the watcher; this window will not close by itself"
+    fi
+  fi
+
+  # 6. wait for the successor: transcript started, then its first reply
+  local state="" deadline=$((SECONDS + ${FSH_ENGAGE_TIMEOUT:-180}))
+  while (( SECONDS < deadline )); do
+    if [[ -n "$alias" ]]; then
+      state="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$alias" "$remote_cch probe $succ_sid" 2>/dev/null || true)"
+    else
+      state="$(py probe "$succ_sid")"
+      [[ -n "$(pane_field "$pane" '#{pane_id}')" ]] || die 5 "the new window closed before the session replied (pane $pane)"
+    fi
+    [[ "$state" == responded ]] && break
+    sleep "$poll"
+  done
+  local code=0
+  if [[ "$state" == responded ]]; then
+    (( watching )) || py mark passer --sid "$sid" --target "${alias:+$alias:}$target" --pane "${TMUX_PANE:-}" --brief "$brief" --state ok
+  else
+    code=7
+  fi
+
+  say "launched: generation $next ($sname, session $succ_sid) in tmux window ${alias:+$alias:}$target (pane $pane), cwd $cwd"
+  say "brief:    $brief"
+  if [[ -n "$alias" ]]; then
+    say "attach:   ssh -t $alias tmux attach -t $target"
+  else
+    say "attach:   tmux attach -t $target   (inside tmux: tmux switch-client -t $target)"
+  fi
+  say "prompt:   $chain_dir/$(printf 'gen-%02d' "$next")/prompt.txt"
+  if (( code == 0 )); then
+    say "status:   the new session replied."
+  else
+    say "status:   the new session had not replied after ${FSH_ENGAGE_TIMEOUT:-180}s; its window is LEFT RUNNING. Inspect it; do not relaunch."
+  fi
+  if [[ -n "$no_kill" || "${FSH_KILL:-1}" == 0 || -z "${TMUX_PANE:-}" ]]; then
+    say "passer:   this window stays open (closing it is turned off, or this is not a tmux pane)."
+  elif (( njobs > 0 )); then
+    say "passer:   $njobs background job(s) still run here, so this window stays open until they finish or the new session runs \`cc-handoff adopt\`."
+  else
+    say "passer:   this window closes by itself shortly after the new session's first reply. Resume later with: claude --resume $sid"
+  fi
+  say "This session has handed off. Tell the user the lines above, then stop: do not continue the handed-off work here, even if a /goal hook asks; the new session carries the goal."
+  return "$code"
+}
+
+remote_preflight() {  # remote_preflight <alias> <local cwd>: key=value lines from the target
+  local alias="$1" cwd="$2" rel=""
+  case "$cwd" in "$HOME"/*) rel="${cwd#"$HOME"/}" ;; "$HOME") rel="." ;; esac
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$alias" \
+    "$remote_cch remote-preflight $(printf '%q %q %q' "$(identity)" "$rel" "$cwd") ${FSH_REMOTE_BRIEFS_DIR:+$(printf '%q' "$FSH_REMOTE_BRIEFS_DIR")}" 2>&1
+}
+
+copy_chain() {  # copy_chain <alias> <chain dir> <remote briefs dir> <passer gen> <passer transcript>
+  # One archive: the chain (briefs, rendered transcripts, records) plus the passer's raw
+  # JSONL, gzipped as gen-NN/session.jsonl.gz, so the whole history travels with the work.
+  local alias="$1" chain_dir="$2" rb="$3" gen="$4" raw="$5" name gz rc=0
+  name="$(basename "$chain_dir")"
+  gz="$chain_dir/$(printf 'gen-%02d' "$gen")/session.jsonl.gz"
+  # The raw JSONL is not redacted, so only its owner may read the copy, here and there. The
+  # umask applies only to a new file, so a gz left by an interrupted run is removed first.
+  (umask 077 && rm -f "$gz" && gzip -c "$raw" > "$gz") || return 1
+  # --no-same-owner: the target's own user owns the copy. Unpacked by root, tar would keep
+  # this host's uid, and that account on the target could edit what a root session reads.
+  tar -C "$(dirname "$chain_dir")" --exclude .lock -cf - "$name" \
+    | ssh -o BatchMode=yes -o ConnectTimeout=8 "$alias" \
+      "$(printf 'mkdir -p %q && tar --no-same-owner -C %q -xf - && chmod 700 %q' "$rb" "$rb" "$rb/$name")" || rc=$?
+  rm -f "$gz"
+  return "$rc"
+}
+
+# ------------------------------------------------------- the successor side ----
+cmd_successor_run() {
+  local chain_dir="${1:?chain dir}" gen="${2:?generation}"
+  need_python
+  local sd; sd="$chain_dir/$(printf 'gen-%02d' "$gen")"
+  get() { py get "$chain_dir" "$gen" "$1"; }
+  local cwd launcher model effort sid name prompt bypass
+  cwd="$(get cwd)"; launcher="$(get launcher)"; model="$(get model)"; effort="$(get effort)"
+  bypass="$(get bypass)"
+  sid="$(get session_id)"; name="$(get name)"; prompt="$(cat "$sd/prompt.txt")"
+  cd "$cwd" 2>/dev/null || cd "$HOME"
+  local limit; limit="$(tmux display-message -p '#{history_limit}' 2>/dev/null || true)"
+  [[ "$limit" =~ ^[0-9]+$ ]] || limit=50000
+  py history "$chain_dir" "$gen" --max-lines $((limit > 400 ? limit - 300 : 100)) || true
+  local pd rendered note="" buf
+  pd="$chain_dir/$(printf 'gen-%02d' $((gen - 1)))"; rendered="$pd/transcript.md"
+  if [[ -r "$rendered" ]]; then
+    buf="cc-handoff-$(sanitize "$(basename "$chain_dir")")-g$((gen - 1))"
+    if tmux load-buffer -b "$buf" "$rendered" 2>/dev/null; then
+      note="Copied the rendered transcript to tmux buffer $buf (paste: tmux paste-buffer -b $buf; list: tmux list-buffers)"
+    fi
+    if [[ "$(uname -s)" == Darwin ]] && command -v pbcopy >/dev/null 2>&1 && pbcopy < "$rendered" 2>/dev/null; then
+      note="${note:+$note, }and to the macOS clipboard"
+    elif command -v clip.exe >/dev/null 2>&1 && grep -qi microsoft /proc/version 2>/dev/null && clip.exe < "$rendered" 2>/dev/null; then
+      note="${note:+$note, }and to the Windows clipboard"
+    fi
+  fi
+  py footer "$chain_dir" "$gen" --buffer-note "$note" || true
+  # Claude Code's first frames can erase what is on the visible screen (the footer vanished
+  # in an 80x24 window, 2026-10-24). Scroll it up into the history first, so only blank
+  # lines are left to erase.
+  local rows i
+  rows="$(tmux display-message -p '#{pane_height}' 2>/dev/null || true)"
+  [[ "$rows" =~ ^[0-9]+$ ]] || rows=50
+  for ((i = 0; i < rows; i++)); do printf '\n'; done
+  py set "$chain_dir" "$gen" "{\"started_at\": $(date +%s)}" 2>/dev/null || true
+  local -a args=()
+  [[ -z "$model" ]] || args+=(--model "$model")
+  [[ -z "$effort" ]] || args+=(--effort "$effort")
+  local a
+  while IFS= read -r -d '' a; do args+=("$a"); done < <(py get "$chain_dir" "$gen" claude_args | "$python" -c \
+    'import json, sys; sys.stdout.write("".join(a + "\0" for a in json.loads(sys.stdin.read() or "[]")))')
+  args+=(--session-id "$sid" -n "$name" "$prompt")
+  local -a envs=()
+  while IFS= read -r -d '' a; do envs+=("$a"); done < <(py get "$chain_dir" "$gen" env | "$python" -c \
+    'import json, sys; d = json.loads(sys.stdin.read() or "{}"); sys.stdout.write("".join(f"{k}={v}\0" for k, v in d.items()))')
+  local rc=0
+  if [[ "$launcher" == claude ]]; then
+    # Permission checks off only when the passer ran that way (see passer_bypass).
+    local -a perm=()
+    [[ "$bypass" != True && "$bypass" != true && "$bypass" != 1 ]] || perm=(--dangerously-skip-permissions)
+    env ${envs[@]+"${envs[@]}"} claude ${perm[@]+"${perm[@]}"} "${args[@]}" || rc=$?
+  elif [[ -r "${ZDOTDIR:-$HOME}/.zshrc" ]] && command -v zsh >/dev/null 2>&1; then
+    # Launchers like yu and yuma are zsh functions from the login profile: run them the way
+    # a person would in a new window (they set their own permission mode). _MOTD_SHOWN skips
+    # a login dashboard that honors it.
+    env ${envs[@]+"${envs[@]}"} _MOTD_SHOWN=1 zsh -lic '"$@"' cc-handoff "$launcher" "${args[@]}" || rc=$?
+  else
+    # No zsh profile here (zsh -i would stop in its first-run wizard): the launcher has to
+    # be a command on PATH.
+    env ${envs[@]+"${envs[@]}"} "$launcher" "${args[@]}" || rc=$?
+  fi
+  printf '\ncc-handoff: Claude Code exited (status %s). Resume it with: claude --resume %s\n' "$rc" "$sid"
+  exec "${SHELL:-/bin/sh}" -l
+}
+
+cmd_adopt() {
+  need_python
+  local sid="${CLAUDE_CODE_SESSION_ID:-}" marker all="" ; local -a ids=()
+  while (( $# )); do
+    case "$1" in --all) all=--all ;; -*) die 2 "adopt: unknown option $1" ;; *) ids+=("$1") ;; esac
+    shift
+  done
+  [[ -n "$all" || ${#ids[@]} -gt 0 ]] || die 2 "adopt: name the job ids to take over (see the brief), or --all"
+  marker="$(py chain-of "$sid" 2>/dev/null)" || die 2 "this session is not a handoff successor (no chain marker for ${sid:-?})"
+  local chain_dir="${marker%%$'\t'*}" gen="${marker##*$'\t'}"
+  (( gen > 1 )) || die 2 "generation 1 has no passer to adopt from"
+  py adopt "$chain_dir" "$gen" $all ${ids[@]+"${ids[@]}"} >/dev/null
+  say "adopted ${all:+all jobs}${ids[*]:-} of generation $((gen - 1)); its window closes once nothing else holds it."
+}
+
+cmd_keep() {
+  need_python
+  local marker; marker="$(py chain-of "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null || true)"
+  local chain_dir gen
+  if [[ -n "$marker" ]]; then chain_dir="${marker%%$'\t'*}"; gen="${marker##*$'\t'}"
+  else die 2 "keep: this session has no chain record"; fi
+  py keep "$chain_dir" "$gen"
+  [[ -z "${TMUX_PANE:-}" ]] || tmux set-option -wu -t "$TMUX_PANE" @handoff_hold 2>/dev/null || true
+  say "this window stays open: the watcher will not close it."
+}
+
+cmd_status() {
+  need_python
+  local chain_dir="${1:-}"
+  if [[ -z "$chain_dir" ]]; then
+    local marker; marker="$(py chain-of "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null)" || die 2 "status: pass a chain directory"
+    chain_dir="${marker%%$'\t'*}"
+  fi
+  py status "$chain_dir"
+}
+
+cmd_jobs() {
+  need_python
+  [[ -n "${CLAUDE_PID:-}" ]] || die 2 "jobs runs inside a Claude Code session (CLAUDE_PID is unset)"
+  py jobs --pid "$CLAUDE_PID" --transcript "$(transcript_of "${CLAUDE_CODE_SESSION_ID:-}")" --exclude-ancestors-of "$$"
+}
+
+cmd_remote_preflight() {  # <identity> <cwd relative to HOME, or ""> <absolute cwd> [<briefs dir>]
+  local want_id="$1" rel="$2" abs="$3" rb="${4:-$briefs_root}" cwd problems=""
+  if [[ -n "$rel" ]]; then cwd="$HOME/$rel"; [[ "$rel" == . ]] && cwd="$HOME"; else cwd="$abs"; fi
+  local t; for t in tmux zsh claude python3 jq; do command -v "$t" >/dev/null 2>&1 || problems="$problems missing:$t"; done
+  [[ "$(identity)" == "$want_id" ]] || problems="$problems identity:$(identity)!=$want_id"
+  [[ -d "$cwd" ]] || problems="$problems no-cwd:$cwd"
+  if [[ -z "$problems" ]] && command -v python3 >/dev/null 2>&1; then
+    is_trusted "$cwd" || problems="$problems untrusted:$cwd(run claude there once and answer its trust dialog)"
+  fi
+  printf 'version=%s\nhome=%s\nmachine=%s\nidentity=%s\ncwd=%s\nbriefs=%s\nuid=%s\n' "$VERSION" "$HOME" \
+    "$(host_id)" "$(identity)" "$cwd" "$rb" "${FSH_PREFLIGHT_UID:-$(id -u)}"   # FSH_PREFLIGHT_UID: for tests
+  if [[ -n "$problems" ]]; then printf 'problems=%s\n' "${problems# }"; return 1; fi
+}
+
+cmd_remote_open() {  # <chain dir on this host> <gen>
+  local chain_dir="$1" gen="$2" name sid win taken n=2 pane cwd
+  need_python
+  sid="$(py get "$chain_dir" "$gen" session_id)"; name="$(py get "$chain_dir" "$gen" name)"
+  cwd="$(py get "$chain_dir" "$gen" cwd)"
+  win="$name"
+  taken="$(tmux list-windows -t "=$shared_session" -F '#{window_name}' 2>/dev/null || true)"
+  while grep -Fxq -- "$win" <<<"$taken"; do win="$name-$n"; n=$((n + 1)); done
+  local run_cmd; run_cmd="$(printf '%q successor-run %q %q' "$self" "$chain_dir" "$gen")"
+  if tmux has-session -t "=$shared_session" 2>/dev/null; then
+    pane="$(tmux new-window -d -P -F '#{pane_id}' -e CLAUDE_CODE_RETRY_WATCHDOG=1 -t "=$shared_session:" -n "$win" -c "$cwd" "$run_cmd")"
+  else
+    pane="$(tmux new-session -d -P -F '#{pane_id}' -e CLAUDE_CODE_RETRY_WATCHDOG=1 -s "$shared_session" -n "$win" -c "$cwd" -x 200 -y 50 "$run_cmd")"
+  fi
+  tmux set-option -w -t "$pane" @fsh_brief "$chain_dir/$(printf 'gen-%02d' $((gen - 1)))/brief.md" 2>/dev/null || true
+  py mark chain --sid "$sid" --gen "$gen" --chain-name "$(basename "$chain_dir")" --chain-dir "$chain_dir"
+  py set "$chain_dir" "$gen" "$(jq -nc --arg p "$pane" --arg t "$shared_session:$win" '{tmux: {pane: $p, target: $t}}')"
+  printf 'pane=%s\ntarget=%s\n' "$pane" "$shared_session:$win"
+}
+
+# --------------------------------------------------------------------- main ----
+cmd="${1:-}"; [[ $# -eq 0 ]] || shift
+case "$cmd" in
+  init) cmd_init "$@" ;;
+  launch) cmd_launch "$@" ;;
+  adopt) cmd_adopt "$@" ;;
+  keep) cmd_keep "$@" ;;
+  status) cmd_status "$@" ;;
+  jobs) cmd_jobs "$@" ;;
+  render)
+    need_python
+    [[ $# -ge 1 ]] || die 2 "render: which transcript?"
+    if [[ "${2:-}" == -o ]]; then py render "$1" --out "${3:?-o needs a file}" >/dev/null; say "${3}"; else py render "$1"; fi ;;
+  successor-run) cmd_successor_run "$@" ;;
+  watch) need_python; py watch "$@" ;;
+  probe)
+    need_python
+    state="$(py probe "${1:?session id}")"
+    if [[ "$state" == waiting && -n "${2:-}" ]] \
+        && tmux list-windows -a -F '#{@fsh_brief}' 2>/dev/null | grep -Fxq -- "$2"; then
+      state=opened   # its window is up, Claude Code has not written the transcript yet
+    fi
+    say "$state" ;;
+  get) need_python; py get "$@" ;;
+  set) need_python; py set "$@" ;;
+  remote-preflight) cmd_remote_preflight "$@" ;;
+  remote-open) cmd_remote_open "$@" ;;
+  --version|version) say "cc-handoff $VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *) die 2 "unknown command $cmd (cc-handoff --help)" ;;
+esac
