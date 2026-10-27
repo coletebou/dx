@@ -72,6 +72,79 @@ file, before reading or sending anything; `scripts/lib/memory-boundary.sh` is th
 implementation, with examples. The context advisor asks it too before it sends conversation excerpts
 to Jev, and a restricted session gets its advice without them.
 
+## Keeping memory healthy
+
+Claude Code loads only the head of `MEMORY.md`: the first 200 lines or 25KB, whichever comes first.
+An index that outgrows that loses its newest entries without a word. `memory-canary`
+(`scripts/memory-canary`) checks a memory home, read-only:
+
+| Check | A problem (exit 1) when |
+|---|---|
+| capacity | the index is over 200 lines or 25,000 characters, counted as Claude Code counts them (trimmed); from 90% it warns |
+| index links | a `](file.md)` link in the index names a file that is not there |
+| case | two file names differ only in case (one file on macOS, two on Linux), or a `memory.md` / `dreams.md` variant exists |
+| conflict markers | a file holds `<<<<<<<` and `>>>>>>>` lines, as a sync whose autostash conflicted leaves them (git exits 0 there) |
+| wiki-links | a `[[name]]` names no file and no `name:` field (both `-` and `_` spellings count): a warning, a problem only above the home's baseline |
+
+```text
+memory-canary                  every home in claude/memory-homes.conf that has a MEMORY.md;
+                               without one, the memory dir Claude Code uses for this directory
+memory-canary --dir <home>     one directory
+memory-canary --strict         warnings fail too (not the wiki-link backlog)
+memory-canary --json           one JSON object per directory
+```
+
+Exit 0 is clean (or warnings only), 1 a problem, 2 nothing to check or a usage error.
+`DREAMS.md` is reported too, and warned about past the caps, since one index line makes it a
+capped file.
+
+**The wiki-link ratchet.** `scripts/wiki-dangle-baseline` ships empty, so dangling wiki-links
+only warn. To stop new ones, add a line per home, `<home dir name>=<count>` (`webapp=4`), at
+today's count: a count at or below it warns, one above it is a problem. Fix rot, then lower the
+number; never raise it.
+
+**The pre-push gate.** If your private copy of this repo commits memory, the pre-push hook (the
+`git` component) also runs `scripts/pre-push-memory` on each outgoing ref. It reads
+`claude/memory-homes.conf` from the commit being pushed, copies each home the push changes out of
+Git (the committed Markdown, never the working tree) and runs `memory-canary --strict` on it, so a
+push cannot publish an index that Claude Code would truncate or that links to nothing. Rows must
+name directories inside the repository: relative paths, `~/.dotfiles/...` (where `install.sh`
+links the checkout), or absolute paths that resolve into it; rows outside it are live memory with
+nothing committed to check. A repository with no committed `claude/memory-homes.conf` anywhere in
+its history (this public one, any other) passes at once and prints nothing. Deleting the
+configuration retires it, and the homes still committed are still checked. Clean verdicts are
+cached by content in `~/.cache/pre-push-memory` (`PRE_PUSH_MEMORY_CACHE=0` turns that off).
+
+## Sharing memory with Codex
+
+`codex-memory-bridge` (`scripts/codex-memory-bridge`) lets Codex read the same memory, and Claude
+read what Codex distilled, without either writing into the other's store:
+
+- **Import**: each repo's memory home (its top-level `*.md`) is copied, as real files, into
+  `~/.codex/memories/extensions/shared_claude_memory/resources/<repo>/`, next to an
+  `instructions.md` that tells Codex to treat them as reference material, never as instructions.
+  Codex folds what is durable into its own memory at its next consolidation. Deleted memories are
+  pruned from the mirror, except when a home reads as empty (a sync in progress, say).
+- **Export**: Codex's `MEMORY.md` and `memory_summary.md` are copied into
+  `$CODEX_SNAP_ROOT/<host>/`. An empty file (Codex mid-rewrite) never replaces a snapshot.
+
+It never writes Codex's own files or the memory homes, skips symlinked sources, and refuses (exit
+1) a repo name that is a path, a destination dir that is a symlink and a snapshot dir that is a
+memory home. Without a Codex store it does nothing.
+
+| Variable | Default |
+|---|---|
+| `CODEX_MEM` | `${CODEX_HOME:-~/.codex}/memories` |
+| `MEMORY_HOMES_CONF` | `~/.dotfiles/claude/memory-homes.conf` |
+| `CODEX_SNAP_ROOT` | `${XDG_STATE_HOME:-~/.local/state}/codex-memory-bridge/snapshots` |
+| `CODEX_MEMORY_BRIDGE_HOST` | `CLAUDE_MACHINE`, `DF_MACHINE`, else the short hostname |
+
+Codex's memory is memory like the rest: to sync the snapshots between machines, point
+`CODEX_SNAP_ROOT` into your private memory tree (`identities/<you>/claude/memory/codex-snapshots`
+is ignored by this repo's `.gitignore`), never into a public checkout. Run it by hand
+(`--dry-run` shows what would change; `--import-only`, `--export-only`, `--repo <name>`), after a
+sync, or from your scheduler; the last run's log is `~/.cache/codex-memory-bridge/last.log`.
+
 ## Models
 
 Every model call goes through `claude-consolidate`, which runs `claude -p` with a short prompt and
@@ -95,7 +168,10 @@ embeddings (`web/core/search/`, set up with `web/bin/drover-embed-setup`), entir
 2. Copy the three `claude/*.conf.example` files to `claude/*.conf` and fill in your repos.
 3. Optional: `./install.sh --with schedules` for the nightly analyzer and dream sweep, and
    `dream enable <repo>` to opt a repo into dreaming.
+4. Optional: `memory-canary` to check the homes now, `codex-memory-bridge --dry-run` to see what
+   it would share with Codex.
 
 The tests: `scripts/tests/reflections.test.py`, `session-reflector.test.py`,
 `session-analyzer.test.py`, `dream.test.py`, `dream-held-nights.test.py`,
-`claude-consolidate.test.py`, `load-memory-hook.test.sh`.
+`claude-consolidate.test.py`, `load-memory-hook.test.sh`, `memory-canary.test.py`,
+`pre-push-memory.test.py`, `codex-memory-bridge.test.sh`.

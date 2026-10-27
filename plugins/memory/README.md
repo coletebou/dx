@@ -20,6 +20,10 @@ The skills drive CLIs that live in the dotfiles part of this repo (`scripts/`), 
 that feed the same store (the session reflector, the load-memory and reflections-context hooks). From
 a clone, `./install.sh --with memory` links the CLIs into `~/.local/bin` and the skills into
 `~/.claude/skills`, and `./install.sh --with schedules` adds the nightly `dream-prep` + `dream sweep`.
+Two of those CLIs need no skill: `memory-canary` checks a memory home (the `MEMORY.md` size limits
+Claude Code loads within, broken links, case collisions, conflict markers) and runs from the
+pre-push hook for a repository that commits memory; `codex-memory-bridge` shares the memory homes
+with Codex and snapshots what Codex distilled.
 
 The memory itself (memory files, reflections, diaries, analysis output) is data, not code: keep it
 in a private repository. This repo's `.gitignore` keeps it out of a fork. The design, the config
