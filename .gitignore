@@ -9,3 +9,12 @@ claude/settings.local.json
 claude/mcp.local.json
 # Claude Code's own per-checkout state, worktrees included.
 .claude/
+# Agent memory is data, not code: keep it in a private repository, never in a
+# fork of this one (docs/memory/README.md).
+identities/*/claude/memory/
+.dreams/
+.analysis/
+# Your real memory and dreaming configs name your repos and hosts; only the
+# claude/*.conf.example templates are committed. Same for synced state.
+claude/*.conf
+claude/*.jsonl

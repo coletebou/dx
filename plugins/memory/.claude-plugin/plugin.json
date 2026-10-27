@@ -1,0 +1,10 @@
+{
+  "name": "memory",
+  "description": "Agent memory that improves itself: an end-of-session retrospective that captures learnings, updates rules and records open follow-ups (reflect), a nightly three-phase consolidation that promotes durable memories (dreaming), and a transcript scan for unfinished work, repeated corrections and memory candidates (session-analyzer)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cole Tebou"
+  },
+  "license": "MIT",
+  "keywords": ["claude-code", "codex", "memory", "retrospective", "reflections"]
+}

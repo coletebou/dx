@@ -29,6 +29,13 @@
       "version": "1.0.0",
       "source": "./plugins/tmux",
       "category": "utilities"
+    },
+    {
+      "name": "memory",
+      "description": "End-of-session retrospectives that capture learnings and open follow-ups (reflect), nightly memory consolidation (dreaming), and transcript analysis (session-analyzer)",
+      "version": "1.0.0",
+      "source": "./plugins/memory",
+      "category": "workflow"
     }
   ]
 }
