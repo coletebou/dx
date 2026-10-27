@@ -304,6 +304,16 @@ lacks "...not in the log window" "=== 1 (" "$(tmux capture-pane -p -t "=proj-par
 sleep 1   # the banner line ran by now; an injected `>PWNED` would have made the file
 equal "the branch name ran nothing" "" "$(find "$tmp/ext" "$repo" -name PWNED 2>/dev/null)"
 equal "the prompt is not left in the worktree" "" "$(git -C "$tmp/ext/proj-1" status --porcelain 2>&1)"
+# macOS caps a terminal's pending input at 1024 bytes, and every line typed before the shell has
+# started counts against it: the window gets one short line, and the rest comes from a script.
+screen="$(tmux capture-pane -p -J -t "$(win_of 1)")"
+lacks "the window is not typed the exports themselves" "export PARALLEL_LOG=" "$screen"
+typed="$(grep -E "^.*\. '[^']*/1\.sh'\$" <<<"$screen" | head -n 1)"
+equal "it is typed one line that sources the window's script" "1" "$([[ -n "$typed" ]] && echo 1 || echo 0)"
+equal "...well under the 1024 bytes" "short" "$( (( ${#typed} > 0 && ${#typed} < 512 )) && echo short || echo "${#typed} bytes")"
+tmux send-keys -t "$(win_of 1)" 'echo "tag=$PARALLEL_TAG"' C-m
+until_banner "$(win_of 1)" "tag=1"
+check "...and the exports reach the window's shell" "tag=1" "$(tmux capture-pane -p -t "$(win_of 1)")"
 out="$(in_repo "$pw" teardown "$tmp/numeric.tsv" 2>&1)"
 tmux set -g base-index 0
 tmux kill-session -t "=keeper"

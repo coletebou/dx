@@ -634,32 +634,37 @@ cmd_launch() {
         # .envrc; we export it directly too in case direnv isn't installed
         # and the user runs `docker compose` before sourcing .envrc.
         local compose_project="${repo_name}-${tag}"
-        tmux send-keys -t "$win" \
-            "export PARALLEL_LOG=$(printf %q "$log_file") PARALLEL_TAG=$(printf %q "$tag") PARALLEL_BRANCH=$(printf %q "$branch") PARALLEL_SESSION_ID=$(printf %q "$sid") PARALLEL_TRANSCRIPT=$(printf %q "$jsonl") PARALLEL_APPEND=$(printf %q "$PW_BIN_DIR/pw-append") COMPOSE_PROJECT_NAME=$(printf %q "$compose_project")" C-m
-        # %q, like the exports: a branch name may hold quotes or `;` (git allows both).
-        tmux send-keys -t "$win" \
-            "echo $(shq "=== $tag ($branch) ===") && pwd && git branch --show-current && echo $(shq "transcript: $jsonl")" C-m
-
         # Write the prompt to a per-session file; pass it to the engine via an
         # xargs-safe path.
         local prompt_path="$prompt_dir/$tag.md"
         printf '%s\n' "${PROMPT_BODIES[$i]}" > "$prompt_path"
 
-        if [ "${ENGINES[$i]}" = codex ]; then
-            local cmodel="${CODEX_MODELS[$i]}" ceffort="${CODEX_EFFORTS[$i]}"
-            # Autonomy flag: bypass (match claude --dangerously-skip-permissions)
-            # or full-auto (workspace-write sandbox; denies network by default).
-            local codex_auto="--dangerously-bypass-approvals-and-sandbox"
-            [ "$PW_CODEX_SANDBOX" = "full-auto" ] && codex_auto="--full-auto"
-            # Always ChatGPT auth: unset OPENAI_API_KEY (and relay) in the
-            # window so codex uses the stored ChatGPT login in ~/.codex/auth.json
-            # instead of an ambient API key. Reasoning effort is set via -c.
-            tmux send-keys -t "$win" \
-                "unset OPENAI_API_KEY OPENAI_BASE_URL; codex $codex_auto -m $(printf %q "$cmodel") -c model_reasoning_effort=$(printf %q "\"$ceffort\"") \"\$(cat $(printf %q "$prompt_path"))\"" C-m
-        else
-            tmux send-keys -t "$win" \
-                "$PW_CLAUDE_CMD --session-id $sid \"\$(cat $(printf %q "$prompt_path"))\"" C-m
-        fi
+        # The window's lines go in a script beside the prompt, and the window
+        # gets one short line that sources it. Typed one by one, they wait in
+        # the terminal's input queue until the shell has started, and macOS
+        # caps that queue at 1024 bytes: the rest, the agent's command among
+        # it, was dropped. %q, like the exports: a branch name may hold quotes
+        # or `;` (git allows both); shq for the banner, which zsh would read
+        # as a command lookup when a word starts with `=`.
+        local setup_path="$prompt_dir/$tag.sh"
+        {
+            printf '%s\n' "export PARALLEL_LOG=$(printf %q "$log_file") PARALLEL_TAG=$(printf %q "$tag") PARALLEL_BRANCH=$(printf %q "$branch") PARALLEL_SESSION_ID=$(printf %q "$sid") PARALLEL_TRANSCRIPT=$(printf %q "$jsonl") PARALLEL_APPEND=$(printf %q "$PW_BIN_DIR/pw-append") COMPOSE_PROJECT_NAME=$(printf %q "$compose_project")"
+            printf '%s\n' "echo $(shq "=== $tag ($branch) ===") && pwd && git branch --show-current && echo $(shq "transcript: $jsonl")"
+            if [ "${ENGINES[$i]}" = codex ]; then
+                local cmodel="${CODEX_MODELS[$i]}" ceffort="${CODEX_EFFORTS[$i]}"
+                # Autonomy flag: bypass (match claude --dangerously-skip-permissions)
+                # or full-auto (workspace-write sandbox; denies network by default).
+                local codex_auto="--dangerously-bypass-approvals-and-sandbox"
+                [ "$PW_CODEX_SANDBOX" = "full-auto" ] && codex_auto="--full-auto"
+                # Always ChatGPT auth: unset OPENAI_API_KEY (and relay) in the
+                # window so codex uses the stored ChatGPT login in ~/.codex/auth.json
+                # instead of an ambient API key. Reasoning effort is set via -c.
+                printf '%s\n' "unset OPENAI_API_KEY OPENAI_BASE_URL; codex $codex_auto -m $(printf %q "$cmodel") -c model_reasoning_effort=$(printf %q "\"$ceffort\"") \"\$(cat $(printf %q "$prompt_path"))\""
+            else
+                printf '%s\n' "$PW_CLAUDE_CMD --session-id $sid \"\$(cat $(printf %q "$prompt_path"))\""
+            fi
+        } > "$setup_path"
+        tmux send-keys -t "$win" ". $(shq "$setup_path")" C-m
     done
 
     tmux select-window -t "$first_win"
