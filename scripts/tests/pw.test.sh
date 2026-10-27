@@ -5,7 +5,8 @@
 # stops a launch before anything is created. Teardown removes the worktrees where
 # launch recorded them, even after the setting moved, and those of a run in the other
 # mode, but never a directory git does not list as a worktree of the repo, nor one a
-# line appended to the log names. Hermetic: a scratch origin and
+# line appended to the log names, nor another manifest's fleet (its session or its
+# worktree of the same tag). Hermetic: a scratch origin and
 # clone, HOME in a temp dir (pw's logs, wt-helper's cache), a private tmux server (its
 # own TMUX_TMPDIR, no config, /bin/sh panes) and a fake `claude`, pinned through
 # PW_ENGINE and PW_CLAUDE_CMD and checked to be what runs, so nothing touches the
@@ -41,6 +42,7 @@ ok()  { printf '  ok   %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  FAIL %s\n       want: %s\n       got:  %s\n' "$1" "$2" "$3"; fail=$((fail + 1)); }
 check() { if [[ "$3" == *"$2"* ]]; then ok "$1"; else bad "$1" "*$2*" "$3"; fi; }
 equal() { if [[ "$3" == "$2" ]]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
+lacks() { if [[ "$3" != *"$2"* ]]; then ok "$1"; else bad "$1" "no '$2'" "$3"; fi; }
 
 # Without tmux or wt-helper there is nothing to run. CI sets PW_TEST_REQUIRE_DEPS=1, so a
 # missing one fails the run there instead of passing it as a skip.
@@ -146,6 +148,8 @@ equal "a bootstrapped launch succeeds" 0 "$?"
 equal "the hook ran in the worktree, with its tag and the source repo" \
   "iota|$(cd "$tmp/ext/proj-iota" && pwd -P)|$prepo" "$(cat "$tmp/ext/proj-iota/hook-ran" 2>&1)"
 check "bootstrap still writes .envrc" "COMPOSE_PROJECT_NAME=proj-iota" "$(cat "$tmp/ext/proj-iota/.envrc" 2>&1)"
+equal "...which an agent's git add -A leaves out, as it does the prompt" "?? hook-ran" \
+  "$(git -C "$tmp/ext/proj-iota" status --porcelain 2>&1)"
 out="$(in_repo "$pw" teardown "$tmp/hook.tsv" 2>&1)"
 manifest hookfail kappa
 out="$(in_repo PW_BOOTSTRAP_HOOK='exit 3' "$pw" launch "$tmp/hookfail.tsv" 2>&1)"
@@ -198,6 +202,67 @@ out="$(in_repo "$pw" teardown "$tmp/five.tsv" 2>&1)"
 equal "teardown succeeds" 0 "$?"
 equal "...removing the real run's worktree" "gone" "$(gone "$tmp/ext/proj-eps")"
 equal "...and the test run's" "gone" "$(gone "$tmp/ext/proj-test-eps")"
+
+echo "teardown leaves another manifest's fleet alone"
+manifest nine iota   # a --test fleet: session proj-parallel-test, worktree proj-test-iota
+manifest ten iota    # a real fleet of the same tag, from another manifest
+# Both launches in the same second, as a script starting two fleets would: a clock that
+# stands still for pw's log name (any other date call passes through).
+mkdir -p "$tmp/still"
+printf '#!/bin/sh\n[ "$1" = "+%%Y%%m%%d-%%H%%M%%S" ] && { echo 20260101-000000; exit 0; }\nexec %s "$@"\n' \
+  "$(command -v date)" > "$tmp/still/date"
+chmod +x "$tmp/still/date"
+out="$(in_repo PATH="$tmp/still:$PATH" "$pw" launch "$tmp/nine.tsv" --test --no-bootstrap 2>&1)"
+equal "a --test launch of one manifest succeeds" 0 "$?"
+out="$(in_repo PATH="$tmp/still:$PATH" "$pw" launch "$tmp/ten.tsv" --no-bootstrap 2>&1)"
+equal "...and a real launch of another in the same second" 0 "$?"
+equal "...each with a log of its own" "2" "$(cat "$tmp/nine.tsv.log-path" "$tmp/ten.tsv.log-path" | sort -u | wc -l | tr -d ' ')"
+out="$(in_repo "$pw" teardown "$tmp/ten.tsv" 2>&1)"
+equal "the second one's teardown succeeds" 0 "$?"
+equal "...removing its worktree" "gone" "$(gone "$tmp/ext/proj-iota")"
+equal "...and its session" "down" "$(session_up)"
+equal "...but not the other manifest's worktree of the same tag" "present" "$(gone "$tmp/ext/proj-test-iota")"
+equal "...nor that fleet's session" "up" "$(tmux has-session -t "=proj-parallel-test" 2>/dev/null && echo up || echo down)"
+check "...saying whose it is" "Leaving tmux session proj-parallel-test: it runs $tmp/nine.tsv" "$out"
+out="$(in_repo "$pw" teardown "$tmp/nine.tsv" 2>&1)"
+equal "that manifest's own teardown succeeds" 0 "$?"
+equal "...removing the rest" "gone" "$(gone "$tmp/ext/proj-test-iota")"
+
+echo "launch types each agent's lines into its own window, quoted"
+# base-index 1 (a common setting): a numeric tag read as a window index would be the log.
+tmux new-session -d -s keeper
+tmux set -g base-index 1
+printf '1\tfeat/one\tnothing to do\n2\tfix/a'"'"';>PWNED;#\tnothing to do\n' > "$tmp/numeric.tsv"
+out="$(in_repo "$pw" launch "$tmp/numeric.tsv" --no-bootstrap 2>&1)"
+equal "a launch with numeric tags and a branch holding quotes succeeds" 0 "$?"
+win_of() { tmux list-windows -t "=proj-parallel" -F '#{window_name} #{window_id}' | awk -v n="$1" '$1 == n { print $2 }'; }
+until_banner() { local i; for ((i = 0; i < 50; i++)); do tmux capture-pane -p -t "$1" | grep -qF "$2" && return 0; sleep 0.2; done; return 1; }
+until_banner "$(win_of 1)" "=== 1 (feat/one) ==="
+check "tag 1's banner is in tag 1's window" "=== 1 (feat/one) ===" "$(tmux capture-pane -p -t "$(win_of 1)")"
+until_banner "$(win_of 2)" "=== 2 ("
+check "...and tag 2's, with the branch as written" "=== 2 (fix/a';>PWNED;#) ===" "$(tmux capture-pane -p -t "$(win_of 2)")"
+lacks "...not in the log window" "=== 1 (" "$(tmux capture-pane -p -t "=proj-parallel:log")"
+sleep 1   # the banner line ran by now; an injected `>PWNED` would have made the file
+equal "the branch name ran nothing" "" "$(find "$tmp/ext" "$repo" -name PWNED 2>/dev/null)"
+equal "the prompt is not left in the worktree" "" "$(git -C "$tmp/ext/proj-1" status --porcelain 2>&1)"
+out="$(in_repo "$pw" teardown "$tmp/numeric.tsv" 2>&1)"
+tmux set -g base-index 0
+tmux kill-session -t "=keeper"
+
+echo "broadcast reaches every agent pane of a split window"
+cat > "$tmp/fake_claude_tui.py" <<'EOF'
+import time
+print("\u2500" * 40 + "\n\u276f \n" + "\u2500" * 40 + "\n  bypass permissions on (shift+tab to cycle)", flush=True)
+time.sleep(600)
+EOF
+fake_tui="exec bash -c 'exec -a claude python3 $tmp/fake_claude_tui.py'"
+tmux new-session -d -s bcast -n agents "$fake_tui"
+tmux split-window -t "=bcast:agents" "$fake_tui"
+for p in $(tmux list-panes -t "=bcast:agents" -F '#{pane_id}'); do until_banner "$p" "bypass permissions on"; done
+out="$(in_repo "$pw" broadcast bcast "hello" --dry-run 2>&1)"
+equal "a dry-run broadcast to a split window succeeds" 0 "$?"
+check "...and would send to both agent panes" "2 engaged, 0 skipped" "$out"
+tmux kill-session -t "=bcast"
 
 echo "teardown goes by the launch header alone, and removes only worktrees of the repo"
 manifest six zeta

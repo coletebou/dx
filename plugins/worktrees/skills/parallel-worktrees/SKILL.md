@@ -195,14 +195,19 @@ The user wants to split an independent-subtasks plan (e.g., a feature with 3–7
    ```
    It tears down the repo recorded in the run's log header (`# repo=`, found
    through `<manifest>.log-path`), so while that record exists it works from
-   any directory. It removes the worktrees at the paths that header records
-   (`# tag=... worktree=`, read only up to the blank line that ends the
-   header, since agents append to the log after it), so a
+   any directory. It kills this manifest's sessions only: launch marks each
+   session with its manifest (`@pw_manifest`), and a `--test` fleet and a
+   real one share the repo's two session names, so the other one may be
+   another manifest's fleet, which it leaves running. It removes the
+   worktrees at the paths the launch logs of this manifest record (every run
+   of it, both modes; `# tag=... worktree=`, read only up to the blank line
+   that ends the header, since agents append to the log after it), so a
    `worktree.baseDirectory` or `WT_*` lever changed since launch does not
    leave them behind, and also the ones `wt-helper --print-base-dir` places
-   now under the plain and `test-` names, which catches a run of the other
-   mode whose log the sidecar no longer names. It removes only directories
-   git lists as linked worktrees of that repo and says which others it left.
+   now under the plain and `test-` names when they are on this manifest's
+   branch for that tag (another manifest may use the same tag). It removes
+   only directories git lists as linked worktrees of that repo and says
+   which others it left.
    Without the record it falls back to the main checkout of the repo you run
    it from. If no session, worktree, or (with `--delete-branches`) branch
    matches, it exits 1, lists what it tried, and keeps the sidecar.

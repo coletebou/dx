@@ -19,8 +19,9 @@
 #     The bracketed tag is the grep token for unstack/status. Marker is
 #     advisory only — run 'stack-claude unstack' before pushing.
 #   - Squash merge + single commit keeps the feature-branch log clean.
-#   - Records the pre-stack SHA in .git/stack-claude-head so unstack is
-#     deterministic. Self-heals if the file goes stale.
+#   - Records the pre-stack SHA in .git/stack-claude-head for status and for
+#     a marker that is no longer on top. Unstack of a top marker resets to its
+#     parent, whatever the record says (the record is per worktree, not branch).
 #   - No hardcoded default branch: caller MUST set $STACK_CLAUDE_BRANCH or
 #     pass -b. This prevents rot when whatever issue branch you're carrying
 #     (e.g. 123-claude-md-refactor) merges and the ref disappears.
@@ -154,17 +155,17 @@ cmd_unstack() {
     # Happy path: marker at top of HEAD.
     if git log -1 --pretty=%B | grep -qF "$MARKER"; then
         need_clean_tree
+        # The marker is the top commit, a one-parent squash, so HEAD^ is the
+        # pre-stack state by definition. The record is not a target: it is one
+        # file per worktree, not per branch, so after a stack on another branch
+        # of this worktree it holds that branch's base. Any ancestor of HEAD
+        # would pass a check, and resetting to it drops this branch's commits.
+        target_sha=$(git rev-parse HEAD^)
         if [[ -f "$git_dir/stack-claude-head" ]]; then
             pre_sha=$(<"$git_dir/stack-claude-head")
-            if git rev-parse --verify --quiet "$pre_sha" >/dev/null \
-               && git merge-base --is-ancestor "$pre_sha" HEAD; then
-                target_sha="$pre_sha"
-            fi
+            [[ "$(git rev-parse --verify --quiet "$pre_sha^{commit}" 2>/dev/null)" == "$target_sha" ]] \
+                || warn "the recorded pre-stack SHA ($pre_sha) is not this stack's base; using the marker's parent"
         fi
-        # Fallback: if recorded SHA is missing/stale/unreachable, use HEAD^.
-        # This is only safe because we already confirmed the marker is the
-        # top commit — HEAD^ is definitively the pre-stack state.
-        [[ -z "${target_sha:-}" ]] && target_sha=$(git rev-parse HEAD^)
 
         log "resetting HEAD to $(git rev-parse --short "$target_sha")"
         git reset --hard "$target_sha"

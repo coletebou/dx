@@ -108,6 +108,23 @@ out="$(in_repo "$sb" -p nope -n new6 2>&1)"
 equal "an unknown profile fails" 1 "$?"
 check "...by name" "profile not found: nope" "$out"
 
+echo "stack-branches picks a profile with fzf on a terminal"
+if command -v python3 >/dev/null 2>&1; then
+  profile pick-one wip-a
+  profile pick-two wip-b
+  mkdir -p "$tmp/fakebin"
+  # Stands in for fzf: takes the rows, picks pick-two's.
+  printf '#!/bin/sh\ncat > /dev/null\necho "pick-two   1 branches  test"\n' > "$tmp/fakebin/fzf"
+  chmod +x "$tmp/fakebin/fzf"
+  out="$(PATH="$tmp/fakebin:$PATH" python3 -c 'import pty, sys; sys.exit(pty.spawn(sys.argv[1:]) >> 8)' \
+    "$sb" profiles remove < /dev/null 2>&1)"
+  check "profiles remove with no name asks fzf on a terminal" "removed profile: pick-two" "$out"
+  equal "...and removes the one picked" "present gone" \
+    "$(for p in pick-one pick-two; do [[ -e "$STACK_BRANCHES_CONFIG/profiles.d/$p.json" ]] && echo present || echo gone; done | tr '\n' ' ' | sed 's/ $//')"
+else
+  ok "# SKIP python3 not installed (needed for a pty)"
+fi
+
 echo "stack-claude squashes a branch onto HEAD and unstacks it"
 G -C "$repo" switch -q -c feature master
 printf 'feature\n' > "$repo/feature.txt"
@@ -135,6 +152,22 @@ equal "...back to the pre-stack commit" "$pre" "$(G -C "$repo" rev-parse HEAD)"
 equal "...without the stacked files" "gone" "$([[ -e "$repo/CLAUDE.md" ]] && echo present || echo gone)"
 equal "...and the record is removed" "gone" "$([[ -e "$repo/.git/stack-claude-head" ]] && echo present || echo gone)"
 check "status says it is not stacked" "not stacked" "$(in_repo "$sc" status 2>&1)"
+
+echo "stack-claude unstack after a stack on another branch of the same worktree"
+G -C "$repo" switch -q feature
+G -C "$repo" switch -q -c feature-a master
+printf 'a1\n' > "$repo/a1.txt"; G -C "$repo" add a1.txt; G -C "$repo" commit -qm a1
+printf 'a2\n' > "$repo/a2.txt"; G -C "$repo" add a2.txt; G -C "$repo" commit -qm a2
+a_tip="$(G -C "$repo" rev-parse HEAD)"
+in_repo "$sc" -b origin/tooling >/dev/null 2>&1
+G -C "$repo" switch -q -c feature-b master
+in_repo "$sc" -b origin/tooling >/dev/null 2>&1   # records master, the base both share
+G -C "$repo" switch -q feature-a
+out="$(in_repo "$sc" unstack 2>&1)"
+equal "unstack on the first branch succeeds" 0 "$?"
+equal "...back to that branch's own pre-stack commit" "$a_tip" "$(G -C "$repo" rev-parse HEAD)"
+check "...saying the record was another stack's" "not this stack's base" "$out"
+equal "...keeping the branch's commits" "a1 a2" "$(cat "$repo/a1.txt" "$repo/a2.txt" 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 
 echo "stack-claude refusals"
 printf 'local edit\n' > "$repo/package-lock.json"

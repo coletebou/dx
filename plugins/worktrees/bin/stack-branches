@@ -82,7 +82,9 @@ pick_profile() {
     while IFS= read -r _p; do profiles+=("$_p"); done < <(list_profiles)
     (( ${#profiles[@]} > 0 )) || die "no profiles defined. create one with: stack-branches profiles add"
 
-    if [[ ! -t 0 || ! -t 1 ]] || ! command -v fzf >/dev/null 2>&1; then
+    # stdin and stderr, not stdout: every caller runs this as $(pick_profile), so
+    # stdout is always a pipe. fzf draws on the terminal itself.
+    if [[ ! -t 0 || ! -t 2 ]] || ! command -v fzf >/dev/null 2>&1; then
         # Non-TTY fallback: if only one profile, use it; else require -p.
         if (( ${#profiles[@]} == 1 )); then
             echo "${profiles[0]}"; return 0

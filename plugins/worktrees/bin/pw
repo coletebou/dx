@@ -10,11 +10,13 @@
 #                                                                   Codex always uses ChatGPT auth.
 #   pw log       [manifest.tsv]                                     Follow merged log (less +F, falls back to tail -F)
 #   pw teardown  <manifest.tsv> [--delete-branches]                 Kill + clean up the repo recorded at launch
-#                                                                   (main checkout if no record), removing the
-#                                                                   worktrees launch recorded and the ones the layout
-#                                                                   gives now (plain and test- names), only those git
-#                                                                   lists as worktrees of that repo. Exits 1,
-#                                                                   keeping the .log-path sidecar, if nothing matched.
+#                                                                   (main checkout if no record): this manifest's
+#                                                                   sessions (both modes, never another manifest's),
+#                                                                   the worktrees its launch logs record, and the
+#                                                                   ones the layout gives now (plain and test- names)
+#                                                                   that are on its branches; only those git lists
+#                                                                   as worktrees of that repo. Exits 1, keeping the
+#                                                                   .log-path sidecar, if nothing matched.
 #   pw validate  <manifest.tsv>                                     Lint before launch
 #   pw status    <session>                                          Read-only: one line per pane (target, state, command).
 #                                                                   Exits 2 if any pane waits for a human (permission or
@@ -325,6 +327,14 @@ bootstrap_worktree() {
 export COMPOSE_PROJECT_NAME=$compose_project
 EOF
         info "  wrote .envrc with COMPOSE_PROJECT_NAME=$compose_project"
+        # The repo tracks no .envrc, so keep this one out of an agent's `git add -A`.
+        # A linked worktree reads the main checkout's info/exclude (git shares it), so
+        # the line covers every checkout of the repo, where an .envrc is local anyway.
+        local exclude; exclude="$(git -C "$wt" rev-parse --git-path info/exclude 2>/dev/null || true)"
+        case "$exclude" in ""|/*) ;; *) exclude="$wt/$exclude" ;; esac
+        if [ -n "$exclude" ] && ! grep -qxF '/.envrc' "$exclude" 2>/dev/null; then
+            mkdir -p "$(dirname "$exclude")" && printf '/.envrc\n' >> "$exclude"
+        fi
     fi
 
     # 3. npm install, unless PW_NPM_INSTALL=0 (a bun or pnpm repo installs
@@ -436,8 +446,15 @@ cmd_launch() {
         fi
     fi
 
-    local log_file="$LOG_DIR/${repo_name}-${ts}.log"
-    : > "$log_file"
+    # A log of its own, even for two launches in one second (a --test fleet and a real
+    # one): a shared name would truncate the first run's record, and teardown goes by it.
+    # set -C makes the create exclusive.
+    local log_file="$LOG_DIR/${repo_name}-${ts}.log" n=1
+    until ( set -C; : > "$log_file" ) 2>/dev/null; do
+        n=$((n + 1))
+        [ "$n" -le 100 ] || die "cannot create a log in $LOG_DIR"
+        log_file="$LOG_DIR/${repo_name}-${ts}-$n.log"
+    done
     # The lock is a directory created on demand by bin/pw-append (mkdir-mutex);
     # nothing to pre-create. Clear any stale .lockd from a crashed prior run.
     rm -rf "${log_file}.lockd" 2>/dev/null || true
@@ -511,8 +528,12 @@ cmd_launch() {
     # the per-agent claude sessions. We `select-window` the first agent at
     # the end so attaching lands in agent-1 by default; the log is one
     # keybind away (Ctrl-b 0).
-    local first_tag="${tag_prefix}${TAGS[0]}"
     tmux new-session -d -s "$session" -n log -c "$repo"
+    # The session names are the repo's, so a --test fleet and a real one, each maybe from
+    # another manifest, can be up together: teardown kills only its own manifest's session.
+    # "=<name>:" is an exact session match; option commands take a pane target, where a bare
+    # "=<name>" is no session at all.
+    tmux set-option -t "=$session:" @pw_manifest "$manifest" >/dev/null 2>&1 || true
     # set-titles on + "#S/#W" are set globally in this repo's base/tmux.conf.
 
     # Auto-tail the merged log in window 0. Use `pw log <manifest>` so it
@@ -561,6 +582,10 @@ cmd_launch() {
     done
     echo "" >> "$log_file"
 
+    # The prompts live next to the log, not in the worktrees, where an agent's
+    # `git add -A` would commit its own brief.
+    local prompt_dir="${log_file%.log}.prompts" first_win=""
+    mkdir -p "$prompt_dir"
     for i in "${!TAGS[@]}"; do
         local tag="${tag_prefix}${TAGS[$i]}"
         local branch="${branch_prefix}${BRANCHES[$i]}"
@@ -570,7 +595,10 @@ cmd_launch() {
 
         # Window 0 is always the log; agents start at window index 1.
         # Always create a new window (no special-case for i=0 anymore).
-        tmux new-window -t "$session" -n "$tag" -c "$wt"
+        # Keys go to its id, not "$session:$tag": tmux reads a numeric tag as a
+        # window index first, so with base-index 1 tag "1" would be the log.
+        local win; win="$(tmux new-window -P -F '#{window_id}' -t "=$session:" -n "$tag" -c "$wt")"
+        [ -n "$first_win" ] || first_win="$win"
 
         # Export env vars into the window so the prompt footer works.
         # PARALLEL_APPEND points at the portable mkdir-mutex append helper —
@@ -580,14 +608,15 @@ cmd_launch() {
         # .envrc; we export it directly too in case direnv isn't installed
         # and the user runs `docker compose` before sourcing .envrc.
         local compose_project="${repo_name}-${tag}"
-        tmux send-keys -t "$session:$tag" \
+        tmux send-keys -t "$win" \
             "export PARALLEL_LOG=$(printf %q "$log_file") PARALLEL_TAG=$(printf %q "$tag") PARALLEL_BRANCH=$(printf %q "$branch") PARALLEL_SESSION_ID=$(printf %q "$sid") PARALLEL_TRANSCRIPT=$(printf %q "$jsonl") PARALLEL_APPEND=$(printf %q "$PW_BIN_DIR/pw-append") COMPOSE_PROJECT_NAME=$(printf %q "$compose_project")" C-m
-        tmux send-keys -t "$session:$tag" \
-            "echo '=== $tag ($branch) ===' && pwd && git branch --show-current && echo 'transcript: $jsonl'" C-m
+        # %q, like the exports: a branch name may hold quotes or `;` (git allows both).
+        tmux send-keys -t "$win" \
+            "echo $(printf %q "=== $tag ($branch) ===") && pwd && git branch --show-current && echo $(printf %q "transcript: $jsonl")" C-m
 
         # Write the prompt to a per-session file; pass it to the engine via an
         # xargs-safe path.
-        local prompt_path="$wt/.pw-prompt.md"
+        local prompt_path="$prompt_dir/$tag.md"
         printf '%s\n' "${PROMPT_BODIES[$i]}" > "$prompt_path"
 
         if [ "${ENGINES[$i]}" = codex ]; then
@@ -599,15 +628,15 @@ cmd_launch() {
             # Always ChatGPT auth: unset OPENAI_API_KEY (and relay) in the
             # window so codex uses the stored ChatGPT login in ~/.codex/auth.json
             # instead of an ambient API key. Reasoning effort is set via -c.
-            tmux send-keys -t "$session:$tag" \
+            tmux send-keys -t "$win" \
                 "unset OPENAI_API_KEY OPENAI_BASE_URL; codex $codex_auto -m $(printf %q "$cmodel") -c model_reasoning_effort=$(printf %q "\"$ceffort\"") \"\$(cat $(printf %q "$prompt_path"))\"" C-m
         else
-            tmux send-keys -t "$session:$tag" \
+            tmux send-keys -t "$win" \
                 "$PW_CLAUDE_CMD --session-id $sid \"\$(cat $(printf %q "$prompt_path"))\"" C-m
         fi
     done
 
-    tmux select-window -t "$session:$first_tag"
+    tmux select-window -t "$first_win"
 
     cat <<EOF
 
@@ -657,6 +686,26 @@ cmd_log() {
     fi
 }
 
+# manifest_logs MANIFEST REPO [other]: the launch logs of REPO whose header names MANIFEST,
+# or with "other", another manifest.
+manifest_logs() {
+    local f
+    for f in "$LOG_DIR"/*.log; do
+        [ -f "$f" ] || continue
+        PW_M="# manifest=$1" PW_R="# repo=$2" PW_OTHER="${3:-}" awk '!NF { exit }
+            /^# manifest=/ { seen = 1; same = ($0 == ENVIRON["PW_M"]) } $0 == ENVIRON["PW_R"] { r = 1 }
+            END { exit !(r && seen && (ENVIRON["PW_OTHER"] == "other" ? !same : same)) }' "$f" && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# log_worktrees LOG: "<tag>\t<worktree>" for each agent of the launch header (read up to the
+# blank line that ends it: agents append to the log after it).
+log_worktrees() {
+    awk '/^# === agents ===$/ { agents = 1; next } agents && /^$/ { exit }
+        agents && sub(/^# tag=/, "") { i = index($0, " worktree="); if (i) print $1 "\t" substr($0, i + 10) }' "$1"
+}
+
 cmd_teardown() {
     local manifest=""
     local delete_branches=0
@@ -671,6 +720,7 @@ cmd_teardown() {
     [ -n "$manifest" ] || die "usage: pw teardown <manifest.tsv> [--delete-branches]"
 
     parse_manifest "$manifest" 0
+    manifest="$(cd "$(dirname "$manifest")" && pwd)/$(basename "$manifest")"  # as launch records it
 
     # Tear down the repo the run was launched from, not the one we stand in:
     # from a linked worktree, `repo_root "$(pwd)"` names that worktree and no
@@ -691,39 +741,63 @@ cmd_teardown() {
     info "Tearing down in $repo ($repo_src)"
     local session_base="${PW_SESSION:-$repo_name-parallel}"
 
-    # Detect test-mode worktrees by probing both prefixed and plain names.
+    # Every launch log of this manifest in this repo: a --test run and a real one can both
+    # be up, and the sidecar names only the later one.
+    local -a run_logs=()
+    local f rec_sessions=$'\n'
+    [ -n "$log_file" ] && [ -f "$log_file" ] && run_logs+=("$log_file")
+    while IFS= read -r f; do
+        [ "$f" = "$log_file" ] || run_logs+=("$f")
+    done < <(manifest_logs "$manifest" "$repo")
+    for f in ${run_logs[@]+"${run_logs[@]}"}; do
+        rec_sessions="$rec_sessions$(awk '!NF { exit } sub(/^# session=/, "") { print; exit }' "$f")"$'\n'
+    done
+
+    # Both modes' session names, but only this manifest's sessions: launch marks each with
+    # its manifest (@pw_manifest), and the other name may hold another manifest's fleet.
+    # An unmarked session goes only when one of this manifest's launch logs records it.
     local -a tried=()
-    local matched=0
+    local matched=0 owner
     for session in "$session_base" "$session_base-test"; do
         tried+=("session  $session")
-        if tmux has-session -t "=$session" 2>/dev/null; then
+        tmux has-session -t "=$session" 2>/dev/null || continue
+        owner="$(tmux show-options -t "=$session:" -qv @pw_manifest 2>/dev/null || true)"
+        if [ "$owner" = "$manifest" ] \
+            || { [ -z "$owner" ] && case "$rec_sessions" in *$'\n'"$session"$'\n'*) true ;; *) false ;; esac; }; then
             info "Killing tmux session $session"
             tmux kill-session -t "=$session"
             matched=$((matched+1))
+        elif [ -n "$owner" ]; then
+            warn "Leaving tmux session $session: it runs $owner"
+        else
+            warn "Leaving tmux session $session: no launch log of this manifest records it"
         fi
     done
 
-    # The worktrees to remove: the ones the launch header records
+    # The worktrees to remove: the ones this manifest's launch headers record
     # (# tag=<tag> ... worktree=<path>, read up to the blank line that ends
     # it, since every agent appends to the log after it), where launch put
     # them even if the setting or a WT_* lever changed since, and the ones the
     # layout gives now under the plain and the test- names, which also finds
-    # a run of the other mode whose log the sidecar no longer names. If the
+    # a run whose log is gone. If the
     # setting's volume is unmounted, that stops teardown here only when there
     # is no record to go by (mount it and re-run).
-    local -a wt_paths=()
+    # A path the layout gives (not a record) may be another manifest's run of the same tag:
+    # it goes only when no other manifest's launch log records it and it is on this
+    # manifest's branch for that tag. wt_want holds that branch, or nothing for a record.
+    local -a wt_paths=() wt_want=()
     local rec_tag rec_path
-    if [ -n "$log_file" ] && [ -f "$log_file" ]; then
+    for f in ${run_logs[@]+"${run_logs[@]}"}; do
         while IFS=$'\t' read -r rec_tag rec_path; do
             for tag_core in "${TAGS[@]}"; do
                 if [ "$rec_tag" = "$tag_core" ] || [ "$rec_tag" = "test-$tag_core" ]; then
                     wt_paths+=("$rec_path")
+                    wt_want+=("")
                     break
                 fi
             done
-        done < <(awk '/^# === agents ===$/ { agents = 1; next } agents && /^$/ { exit }
-            agents && sub(/^# tag=/, "") { i = index($0, " worktree="); if (i) print $1 "\t" substr($0, i + 10) }' "$log_file")
-    fi
+        done < <(log_worktrees "$f")
+    done
     if [ "${#wt_paths[@]}" -eq 0 ]; then
         require wt-helper
         pw_resolve_wt_base "$repo"
@@ -732,21 +806,28 @@ cmd_teardown() {
         warn "wt-helper could not say where worktrees go for $repo; removing only the worktrees the launch recorded"
         PW_WT_BASE=""
     fi
+    local foreign=$'\n'
     if [ -n "$PW_WT_BASE" ]; then
-        for tag_core in "${TAGS[@]}"; do
-            for prefix in "" "test-"; do
-                wt_paths+=("$(pw_wt_path "$repo" "${prefix}${tag_core}")")
-            done
+        while IFS= read -r f; do
+            while IFS=$'\t' read -r rec_tag rec_path; do
+                foreign="$foreign$rec_path"$'\n'
+            done < <(log_worktrees "$f")
+        done < <(manifest_logs "$manifest" "$repo" other)
+        for i in "${!TAGS[@]}"; do
+            wt_paths+=("$(pw_wt_path "$repo" "${TAGS[$i]}")" "$(pw_wt_path "$repo" "test-${TAGS[$i]}")")
+            local test_branch="test/${BRANCHES[$i]}"   # what launch --test checks out
+            wt_want+=("${BRANCHES[$i]#refs/heads/}" "${test_branch#refs/heads/}")
         done
     fi
     # Only what git lists as a linked worktree of this repo goes: a recorded
     # path may have been reused since, and a layout path may hold someone
     # else's directory (the --force removal, and rm -rf after it, would take
     # either). The first entry of the list is the main checkout.
-    local registered wt wt_p done_paths=$'\n'
+    local registered wt wt_p have done_paths=$'\n'
     registered="$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2 \
         | while IFS= read -r wt_p; do (cd "$wt_p" 2>/dev/null && pwd -P) || printf '%s\n' "$wt_p"; done)" || registered=""
-    for wt in "${wt_paths[@]}"; do
+    for i in "${!wt_paths[@]}"; do
+        wt="${wt_paths[$i]}"
         case "$done_paths" in *$'\n'"$wt"$'\n'*) continue ;; esac
         done_paths="$done_paths$wt"$'\n'
         tried+=("worktree $wt")
@@ -755,6 +836,17 @@ cmd_teardown() {
         if ! grep -qxF -- "$wt_p" <<< "$registered"; then
             warn "Leaving $wt: git does not list it as a worktree of $repo"
             continue
+        fi
+        if [ -n "${wt_want[$i]}" ]; then
+            case "$foreign" in *$'\n'"$wt"$'\n'*)
+                warn "Leaving $wt: another manifest's launch log records it"
+                continue ;;
+            esac
+            have="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
+            if [ "$have" != "${wt_want[$i]}" ]; then
+                warn "Leaving $wt: it is on '$have', not this manifest's '${wt_want[$i]}'"
+                continue
+            fi
         fi
         info "Removing worktree $wt"
         git -C "$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
@@ -1162,24 +1254,33 @@ cmd_broadcast() {
             continue
         fi
 
-        local target="${session}:${idx}"
-        if send_to_pane "$target" "$effective_prompt"; then
-            if (( dry_run )); then
-                engaged=$((engaged+1))
-                engaged_windows+=("$idx:$name (dry-run)")
-            elif verify_engagement "$target"; then
-                engaged=$((engaged+1))
-                engaged_windows+=("$idx:$name")
-                info "  $idx:$name ✓ engaged"
+        # Every pane of the window, not only its active one ("$session:$idx"): a split
+        # window can hold several agents. Each is classified and sent to on its own.
+        local -a panes=()
+        local _p target label
+        while IFS= read -r _p; do panes+=("$_p"); done \
+            < <(tmux list-panes -t "${session}:${idx}" -F '#{pane_id}' 2>/dev/null)
+        for target in ${panes[@]+"${panes[@]}"}; do
+            label="$idx:$name"
+            (( ${#panes[@]} > 1 )) && label="$idx:$name $target"
+            if send_to_pane "$target" "$effective_prompt"; then
+                if (( dry_run )); then
+                    engaged=$((engaged+1))
+                    engaged_windows+=("$label (dry-run)")
+                elif verify_engagement "$target"; then
+                    engaged=$((engaged+1))
+                    engaged_windows+=("$label")
+                    info "  $label ✓ engaged"
+                else
+                    failed=$((failed+1))
+                    failed_windows+=("$label (no spinner detected)")
+                    warn "  $label ⚠ sent but no engagement signal — verify manually"
+                fi
             else
-                failed=$((failed+1))
-                failed_windows+=("$idx:$name (no spinner detected)")
-                warn "  $idx:$name ⚠ sent but no engagement signal — verify manually"
+                skipped=$((skipped+1))
+                skipped_windows+=("$label ($skip_state)")
             fi
-        else
-            skipped=$((skipped+1))
-            skipped_windows+=("$idx:$name ($skip_state)")
-        fi
+        done
     done
 
     info ""
