@@ -963,15 +963,16 @@ dotsync_fanout_report() {
   run_post_sync
   write_heartbeat "${EXIT_CODE:-0}"
   publish_heartbeat
-  printf 'ts=%s result=%s incomplete=%s dispatched=%s seconds=%s\n' "$(date +%s)" "$result" \
-    "${peers_failed_count:-0}" "${peers_dispatched:-0}" "$(( (end_ms - start_ms) / 1000 ))" \
-    >"$TIMING_LOG_DIR/fanout-result.tmp" && mv "$TIMING_LOG_DIR/fanout-result.tmp" "$TIMING_LOG_DIR/fanout-result"
   printf '  step %-14s %s\n' fanout-total "$(fmt_dur $((end_ms - start_ms)))" >>"$TIMING_LOG"
   echo "fan-out: result=$result incomplete=${peers_failed_count:-0}/${peers_dispatched:-0}"
   if [[ "$result" != ok ]]; then
     dotsync_notify "dotsync: peers $result" "${peers_failed_count:-0} of ${peers_dispatched:-0} peer(s) incomplete. Run: dotsync status"
   fi
   [[ -z "${SSH_CM_DIR:-}" ]] || rm -rf "$SSH_CM_DIR" 2>/dev/null || true
+  # Last, so a reader that sees the result knows the fan-out has done everything else.
+  printf 'ts=%s result=%s incomplete=%s dispatched=%s seconds=%s\n' "$(date +%s)" "$result" \
+    "${peers_failed_count:-0}" "${peers_dispatched:-0}" "$(( (end_ms - start_ms) / 1000 ))" \
+    >"$TIMING_LOG_DIR/fanout-result.tmp" && mv "$TIMING_LOG_DIR/fanout-result.tmp" "$TIMING_LOG_DIR/fanout-result"
 }
 
 # A manual run returns once this machine is pushed; the peers update in a detached child that
