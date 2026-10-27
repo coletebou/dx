@@ -59,10 +59,10 @@ installer stops and tells you your options.
 | `shell` | zsh entry points (`zshenv`, `zshrc`, `aliases`, `zprofile`, `profile`), the starship prompt, `~/.df-profile` |
 | `git` | global git config with identity routing, a global ignore file, gitleaks pre-commit and pre-push hooks |
 | `tmux` | `tmux.conf` and its status helpers, Claude Code and Codex resume after a tmux-resurrect restore, the tmux plugin's CLIs |
-| `claude` | Claude Code: a generated `settings.json` (hooks, statusline), a `CLAUDE.md` rules stub, MCP servers |
+| `claude` | Claude Code: a generated `settings.json` (hooks, statusline), a `CLAUDE.md` rules stub, MCP servers, `claude-backup` and `agent-skills-sync` |
 | `codex` | Codex: global rules (`AGENTS.md`) and hooks, a provider-neutral `config.toml` copied once (Codex writes to it), the Codex skills |
 | `session`, `worktrees`, `memory`, `review`, `toolbox` | each plugin's CLIs in `~/.local/bin` and its skills in `~/.claude/skills` |
-| `sync` | [`dotsync`](docs/dotsync.md): this checkout in sync across your machines (commit behind a secret scan, pull, push, rerun the installer, then update every peer of the same identity over ssh), with `dotsync status` and `dotsync doctor` |
+| `sync` | [`dotsync`](docs/dotsync.md): this checkout in sync across your machines (commit behind a secret scan, pull, push, rerun the installer, then update every peer of the same identity over ssh), with `dotsync status` and `dotsync doctor`; and [`codesync`](docs/codesync.md): every repository under `~/code` committed, pulled and pushed, uncommitted work included, then the same on your other machines (never one of another identity) |
 | `ghostty` | the Ghostty config, and the `xterm-ghostty` terminfo for your user where it is missing |
 | `vscode` | VS Code user settings (Prettier off); `vscode/extensions.json` lists the recommended extensions |
 | `brew` | `~/.Brewfile`, a commented developer Brewfile for `brew bundle --global` |
@@ -71,6 +71,15 @@ installer stops and tells you your options.
 | `schedules` | launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, the nightly dream sweep, tmux autosave, and the hourly `dotsync` where `sync` is installed. Not part of `--all`. |
 | `github-kit` | the [GitHub repo kit](github-kit/README.md) (issue forms, a PR template and its rules, a label set with a sync script, PR-labeling, secret-scan, Claude Code and CI-lane workflows), copied into the `.github/` of the repository `--target` names. Not part of `--all`. |
 | `manager` | a Drover setting that points its OpenClaw fleet manager at your identity's overlay (below). Not part of `--all`. |
+
+Two small helpers come with the `claude` component; neither runs unless you run it:
+
+- `claude-backup` tars all of `~/.claude` but its logs into `~/Archives/claude-history`
+  (`BACKUP_DIR` moves it); `--prune-days N` then deletes old sessions' history entries and
+  directories, exactly as its `--help` lists.
+- `agent-skills-sync` clones or fast-forwards a skills checkout (default:
+  [agent-skills](https://github.com/coletebou/agent-skills) in `~/code/agent-skills`) on its
+  deployment branch, and only reports a dirty, diverged or rewritten one.
 
 The Claude Code setup in `base/claude/` is the part most people come for:
 
@@ -128,6 +137,7 @@ install.sh                        the installer
 | [dotsync](docs/dotsync.md) | keeping one dotfiles checkout in sync across machines: setup for two machines, the peers file, hooks, commit-message providers, status and doctor, safety properties |
 | [Running fleets of agents](docs/workflow/README.md) | coordinator and worker roles, briefs and handoffs, lane terms, parallel worktrees, review before ship, publishing through a scrub gate |
 | [Handoff chains](docs/handoff.md) | how `cc-handoff` moves a long session into a fresh one, on this machine or another |
+| [codesync](docs/codesync.md) | every repository in step across your machines: WIP commits, the force-push rules, peers, `--local`, troubleshooting |
 | [Claude Code hooks](docs/claude-hooks.md) | every hook, event by event |
 | [Agent memory](docs/memory/README.md) | reflections, the session reflector, transcript analysis and the nightly dreaming sweep |
 | [Infrastructure playbooks](docs/infra/README.md) | a fleet over Tailscale, Cloudflare in front of self-hosted services, a production VPS, Claude Code on Bedrock |

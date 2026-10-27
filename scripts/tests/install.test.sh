@@ -101,7 +101,8 @@ equal "git resolves the hooks path under ~/.dotfiles" "$HOME/.dotfiles/base/git/
 # The way git reads it for a commit: all config files, includes followed (--global alone skips them).
 equal "the old git identity was kept" "sam@example.com" "$(cd "$tmp" && git config --get user.email 2>&1)"
 for b in pw pw-append stack-branches stack-claude wt-helper cc-park cc-handoff reflections dream memory-canary \
-    codex-memory-bridge tmux-archive autoreview-pair dotsync dotsync-doctor dotsync-commit-message; do
+    codex-memory-bridge tmux-archive autoreview-pair dotsync dotsync-doctor dotsync-commit-message \
+    codesync claude-backup agent-skills-sync; do
   [[ -L "$HOME/.local/bin/$b" && -x "$HOME/.local/bin/$b" ]] || bad "~/.local/bin/$b is a working link" "a link" "$(ls -l "$HOME/.local/bin/$b" 2>&1)"
 done
 ok "the CLIs are linked into ~/.local/bin"
@@ -397,6 +398,28 @@ out="$("$run_bash" "$copy/install.sh" --with manager --identity bare 2>&1)"; rc=
 equal "the install succeeds" 0 "$rc"
 check "...saying how to add one" "copy identities/example/openclaw-manager" "$out"
 equal "...and writes no setting" "absent" "$([[ -e "$HOME/.config/drover" ]] && echo present || echo absent)"
+echo "codesync, claude-backup and agent-skills-sync"
+newhome 8
+out="$(inst --list)"
+check "--list names codesync in the sync component" "dotsync-commit-message and codesync" "$out"
+check "...and the Claude Code helpers" "claude-backup and agent-skills-sync" "$out"
+out="$(inst --with sync,claude --dry-run)"; rc=$?
+equal "a dry run of sync and claude succeeds" 0 "$rc"
+check "...naming the codesync link" "would link ~/.local/bin/codesync" "$out"
+check "...and the helpers" "would link ~/.local/bin/agent-skills-sync" "$out"
+check "...and saying where the peers go" "~/.config/codesync/peers" "$out"
+out="$(inst --with sync,claude)"; rc=$?
+equal "installing them succeeds" 0 "$rc"
+for b in codesync claude-backup agent-skills-sync; do
+  equal "~/.local/bin/$b links to the checkout" "$root/scripts/$b" "$(readlink "$HOME/.local/bin/$b" 2>&1)"
+done
+equal "...and none of them ran: no ~/code, ~/Archives or backup was made" "" \
+  "$(cd "$HOME" && ls -d code Archives 2>/dev/null)"
+for b in codesync claude-backup agent-skills-sync; do
+  lacks "...nor does a schedule or registration name $b" "$b" "$(cat "$tmp/calls" 2>/dev/null)"
+done
+out="$(inst --with sync,claude)"
+check "a second run changes nothing" "Everything was already in place." "$out"
 
 echo "the checkout"
 equal "nothing was written into the repo" "$before_status" "$(git -C "$root" status --porcelain)"

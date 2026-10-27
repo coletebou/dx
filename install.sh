@@ -47,7 +47,7 @@ describe() {
         worktrees) echo "wt-helper, pw, stack-branches and stack-claude, with their skills" ;;
         memory)    echo "reflections, dream, session-analyzer, claude-consolidate, memory-canary and codex-memory-bridge, with their skills" ;;
         review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
-        sync)      echo "dotsync, dotsync-doctor and dotsync-commit-message: this checkout in sync across your machines" ;;
+        sync)      echo "dotsync, dotsync-doctor, dotsync-commit-message and codesync: this checkout and every repository under ~/code in sync across your machines" ;;
         toolbox)   echo "the disk-reclaim and shipped-but-open skills" ;;
         ghostty)   echo "the Ghostty config, and the xterm-ghostty terminfo where it is missing" ;;
         vscode)    echo "VS Code user settings (Prettier off), and how to install the recommended extensions" ;;
@@ -563,14 +563,16 @@ c_node_tools() {
     fi
 }
 
+# codesync is linked, never scheduled: it commits and pushes every repository under ~/code, so it
+# runs only when you run it. It reads dotsync's peers file unless it has one of its own.
 c_sync() {
     link_bins "$DOTFILES_DIR/scripts/dotsync" "$DOTFILES_DIR/scripts/dotsync-doctor" \
-        "$DOTFILES_DIR/scripts/dotsync-commit-message"
+        "$DOTFILES_DIR/scripts/dotsync-commit-message" "$DOTFILES_DIR/scripts/codesync"
     need python3 "dotsync needs it for its lock and its checks"
     need gitleaks "dotsync refuses to commit or push without it"
-    need ssh "dotsync updates your other machines over ssh"
-    [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/dotsync/peers" ] \
-        || say "  note: list your other machines (one ssh alias per line) in ~/.config/dotsync/peers (docs/dotsync.md)"
+    need ssh "dotsync and codesync update your other machines over ssh"
+    [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/dotsync/peers" ] || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/codesync/peers" ] \
+        || say "  note: list your other machines (one ssh alias per line) in ~/.config/dotsync/peers; codesync reads it too, unless ~/.config/codesync/peers exists (docs/dotsync.md, docs/codesync.md)"
 }
 
 # The dotsync timer belongs to the sync component: --with schedules alone never starts
