@@ -452,14 +452,21 @@ EOF
     # Scoped to repo/local dests — see header comment for rationale.
     # git matches each new rule against the index with gitignore semantics
     # (a pathspec would not: `/*.json` would also take src/x.json, and a bare
-    # `notes.md` would miss sub/notes.md). zsh's unique-array type dedupes, so
-    # overlapping patterns don't make `git rm` fail on a duplicate path.
+    # `notes.md` would miss sub/notes.md). A file goes only if the repo's whole
+    # rule set, now holding the new rules, ignores it too: a nested
+    # `!keep.log` keeps sub/keep.log tracked under a new `*.log`. zsh's
+    # unique-array type dedupes, so overlapping patterns don't make `git rm`
+    # fail on a duplicate path.
     if (( added > 0 )) && [[ "$dest" != "global" ]]; then
         local -aU to_untrack=()
+        local -A ignored_now=()
         local pat f
+        while IFS= read -r -d '' f; do
+            ignored_now[$f]=1
+        done < <(git -C "$repo_root" ls-files -z --cached --ignored --exclude-standard 2>/dev/null)
         for pat in "${added_patterns[@]}"; do
             while IFS= read -r -d '' f; do
-                to_untrack+=("$f")
+                (( ${+ignored_now[$f]} )) && to_untrack+=("$f")
             done < <(git -C "$repo_root" ls-files -z --cached --ignored --exclude="$pat" 2>/dev/null)
         done
         if (( ${#to_untrack[@]} > 0 )); then

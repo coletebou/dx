@@ -50,6 +50,14 @@ lacks "an anchored /*.json untracks the root file" "a.json " " $tracked"
 check "...but not src/b.json" "src/b.json" "$tracked"
 zsh_in "$repo" "ignore -r deep.md" >/dev/null
 lacks "a bare name untracks it at any depth" "src/deep.md" "$(git -C "$repo" ls-files)"
+mkdir -p "$repo/keep"
+touch "$repo/keep/keep.log" "$repo/keep/other.log"
+printf '!keep.log\n' > "$repo/keep/.gitignore"
+git -C "$repo" add -A && git -C "$repo" commit -qm logs
+zsh_in "$repo" "ignore -r '*.log'" >/dev/null
+tracked="$(git -C "$repo" ls-files | tr '\n' ' ')"
+check "a nested exception (!keep.log) keeps its file tracked" "keep/keep.log" "$tracked"
+lacks "...while the rule untracks the rest" "keep/other.log" "$tracked"
 
 echo "ignore -l in a linked worktree"
 git -C "$repo" worktree add -q "$tmp/wt" -b wt
