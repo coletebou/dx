@@ -70,7 +70,9 @@ export const LABEL_DEFINITIONS = Object.freeze([
 const LOCKFILE = /(^|\/)(bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|Podfile\.lock|Package\.resolved|go\.sum|[^/]+\.lock)$/;
 const GENERATED = /(^|\/)(dist|build|coverage|node_modules|vendor)\/|\.min\.(js|css)$|\.snap$|\.generated\./;
 const ASSET = /\.(png|jpe?g|gif|ico|svg|webp|avif|woff2?|ttf|otf)$/i;
-const DOC = /\.(md|mdx|txt|rst|adoc)$|^docs\/|(^|\/)(LICENSE|NOTICE|AUTHORS|CODEOWNERS)$/;
+// Not every .txt: requirements.txt, constraints.txt and CMakeLists.txt are dependency and build
+// files, so a .txt outside docs/ is behavior unless it is a LICENSE-style file.
+const DOC = /\.(md|mdx|rst|adoc)$|^docs\/|(^|\/)(LICENSE|NOTICE|AUTHORS|COPYING|CODEOWNERS)(\.(md|txt))?$/;
 const TEST = /(^|\/)(tests?|__tests__|spec|e2e|UITests|Tests)\/|[._-](test|spec)\.[a-z]+$|Tests?\.swift$|_test\.(go|py)$|(^|\/)test_[^/]+\.py$/;
 const MANIFEST = /(^|\/)package\.json$/;
 const UI_SOURCE = /\.(tsx|jsx|css|scss|sass|less|html|astro|swift|vue|svelte)$/;

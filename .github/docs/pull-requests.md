@@ -52,8 +52,8 @@ are necessary, but on their own they are mock-only proof.
 | The PR changes | It needs | Counts as evidence |
 |----------------|----------|--------------------|
 | UI a user sees: `.tsx`, `.jsx`, `.css`, `.html`, `.vue`, `.svelte`, `.swift` and similar files, or images, under the paths the repository variable `PR_LABELS_UI_PATHS` names (anywhere when it is unset), minus `PR_LABELS_NOT_UI` | screenshots | an image or recording attached to the PR body, or to a comment or review by the author or a collaborator |
-| Behavior: any code, script, workflow, Dockerfile, runtime dependency or lockfile | an E2E or live run | in the body's `## Evidence` (or `## Proof`) section, or a comment that starts with "Evidence": a code block with the command and its output, a recording or screenshot, or a link to the run |
-| Only docs, only tests, or only `@types/*` packages | nothing | `proof: ➖ not needed` |
+| Behavior: any code, script, workflow, Dockerfile, build file, runtime dependency (`package.json`, `requirements.txt`, `constraints.txt`) or lockfile | an E2E or live run | in the body's `## Evidence` (or `## Proof`) section, or a comment that starts with "Evidence": a code block with the command and its output, a recording or screenshot, or a link to the run |
+| Only docs (Markdown, reStructuredText or AsciiDoc files, anything under `docs/`, LICENSE-style files; other `.txt` files count as behavior), only tests, or only `@types/*` packages | nothing | `proof: ➖ not needed` |
 
 So a PR gets `proof: 📸 needs screenshots` and/or `proof: 🧪 needs e2e` until
 each needed kind of evidence is attached, then `proof: ✅ sufficient`.

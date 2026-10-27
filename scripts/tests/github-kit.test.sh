@@ -503,6 +503,10 @@ eq('...in a body with CRLF line ends too, as the web editor saves them', true,
 eq('a code block with only a # line in it is still run output, and an empty one is not', [true, false], [
   m.hasRunEvidence('\n```\n# ok\n```\n'), m.hasRunEvidence('\n```\n\n```\nsee above\n'),
 ]);
+eq('a dependency or build .txt file is behavior; a .txt under docs/ and LICENSE.txt are not',
+  [true, true, true, false, false],
+  ['requirements.txt', 'constraints.txt', 'CMakeLists.txt', 'docs/build-notes.txt', 'LICENSE.txt']
+    .map((path) => m.classifyFiles([f(path, 1, 1)], anywhere).behavior));
 JS
   n=0
   while IFS=$'\t' read -r verdict name want got; do
@@ -513,7 +517,7 @@ JS
       *) bad "the pr-labels.mjs checks run" "ok or FAIL lines" "$verdict $name $want $got" ;;
     esac
   done < <(node "$tmp/pr-labels-check.mjs" "$pr_labels" "$tmp/kit-labels.json" 2>&1)
-  [[ "$n" -ge 21 ]] || bad "every pr-labels.mjs check ran" "21 or more" "$n"
+  [[ "$n" -ge 22 ]] || bad "every pr-labels.mjs check ran" "22 or more" "$n"
 else
   ok "# SKIP no Node 18 or newer: pr-labels.mjs not checked"
 fi
