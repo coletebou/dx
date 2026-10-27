@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""dotsync doctor: a bounded, read-only diagnosis of dotsync on this machine.
+
+    dotsync doctor [--json]          (or dotsync-doctor --repo DIR ...)
+
+Reports the checkout (branch, upstream, cached ahead/behind, dirty entries, a git operation in
+progress), the pause and the lock, whether the installed dotsync is this checkout's, the latest
+heartbeat and timing record, and the configuration: the peers file, the hooks, the config file,
+gitleaks, and the commit-message provider (whether its credential is set, never its value).
+It fetches nothing, repairs nothing, and prints no file contents: git reads share a two-second
+budget and an output cap. Exit 0 means the report was made, not that everything is healthy.
+"""
+
+import argparse
+import datetime
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import time
+
+
+GIT_BUDGET_SECONDS = 2.0
+MAX_GIT_BYTES = 256 * 1024
+MAX_HEARTBEAT_BYTES = 16 * 1024
+MAX_CONFIG_BYTES = 64 * 1024
+TIMING_TAIL_BYTES = 64 * 1024
+STALE_HEARTBEAT_SECONDS = 24 * 3600
+TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
+HASH = re.compile(r"[0-9a-fA-F]{7,64}\Z")
+DURATION = r"(?:[0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)){1,3}"
+HOOK_STAGES = ("pre-commit", "post-pull", "post-sync")
+PROVIDER_KEYS = {"anthropic": "ANTHROPIC_API_KEY", "bedrock": "AWS_BEARER_TOKEN_BEDROCK"}
+
+
+def label(value, limit=240):
+    """Keep terminal controls and unbounded metadata out of human output."""
+    return "".join(c if c.isprintable() else "?" for c in str(value))[:limit]
+
+
+def token(value):
+    return value if isinstance(value, str) and TOKEN.fullmatch(value) else None
+
+
+def number(value):
+    return value if type(value) in (int, float) and -2**53 <= value <= 2**53 and math.isfinite(value) else None
+
+
+def integer(value, minimum=0, maximum=2**53):
+    return value if type(value) is int and minimum <= value <= maximum else None
+
+
+def read_bounded(path, maximum, tail=False):
+    """Refuse devices and FIFOs; read only a bounded part of a regular file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            size = os.fstat(stream.fileno())
+            if not stat.S_ISREG(size.st_mode):
+                return None, "not_regular"
+            if tail:
+                stream.seek(max(0, size.st_size - maximum))
+            data = stream.read(maximum + (0 if tail else 1))
+            return (None, "too_large") if len(data) > maximum else (data, None)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "unreadable"
+
+
+def git_read(repo, args, deadline):
+    """Cap wall time and bytes; never return raw Git stderr or run shell code."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None, "timeout"
+    # A caller's GIT_DIR or index override must not redirect an explicit --repo. Keep the
+    # config-file overrides fixtures use; drop tracing and anything that could write files.
+    config_inputs = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("GIT_") or key in config_inputs}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1",
+               GIT_ALLOW_PROTOCOL="file", GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
+    command = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c",
+               "core.untrackedCache=false", "-C", str(repo)] + args
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env=env, start_new_session=True)
+    except OSError:
+        return None, "unavailable"
+    output = bytearray()
+    finished = False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, "timeout"
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fd, 16384)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    else:
+                        output.extend(chunk)
+                        if len(output) > MAX_GIT_BYTES:
+                            return None, "too_large"
+        try:
+            rc = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return None, "timeout"
+        finished = True
+        return (bytes(output), None) if rc == 0 else (None, "git_error")
+    finally:
+        if not finished:
+            # The parent may have exited while a child still holds stdout.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait()
+        process.stdout.close()
+
+
+def repository_state(repo):
+    result = dict(path=label(repo), status="unavailable", branch=None, head=None,
+                  upstream=None, ahead=None, behind=None, dirty=None,
+                  dirty_entries=None, in_progress=None, comparison="cached_refs_only")
+    deadline = time.monotonic() + GIT_BUDGET_SECONDS
+    raw, error = git_read(repo, ["status", "--porcelain=v2", "--branch", "--ahead-behind",
+                                "-z", "--untracked-files=normal", "--no-renames",
+                                "--ignore-submodules=all"], deadline)
+    if error:
+        result["reason"] = error
+    else:
+        result["status"] = "ok"
+        dirty = 0
+        for entry in raw.decode("utf-8", "replace").split("\0"):
+            if entry.startswith("# branch.head "):
+                result["branch"] = label(entry[len("# branch.head "):])
+            elif entry.startswith("# branch.oid "):
+                value = entry[len("# branch.oid "):]
+                result["head"] = value if HASH.fullmatch(value) else None
+            elif entry.startswith("# branch.upstream "):
+                result["upstream"] = label(entry[len("# branch.upstream "):])
+            elif entry.startswith("# branch.ab "):
+                match = re.fullmatch(r"# branch.ab \+(\d+) -(\d+)", entry)
+                if match:
+                    result.update(ahead=int(match[1]), behind=int(match[2]))
+            elif entry and not entry.startswith("# "):
+                dirty += 1
+        result.update(dirty=bool(dirty), dirty_entries=dirty, submodule_worktrees="not_inspected")
+    raw, error = git_read(repo, ["rev-parse", "--absolute-git-dir"], deadline)
+    if error:
+        result["operation_state_reason"] = error
+    else:
+        git_dir = Path(os.fsdecode(raw).strip())
+        markers = {"rebase-merge": "rebase", "rebase-apply": "rebase_or_am",
+                   "MERGE_HEAD": "merge", "CHERRY_PICK_HEAD": "cherry_pick",
+                   "REVERT_HEAD": "revert", "sequencer": "sequencer", "BISECT_LOG": "bisect"}
+        try:
+            present = set(os.listdir(git_dir))
+            result["in_progress"] = sorted({name for marker, name in markers.items() if marker in present})
+        except OSError:
+            result["operation_state_reason"] = "unreadable"
+    return result
+
+
+def pause_state(state_dir, now):
+    path = state_dir / "pause"
+    result = dict(path=label(path), status="active", age_seconds=None)
+    try:
+        info = path.stat()
+        result.update(status="paused" if stat.S_ISREG(info.st_mode) else "not_regular",
+                      age_seconds=max(0, int(now - info.st_mtime)))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        result["status"] = "unavailable"
+    return result
+
+
+def private_to_user(info):
+    """The rules of lib/dotsync-lock.py: owned by this user, no group or other permission bits."""
+    return info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+
+def lock_file_state(path):
+    """Probe the kernel lock without creating, truncating or reading the file."""
+    result = dict(path=label(path), status="absent", kind="flock")
+    try:
+        parent = os.lstat(path.parent)
+    except FileNotFoundError:
+        parent = None
+    except OSError:
+        result["status"] = "unavailable"
+        return result
+    if parent is not None and not (stat.S_ISDIR(parent.st_mode) and private_to_user(parent)):
+        result["status"] = "unsafe"
+        return result
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return result
+    except OSError:
+        result["status"] = "unavailable"
+        return result
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            result["status"] = "not_regular"
+            return result
+        if not private_to_user(info):
+            result["status"] = "unsafe"
+            return result
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result["status"] = "unlocked"
+        except OSError as error:
+            result["status"] = "active" if error.errno in (errno.EAGAIN, errno.EACCES) else "unavailable"
+    finally:
+        # Closing releases the probe's lock; the lock file stays put.
+        os.close(fd)
+    return result
+
+
+def installation_state(repo, installed):
+    source = repo / "scripts" / "dotsync"
+    result = dict(source=label(source), installed=label(installed), status="unavailable",
+                  symlink=installed.is_symlink(), matches_source=None,
+                  executable=os.access(installed, os.X_OK))
+    try:
+        result["resolved_installed"] = label(installed.resolve())
+    except (OSError, RuntimeError):
+        result["resolved_installed"] = None
+    source_data, source_error = read_bounded(source, 2 * 1024 * 1024)
+    installed_data, installed_error = read_bounded(installed, 2 * 1024 * 1024)
+    if source_error:
+        result.update(status="source_unavailable", reason=source_error)
+    elif installed_error:
+        status = "broken_symlink" if result["symlink"] and installed_error == "missing" else "installed_unavailable"
+        result.update(status=status, reason=installed_error)
+    else:
+        same_bytes = hashlib.sha256(source_data).digest() == hashlib.sha256(installed_data).digest()
+        result["matches_source"] = same_bytes
+        try:
+            linked = result["symlink"] and os.path.samefile(source, installed)
+        except OSError:
+            linked = False
+        result["status"] = "linked" if linked else ("copy_matches" if same_bytes else "different")
+    return result
+
+
+def literal_profile_value(profile_path, key):
+    """KEY from a literal `[export ]KEY=value` line; data, never shell."""
+    raw, error = read_bounded(profile_path, 16 * 1024)
+    if error:
+        return None
+    pattern = (r"\s*(?:export\s+)?" + key + r"=(?:'([A-Za-z0-9][A-Za-z0-9_.:-]{0,95})'|"
+               r'"([A-Za-z0-9][A-Za-z0-9_.:-]{0,95})"|([A-Za-z0-9][A-Za-z0-9_.:-]{0,95}))\s*(?:#.*)?')
+    value = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        match = re.fullmatch(pattern, line)
+        if match:
+            value = next(group for group in match.groups() if group is not None)
+    return value
+
+
+def host_name(explicit, profile_path):
+    """The same order as dotsync: DF_MACHINE, then ~/.df-profile, then the short hostname."""
+    host = explicit or os.environ.get("DF_MACHINE") or literal_profile_value(profile_path, "DF_MACHINE")
+    if not host:
+        host = os.uname().nodename.split(".", 1)[0]
+    host = (host or "").lower()
+    return host if token(host) and ".." not in host else "unknown-local"
+
+
+def heartbeat_state(state_dir, now):
+    path = state_dir / "heartbeat.json"
+    raw, error = read_bounded(path, MAX_HEARTBEAT_BYTES)
+    if error == "missing":
+        return dict(path=label(path), status="missing", outcome="unknown")
+    data = None
+    if not error:
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                error = "invalid_schema"
+        except (ValueError, UnicodeError):
+            error = "invalid_json"
+    result = dict(path=label(path), status=error or "ok", outcome="unknown")
+    if error:
+        return result
+    timestamp = number(data.get("ts"))
+    if timestamp is None and isinstance(data.get("iso"), str):
+        try:
+            parsed = datetime.datetime.fromisoformat(data["iso"].replace("Z", "+00:00"))
+            timestamp = parsed.timestamp() if parsed.tzinfo else None
+        except (ValueError, OverflowError, OSError):
+            pass
+    if timestamp is not None and timestamp <= 0:
+        timestamp = None
+    result.update(host=token(data.get("host")), ts=timestamp,
+                  age_seconds=max(0, int(now - timestamp)) if timestamp else None,
+                  clock_skew=bool(timestamp and timestamp > now + 60),
+                  exit=integer(data.get("exit"), 0, 255), result=token(data.get("result")),
+                  phase=token(data.get("phase")),
+                  head=data.get("head") if isinstance(data.get("head"), str) and HASH.fullmatch(data["head"]) else None)
+    for key in ("pushed", "pulled", "peers_failed", "scheduled", "peer", "deferred", "pull_only"):
+        result[key] = integer(data.get(key))
+    result["outcome"] = "unknown" if result["exit"] is None else ("success" if result["exit"] == 0 else "failed")
+    if result["exit"] == 0 and result["result"] in ("running", "failed", "partial", "deferred", "stale-config"):
+        result["outcome"] = result["result"]
+    result["stale"] = result["age_seconds"] is not None and result["age_seconds"] > STALE_HEARTBEAT_SECONDS
+    return result
+
+
+def diagnostic_log_state(state_dir, now):
+    """Advertise the local detail log without reading any of it."""
+    path = state_dir / "last-run.log"
+    result = dict(path=label(path), status="missing", age_seconds=None, bytes=None)
+    try:
+        info = path.stat()
+        result.update(status="available" if stat.S_ISREG(info.st_mode) else "not_regular",
+                      age_seconds=max(0, int(now - info.st_mtime)), bytes=info.st_size)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        result["status"] = "unreadable"
+    return result
+
+
+def timing_state(state_dir):
+    path = state_dir / "dotsync-timing.log"
+    raw, error = read_bounded(path, TIMING_TAIL_BYTES, tail=True)
+    result = dict(path=label(path), status=error or "ok", completed=None, outcome="unknown")
+    if error:
+        return result
+    lines = raw.decode("utf-8", "replace").splitlines()
+    headers = [(index, re.match(r"^=== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) host=([A-Za-z0-9_.-]+) pid=(\d+)(?:\s|$)", line))
+               for index, line in enumerate(lines)]
+    headers = [(index, match) for index, match in headers if match]
+    if not headers:
+        result["status"] = "no_run_header_in_tail"
+        return result
+    index, header = headers[-1]
+    result.update(started_local=header[1], host=token(header[2]), pid=integer(int(header[3]), 1, 2**31 - 1),
+                  completed=False, last_phase=None, last_duration=None, total_duration=None)
+    for line in lines[index + 1:]:
+        step = re.fullmatch(r"\s+step ([A-Za-z0-9_.-]+)\s+(" + DURATION + r")", line)
+        total = re.fullmatch(r"\s+total\s+(" + DURATION + r")", line)
+        if step:
+            result.update(last_phase=token(step[1]), last_duration=step[2])
+        elif total:
+            result.update(completed=True, total_duration=total[1])
+    return result
+
+
+def private_path(path):
+    """dotsync's rule for its config and hooks: owned by you, writable by nobody else."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    return info.st_uid == os.getuid() and not stat.S_ISLNK(info.st_mode) and not info.st_mode & 0o022
+
+
+def config_state(config_dir):
+    path = config_dir / "config"
+    result = dict(path=label(path), status="absent", keys=[])
+    private = private_path(path)
+    if private is None:
+        return result
+    if private is False:
+        result["status"] = "unsafe"
+        return result
+    raw, error = read_bounded(path, MAX_CONFIG_BYTES)
+    if error:
+        result["status"] = error
+        return result
+    keys = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key = line.split("=", 1)[0]
+        if "=" in line and re.fullmatch(r"DOTSYNC_[A-Z0-9_]+", key):
+            keys.append(key)
+    result.update(status="ok", keys=sorted(set(keys)))
+    return result
+
+
+def config_values(config_dir):
+    """The DOTSYNC_* values the config file sets, the environment winning, as dotsync reads them."""
+    values = {}
+    raw, error = read_bounded(config_dir / "config", MAX_CONFIG_BYTES)
+    if not error and private_path(config_dir / "config"):
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):]
+            key, sep, value = line.partition("=")
+            if sep and re.fullmatch(r"DOTSYNC_[A-Z0-9_]+", key):
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                values[key] = value
+    values.update({k: v for k, v in os.environ.items() if k.startswith("DOTSYNC_")})
+    return values
+
+
+def peers_state(path, identity):
+    result = dict(path=label(path), status="missing", peers=0, other_identity=0, invalid=0)
+    raw, error = read_bounded(path, MAX_CONFIG_BYTES)
+    if error:
+        result["status"] = error
+        return result
+    result["status"] = "ok"
+    for line in raw.decode("utf-8", "replace").splitlines():
+        fields = line.split("#", 1)[0].split()
+        if not fields:
+            continue
+        name = fields[0]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) or ".." in name:
+            result["invalid"] += 1
+            continue
+        declared = fields[1] if len(fields) > 1 and fields[1] != "-" else None
+        if declared and identity and declared != identity:
+            result["other_identity"] += 1
+        else:
+            result["peers"] += 1
+    return result
+
+
+def hooks_state(hooks_dir):
+    result = dict(path=label(hooks_dir), status="absent", stages={})
+    private = private_path(hooks_dir)
+    if private is None:
+        return result
+    result["status"] = "ok" if private else "unsafe"
+    for stage in HOOK_STAGES:
+        directory = hooks_dir / (stage + ".d")
+        entry = dict(executable=0, ignored=0, unsafe=private_path(directory) is False)
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            names = []
+        for name in names:
+            path = directory / name
+            if name.startswith(".") or name.endswith(("~", ".disabled", ".sample")) or not path.is_file():
+                continue
+            if os.access(path, os.X_OK):
+                entry["executable"] += 1
+                if private_path(path) is False:
+                    entry["unsafe"] = True
+            else:
+                entry["ignored"] += 1
+        result["stages"][stage] = entry
+    return result
+
+
+def provider_state(values):
+    provider = values.get("DOTSYNC_COMMIT_MESSAGE_PROVIDER") or ("command" if values.get("DOTSYNC_COMMIT_MESSAGE_CMD") else "off")
+    result = dict(provider=provider if provider in ("off", "command", "anthropic", "bedrock") else "unknown")
+    key = PROVIDER_KEYS.get(provider)
+    if key:
+        result["credential"] = key
+        result["credential_set"] = bool(os.environ.get(key)) or bool(values.get("DOTSYNC_COMMIT_MESSAGE_ENV_FILE"))
+    if provider == "command":
+        result["command_set"] = bool(values.get("DOTSYNC_COMMIT_MESSAGE_CMD"))
+    return result
+
+
+def findings(report):
+    issues = []
+
+    def add(code, message, action, severity="warning"):
+        issues.append(dict(code=code, severity=severity, message=message, action=action))
+
+    repo = report["repository"]
+    if repo["status"] != "ok":
+        add("repository_unavailable", "Git state is unavailable (" + repo.get("reason", "unknown") + ").",
+            "Check the repository path (DOTFILES_DIR) and that git works.")
+    else:
+        if repo["in_progress"]:
+            add("git_operation", "Git operation in progress: " + ", ".join(repo["in_progress"]) + ".",
+                "Finish or abort it before syncing.")
+        if repo["dirty"]:
+            add("dirty_tree", "The working tree has local changes.",
+                "A manual dotsync commits them (after the secret scan); review them first.", "info")
+        if repo["branch"] == "(detached)":
+            add("detached_head", "HEAD is detached.", "Switch to the branch you sync before running dotsync.")
+        elif repo["upstream"] is None:
+            add("no_upstream", "This branch has no upstream, so dotsync cannot pull or push.",
+                "git branch --set-upstream-to origin/<branch>")
+        elif repo["ahead"] or repo["behind"]:
+            add("cached_divergence", "Cached tracking refs show unpublished or incoming commits.",
+                "A normal dotsync publishes and pulls them.", "info")
+    if report["pause"]["status"] == "paused":
+        add("paused", "Unattended syncs are paused.", "dotsync resume", "info")
+    elif report["pause"]["status"] != "active":
+        add("pause_unavailable", "The pause state is unusual (" + report["pause"]["status"] + ").",
+            "Inspect the pause path and its permissions.")
+    if report["lock"]["status"] == "unsafe":
+        add("lock_attention", "The lock file or its directory is owned by another user or open to group/other; "
+            "dotsync refuses it.", "Fix the ownership and modes (directory 0700, file 0600) without deleting a held lock.")
+    elif report["lock"]["status"] not in ("absent", "active", "unlocked"):
+        add("lock_attention", "Lock state: " + report["lock"]["status"] + ".", "Inspect the lock path.")
+    install = report["installation"]
+    if install["status"] not in ("linked", "copy_matches") or not install["executable"]:
+        add("installation_attention", "The installed dotsync is missing, different, or not executable.",
+            "./install.sh --with sync")
+    if not report["tools"]["gitleaks"]:
+        add("gitleaks_missing", "gitleaks is not installed: dotsync refuses to commit or push without it.",
+            "Install gitleaks (https://github.com/gitleaks/gitleaks).")
+    if not report["tools"]["ssh"]:
+        add("ssh_missing", "ssh is not installed: dotsync cannot update peers.", "Install OpenSSH.", "info")
+    peers = report["peers"]
+    if peers["status"] == "missing":
+        add("no_peers_file", "No peers file: dotsync syncs only this machine.",
+            "List your other machines, one ssh alias per line, in " + peers["path"] + ".", "info")
+    elif peers["status"] != "ok":
+        add("peers_unreadable", "The peers file is " + peers["status"] + ".", "Inspect " + peers["path"] + ".")
+    elif peers["invalid"]:
+        add("peers_invalid", "%d line(s) of the peers file name no valid ssh alias." % peers["invalid"],
+            "Use one alias per line: letters, digits, dot, dash, underscore.")
+    if report["identity"] is None:
+        add("no_identity", "This machine has no identity (DF_IDENTITY in ~/.df-profile): peers are never synced.",
+            "./install.sh --with shell --identity <name>")
+    if report["config"]["status"] == "unsafe":
+        add("config_unsafe", "The config file is not private to you, so dotsync ignores it.",
+            "chmod 600 " + report["config"]["path"])
+    hooks = report["hooks"]
+    if hooks["status"] == "unsafe" or any(s["unsafe"] for s in hooks["stages"].values()):
+        add("hooks_unsafe", "A hooks directory or hook is writable by others, so dotsync refuses it.",
+            "chmod go-w on the hooks directory and its hooks.")
+    if any(s["ignored"] for s in hooks["stages"].values()):
+        add("hooks_not_executable", "Some files in the hooks directories are not executable and never run.",
+            "chmod +x the hooks you mean to run.", "info")
+    provider = report["commit_messages"]
+    if provider.get("credential") and not provider.get("credential_set"):
+        add("provider_credential_missing", "The " + provider["provider"] + " commit-message provider has no "
+            + provider["credential"] + " here; commits keep their generic subject.",
+            "Export it, or name a file holding it in DOTSYNC_COMMIT_MESSAGE_ENV_FILE.", "info")
+    if provider["provider"] == "unknown":
+        add("provider_unknown", "DOTSYNC_COMMIT_MESSAGE_PROVIDER is not off, command, anthropic or bedrock.",
+            "Fix the setting; commits keep their generic subject meanwhile.")
+    hb = report["heartbeat"]
+    if hb["status"] != "ok":
+        add("heartbeat_unavailable", "No usable local heartbeat (" + hb["status"] + ").",
+            "Run dotsync once; every run writes one.", "info")
+    elif hb["outcome"] == "failed":
+        add("last_sync_failed", "The latest heartbeat reports a failure (exit " + str(hb["exit"]) + ", phase "
+            + str(hb.get("phase")) + ").", "See the detail log and the phase; local commits are kept.")
+    elif hb["outcome"] == "unknown":
+        add("heartbeat_outcome_unknown", "The heartbeat has no valid exit status.", "Run dotsync once.", "info")
+    elif hb["outcome"] == "stale-config":
+        add("stale_config", "The latest run did not reach the commit it was sent.",
+            "Check the branch and the cached comparison before the next sync.")
+    elif hb["outcome"] == "partial":
+        add("partial_sync", "The latest run left some peers incomplete.", "dotsync status lists them.")
+    elif hb["outcome"] in ("deferred", "running"):
+        add("sync_" + hb["outcome"], "The latest run reports " + hb["outcome"] + ".",
+            "Check the pause; a deferral clears once nobody is editing the checkout.", "info")
+    if hb["status"] == "ok" and hb.get("age_seconds") is None:
+        add("heartbeat_age_unknown", "The heartbeat has no valid timestamp.", "Run dotsync once.", "info")
+    if hb.get("stale"):
+        add("stale_heartbeat", "The latest heartbeat is more than a day old.", "Check the schedule, the pause and the lock.")
+    if hb.get("clock_skew"):
+        add("heartbeat_clock_skew", "The heartbeat timestamp is in the future.", "Check the clock.")
+    if hb.get("peers_failed"):
+        add("peer_sync_failed", "The latest heartbeat reports %d incomplete peer(s)." % hb["peers_failed"],
+            "dotsync status, and each peer's log in the state directory.")
+    timing = report["timing"]
+    if timing["status"] not in ("ok", "missing"):
+        add("timing_unavailable", "The timing log is " + timing["status"] + ".", "Inspect it if you need phase timings.", "info")
+    elif timing["status"] == "ok" and timing["completed"] is False:
+        add("timing_incomplete", "The latest run has no completion footer (still running, or killed).",
+            "Check the lock before retrying.", "info")
+    return issues
+
+
+def readable(report):
+    repo, hb, timing = report["repository"], report["heartbeat"], report["timing"]
+
+    def known(value):
+        return "?" if value is None else value
+
+    print("dotsync doctor: " + report["health"] + " (local, read-only)")
+    print("host: {}  identity: {}".format(report["host"], report["identity"] or "unknown"))
+    print("repository: " + repo["path"])
+    if repo["status"] == "ok":
+        print("  branch: {}  head: {}  upstream: {}".format(repo["branch"] or "unknown", (repo["head"] or "unborn/unknown")[:12], repo["upstream"] or "none"))
+        print("  cached ahead/behind: {}/{}  dirty entries: {}  operation: {}".format(
+            known(repo["ahead"]), known(repo["behind"]), repo["dirty_entries"],
+            ", ".join(repo["in_progress"]) if repo["in_progress"] else ("none" if repo["in_progress"] == [] else "unknown")))
+    else:
+        print("  unavailable: " + repo.get("reason", "unknown"))
+    pause, lock = report["pause"], report["lock"]
+    pause_text = "not paused" if pause["status"] == "active" else "{} (age {}s)".format(pause["status"], known(pause["age_seconds"]))
+    print("pause: {}  lock: {} (kernel flock probe)".format(pause_text, lock["status"]))
+    print("installation: {}  {} -> {}".format(report["installation"]["status"], report["installation"]["installed"],
+                                             report["installation"].get("resolved_installed") or "unknown"))
+    peers = report["peers"]
+    print("peers file: {} ({} peer(s), {} for another identity, {} invalid)  {}".format(
+        peers["status"], peers["peers"], peers["other_identity"], peers["invalid"], peers["path"]))
+    hooks = report["hooks"]
+    print("hooks: {}  {}".format(hooks["status"], ", ".join(
+        "{} {}".format(stage, entry["executable"]) for stage, entry in hooks["stages"].items()) or hooks["path"]))
+    provider = report["commit_messages"]
+    print("commit messages: {}{}  gitleaks: {}  ssh: {}".format(
+        provider["provider"],
+        "" if "credential" not in provider else " ({} {})".format(provider["credential"], "set" if provider["credential_set"] else "not set"),
+        "found" if report["tools"]["gitleaks"] else "MISSING", "found" if report["tools"]["ssh"] else "missing"))
+    print("heartbeat: {}  exit: {}  age: {}s  result: {}  phase: {}".format(
+        hb["outcome"] if hb["status"] == "ok" else hb["status"], known(hb.get("exit")),
+        known(hb.get("age_seconds")), hb.get("result") or "not recorded", hb.get("phase") or "not recorded"))
+    print("timing: {}  last phase: {}  total: {} (timing does not establish success)".format(
+        ("footer present" if timing["completed"] else "incomplete") if timing["status"] == "ok" else timing["status"],
+        timing.get("last_phase") or "unknown", timing.get("total_duration") or "unknown"))
+    print("detail log: {} ({})".format(report["detail_log"]["path"], report["detail_log"]["status"]))
+    print("Tracking counts use cached refs. No network checks were run.")
+    for issue in report["issues"]:
+        print("- " + issue["message"] + " " + issue["action"])
+
+
+def default_repo():
+    if os.environ.get("DOTFILES_DIR"):
+        return Path(os.environ["DOTFILES_DIR"])
+    here = Path(__file__).resolve().parent.parent
+    if (here / ".git").exists() and (here / "scripts" / "dotsync").is_file():
+        return here
+    return Path.home() / ".dotfiles"
+
+
+def main():
+    home = Path.home()
+    state_home = Path(os.environ.get("XDG_STATE_HOME") or home / ".local" / "state")
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or home / ".local" / "state")
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--json", action="store_true", help="print a structured report")
+    parser.add_argument("--repo", type=Path, default=default_repo())
+    parser.add_argument("--state-dir", type=Path,
+                        default=Path(os.environ.get("DOTSYNC_STATE_DIR") or state_home / "dotsync"))
+    parser.add_argument("--config-dir", type=Path,
+                        default=Path(os.environ.get("DOTSYNC_CONFIG_DIR") or config_home / "dotsync"))
+    parser.add_argument("--installed-path", type=Path, default=home / ".local" / "bin" / "dotsync")
+    parser.add_argument("--lock-file", type=Path,
+                        default=Path(os.environ.get("DOTSYNC_LOCK_FILE") or runtime_dir / "dotsync" / "lock"))
+    parser.add_argument("--profile-path", type=Path, default=home / ".df-profile")
+    parser.add_argument("--host", help="the machine name to report (default: as dotsync derives it)")
+    args = parser.parse_args()
+    if args.host and not token(args.host):
+        parser.error("--host must be a short name of letters, digits, dots, dashes or underscores")
+    now = time.time()
+    repo = args.repo.expanduser().absolute()
+    state_dir = args.state_dir.expanduser()
+    config_dir = args.config_dir.expanduser()
+    values = config_values(config_dir)
+    identity = os.environ.get("DF_IDENTITY") or literal_profile_value(args.profile_path.expanduser(), "DF_IDENTITY")
+    identity = identity if token(identity) else None
+    peers_path = Path(values.get("DOTSYNC_PEERS_FILE") or config_dir / "peers").expanduser()
+    hooks_dir = Path(values.get("DOTSYNC_HOOKS_DIR") or config_dir / "hooks").expanduser()
+    report = dict(schema_version=1, host=host_name(args.host, args.profile_path.expanduser()), identity=identity,
+                  checked_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  read_only=True, network_checked=False,
+                  repository=repository_state(repo), pause=pause_state(state_dir, now),
+                  lock=lock_file_state(args.lock_file.expanduser()),
+                  installation=installation_state(repo, args.installed_path.expanduser()),
+                  peers=peers_state(peers_path, identity), hooks=hooks_state(hooks_dir),
+                  config=config_state(config_dir), commit_messages=provider_state(values),
+                  tools=dict(gitleaks=bool(shutil.which("gitleaks")), ssh=bool(shutil.which("ssh"))),
+                  heartbeat=heartbeat_state(state_dir, now), timing=timing_state(state_dir),
+                  detail_log=diagnostic_log_state(state_dir, now))
+    report["issues"] = findings(report)
+    report["health"] = "attention" if any(i["severity"] == "warning" for i in report["issues"]) else ("info" if report["issues"] else "ok")
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        readable(report)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
