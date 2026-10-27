@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import statistics
+import stat
+import sys
+import tempfile
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DISPOSITION_FIELDS = ("confirmed", "false_positive", "not_actionable")
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def discover_repo_root(start: Path) -> Path | None:
+    current = start.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def fallback_log_dir() -> Path:
+    identity = (
+        str(os.getuid())
+        if hasattr(os, "getuid")
+        else hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:12]
+    )
+    return Path(tempfile.gettempdir()).resolve() / f"autoreview-state-{identity}"
+
+
+def fallback_log_dirs() -> list[Path]:
+    legacy = fallback_log_dir()
+    candidates = [legacy]
+    try:
+        matches = sorted(legacy.parent.glob(f"{legacy.name}-*"))
+    except OSError:
+        matches = []
+    for match in matches:
+        if match not in candidates:
+            candidates.append(match)
+    return candidates
+
+
+def private_directory_available(path: Path) -> bool:
+    try:
+        path_stat = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISDIR(path_stat.st_mode):
+        return False
+    if hasattr(os, "getuid") and path_stat.st_uid != os.getuid():
+        return False
+    if path_stat.st_mode & 0o022:
+        return False
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def implicit_log_candidates() -> tuple[Path, Path]:
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    candidate = (
+        Path(state_home).expanduser()
+        if state_home
+        else Path.home() / ".local" / "state"
+    ) / "autoreview"
+    return candidate, fallback_log_dir()
+
+
+def private_history_root_available(path: Path) -> bool:
+    return private_directory_available(path) and private_directory_available(
+        path / "runs"
+    )
+
+
+def private_file_available(path: Path) -> bool:
+    try:
+        path_stat = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(path_stat.st_mode):
+        return False
+    if hasattr(os, "getuid") and path_stat.st_uid != os.getuid():
+        return False
+    return not bool(path_stat.st_mode & 0o022)
+
+
+def default_log_dirs() -> list[Path]:
+    configured = os.environ.get("AUTOREVIEW_RUN_LOG_DIR", "").strip()
+    if configured:
+        return [Path(configured).expanduser()]
+    candidate, _fallback = implicit_log_candidates()
+    runs_root = (candidate.resolve() / "runs").resolve()
+    repos = {
+        repo
+        for repo in (
+            discover_repo_root(runs_root),
+            discover_repo_root(Path.cwd()),
+        )
+        if repo is not None
+    }
+    candidate_overlaps_repo = False
+    for repo in repos:
+        if runs_root.is_relative_to(repo) or repo.is_relative_to(runs_root):
+            candidate_overlaps_repo = True
+            break
+
+    roots: list[Path] = []
+    root_candidates = [
+        (candidate.resolve(), not candidate_overlaps_repo),
+        *((fallback, True) for fallback in fallback_log_dirs()),
+    ]
+    for root, eligible in root_candidates:
+        if not eligible:
+            continue
+        if private_history_root_available(root):
+            if root not in roots:
+                roots.append(root)
+            continue
+        if root.exists() or (root / "runs").exists():
+            print(
+                "ignoring unsafe or incomplete implicit autoreview history root",
+                file=sys.stderr,
+            )
+    return roots
+
+
+def default_log_dir() -> Path:
+    roots = default_log_dirs()
+    if roots:
+        return roots[0]
+    return implicit_log_candidates()[0]
+
+
+def percentile(values: list[float], percentage: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    index = max(0, min(len(ordered) - 1, int(len(ordered) * percentage + 0.999) - 1))
+    return ordered[index]
+
+
+def load_runs(root: Path) -> list[dict[str, Any]]:
+    runs_root = root / "runs"
+    if not runs_root.is_dir():
+        raise SystemExit(f"autoreview history not found: {runs_root}")
+    runs: list[tuple[int, str, dict[str, Any]]] = []
+    for path in sorted(runs_root.glob("*/metadata.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"invalid history JSON at {path}: {exc}") from exc
+        if isinstance(value, dict):
+            started = value.get("started_at_unix_ns")
+            if not isinstance(started, int):
+                started = path.stat().st_mtime_ns
+            runs.append((started, str(value.get("run_id") or path.parent.name), value))
+    runs.sort(key=lambda item: (item[0], item[1]))
+    return [value for _, _, value in runs]
+
+
+def load_run_roots(roots: list[Path]) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    seen_run_ids: set[str] = set()
+    for root in roots:
+        for run in load_runs(root):
+            run_id = str(run.get("run_id") or "")
+            if run_id and run_id in seen_run_ids:
+                continue
+            if run_id:
+                seen_run_ids.add(run_id)
+            runs.append(run)
+    return sorted(
+        runs,
+        key=lambda run: (
+            int(run.get("started_at_unix_ns") or 0),
+            str(run.get("run_id") or ""),
+        ),
+    )
+
+
+def finding_disposition(reviewer: dict[str, Any]) -> dict[str, int]:
+    reported = reviewer.get("findings")
+    if isinstance(reported, bool) or not isinstance(reported, int) or reported < 0:
+        if (
+            reviewer.get("finding_disposition") is not None
+            and reviewer.get("status") not in {"failed", "running"}
+        ):
+            raise SystemExit(
+                "invalid finding disposition: reviewer finding count is unavailable"
+            )
+        reported = 0
+    raw = reviewer.get("finding_disposition")
+    counts = {field: 0 for field in DISPOSITION_FIELDS}
+    if raw is not None:
+        if not isinstance(raw, dict):
+            raise SystemExit("invalid finding disposition metadata")
+        for field in DISPOSITION_FIELDS:
+            value = raw.get(field, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise SystemExit(
+                    f"invalid finding disposition count for {field}: {value!r}"
+                )
+            counts[field] = value
+    dispositioned = sum(counts.values())
+    if dispositioned > reported:
+        raise SystemExit(
+            "invalid finding disposition: categorized findings exceed reported findings"
+        )
+    pending = reported - dispositioned
+    if raw is not None and "pending" in raw:
+        stored_pending = raw["pending"]
+        if (
+            isinstance(stored_pending, bool)
+            or not isinstance(stored_pending, int)
+            or stored_pending != pending
+        ):
+            raise SystemExit("invalid finding disposition pending count")
+    return {
+        "reported": reported,
+        **counts,
+        "pending": pending,
+    }
+
+
+def find_run_metadata(roots: list[Path], run_id: str) -> Path:
+    if RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise SystemExit(f"invalid autoreview run id: {run_id!r}")
+    matches: list[Path] = []
+    for root in roots:
+        resolved_root = root.expanduser().resolve()
+        if not private_history_root_available(resolved_root):
+            continue
+        metadata_path = resolved_root / "runs" / run_id / "metadata.json"
+        if private_directory_available(metadata_path.parent) and private_file_available(
+            metadata_path
+        ):
+            matches.append(metadata_path)
+    if not matches:
+        raise SystemExit(f"autoreview run not found in private history roots: {run_id}")
+    unique_matches = list(dict.fromkeys(path.resolve() for path in matches))
+    if len(unique_matches) != 1:
+        raise SystemExit(
+            f"autoreview run exists in multiple history roots; pass --log-dir: {run_id}"
+        )
+    return unique_matches[0]
+
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def record_finding_disposition(
+    roots: list[Path],
+    run_id: str,
+    reviewer_run_id: int,
+    *,
+    confirmed: int | None,
+    false_positive: int | None,
+    not_actionable: int | None,
+) -> dict[str, Any]:
+    if reviewer_run_id <= 0:
+        raise SystemExit("--reviewer-run-id must be greater than zero")
+    updates = {
+        "confirmed": confirmed,
+        "false_positive": false_positive,
+        "not_actionable": not_actionable,
+    }
+    if all(value is None for value in updates.values()):
+        raise SystemExit(
+            "recording a disposition requires --confirmed, --false-positive, "
+            "or --not-actionable"
+        )
+    for field, value in updates.items():
+        if value is not None and value < 0:
+            raise SystemExit(f"--{field.replace('_', '-')} must not be negative")
+
+    metadata_path = find_run_metadata(roots, run_id)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid history JSON at {metadata_path}: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise SystemExit(f"invalid history metadata at {metadata_path}")
+    if metadata.get("status") == "running":
+        raise SystemExit("cannot disposition findings while an autoreview run is active")
+    reviewers = metadata.get("reviewer_runs")
+    if not isinstance(reviewers, list):
+        raise SystemExit(f"autoreview run has no reviewer history: {run_id}")
+    reviewer = next(
+        (
+            item
+            for item in reviewers
+            if isinstance(item, dict)
+            and item.get("reviewer_run_id") == reviewer_run_id
+        ),
+        None,
+    )
+    if reviewer is None:
+        raise SystemExit(
+            f"reviewer run {reviewer_run_id} not found in autoreview run {run_id}"
+        )
+    current = finding_disposition(reviewer)
+    counts = {
+        field: current[field] if value is None else value
+        for field, value in updates.items()
+    }
+    reported = current["reported"]
+    dispositioned = sum(counts.values())
+    if dispositioned > reported:
+        raise SystemExit(
+            f"finding disposition total {dispositioned} exceeds "
+            f"reviewer-reported findings {reported}"
+        )
+    disposition = {
+        **counts,
+        "pending": reported - dispositioned,
+        "updated_at": utc_timestamp(),
+    }
+    reviewer["finding_disposition"] = disposition
+    atomic_write_json(metadata_path, metadata)
+    return {
+        "run_id": run_id,
+        "reviewer_run_id": reviewer_run_id,
+        "engine": reviewer.get("engine"),
+        "model": reviewer.get("model"),
+        "thinking": reviewer.get("thinking"),
+        "reported": reported,
+        **disposition,
+    }
+
+
+def summarize(runs: list[dict[str, Any]], engine: str | None) -> dict[str, Any]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    review_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+
+    def configuration_key(record: dict[str, Any]) -> tuple[Any, ...]:
+        speed_requested = record.get("speed_requested")
+        if speed_requested is None and "speed" in record:
+            speed_requested = record.get("speed")
+        if speed_requested is None:
+            speed_requested = (
+                "inherited" if record.get("engine") == "codex" else "n/a"
+            )
+        return (
+            record.get("engine"),
+            record.get("model"),
+            record.get("thinking"),
+            record.get("auth"),
+            record.get("profile"),
+            speed_requested,
+        )
+
+    for run in runs:
+        attempts = [
+            attempt
+            for attempt in run.get("attempts", [])
+            if isinstance(attempt, dict)
+        ]
+        reviewers = [
+            reviewer
+            for reviewer in run.get("reviewer_runs", [])
+            if isinstance(reviewer, dict)
+        ]
+        for reviewer in reviewers:
+            if reviewer.get("status") != "running" and (
+                not engine or reviewer.get("engine") == engine
+            ):
+                review_groups[configuration_key(reviewer)].append(reviewer)
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or attempt.get("status") == "running":
+                continue
+            if engine and attempt.get("engine") != engine:
+                continue
+            groups[configuration_key(attempt)].append(attempt)
+
+    configurations: list[dict[str, Any]] = []
+    for key in groups.keys() | review_groups.keys():
+        attempts = groups.get(key, [])
+        reviews = review_groups.get(key, [])
+        dispositions = [finding_disposition(review) for review in reviews]
+        findings_reported = sum(item["reported"] for item in dispositions)
+        findings_confirmed = sum(item["confirmed"] for item in dispositions)
+        findings_false_positive = sum(
+            item["false_positive"] for item in dispositions
+        )
+        findings_not_actionable = sum(
+            item["not_actionable"] for item in dispositions
+        )
+        findings_pending = sum(item["pending"] for item in dispositions)
+        findings_rated = findings_confirmed + findings_false_positive
+        durations = [
+            float(attempt["duration_seconds"])
+            for attempt in attempts
+            if isinstance(attempt.get("duration_seconds"), (int, float))
+        ]
+        configurations.append(
+            {
+                "engine": key[0],
+                "model": key[1],
+                "thinking": key[2],
+                "auth": key[3],
+                "profile": key[4],
+                "speed_requested": key[5],
+                "reviews": len(reviews),
+                "review_completed": sum(
+                    review.get("status") == "completed" for review in reviews
+                ),
+                "review_failures": sum(
+                    review.get("status") == "failed" for review in reviews
+                ),
+                "attempts": len(attempts),
+                "completed": sum(attempt.get("status") == "completed" for attempt in attempts),
+                "refusals": sum(bool(attempt.get("refusal")) for attempt in attempts),
+                "failures": sum(
+                    attempt.get("status") in {"failed", "model_unavailable"}
+                    for attempt in attempts
+                ),
+                "fallback_attempts": sum(attempt.get("reason") != "primary" for attempt in attempts),
+                "findings_reported": findings_reported,
+                "findings_confirmed": findings_confirmed,
+                "findings_false_positive": findings_false_positive,
+                "findings_not_actionable": findings_not_actionable,
+                "findings_pending": findings_pending,
+                "confirmation_rate": (
+                    round(findings_confirmed / findings_rated, 3)
+                    if findings_rated
+                    else None
+                ),
+                "false_positive_rate": (
+                    round(findings_false_positive / findings_rated, 3)
+                    if findings_rated
+                    else None
+                ),
+                "average_seconds": round(statistics.fmean(durations), 3) if durations else 0.0,
+                "p50_seconds": round(statistics.median(durations), 3) if durations else 0.0,
+                "p95_seconds": round(percentile(durations, 0.95), 3) if durations else 0.0,
+            }
+        )
+    configurations.sort(
+        key=lambda item: (
+            str(item["engine"]),
+            str(item["model"]),
+            str(item["thinking"]),
+            str(item["speed_requested"]),
+        )
+    )
+    return {
+        "runs": len(runs),
+        "clean_runs": sum(
+            (run.get("result") or {}).get("outcome") == "clean" for run in runs
+        ),
+        "error_runs": sum(run.get("status") == "error" for run in runs),
+        "configurations": configurations,
+    }
+
+
+def render(summary: dict[str, Any]) -> None:
+    print(
+        f"runs={summary['runs']} clean={summary['clean_runs']} "
+        f"errors={summary['error_runs']}"
+    )
+    rows = summary["configurations"]
+    if not rows:
+        print("no completed reviewer attempts")
+        return
+    headers = (
+        "engine",
+        "model",
+        "thinking",
+        "auth",
+        "speed_req",
+        "reviews",
+        "review_ok",
+        "review_fail",
+        "attempts",
+        "attempt_ok",
+        "refused",
+        "failed",
+        "fallback",
+        "reported",
+        "confirmed",
+        "false_pos",
+        "not_action",
+        "pending",
+        "confirm_rate",
+        "fp_rate",
+        "avg_s",
+        "p50_s",
+        "p95_s",
+    )
+    values = [
+        (
+            row["engine"] or "-",
+            row["model"] or "-",
+            row["thinking"] or "-",
+            row["auth"] or "-",
+            row["speed_requested"] or "-",
+            str(row["reviews"]),
+            str(row["review_completed"]),
+            str(row["review_failures"]),
+            str(row["attempts"]),
+            str(row["completed"]),
+            str(row["refusals"]),
+            str(row["failures"]),
+            str(row["fallback_attempts"]),
+            str(row["findings_reported"]),
+            str(row["findings_confirmed"]),
+            str(row["findings_false_positive"]),
+            str(row["findings_not_actionable"]),
+            str(row["findings_pending"]),
+            (
+                "-"
+                if row["confirmation_rate"] is None
+                else str(row["confirmation_rate"])
+            ),
+            (
+                "-"
+                if row["false_positive_rate"] is None
+                else str(row["false_positive_rate"])
+            ),
+            str(row["average_seconds"]),
+            str(row["p50_seconds"]),
+            str(row["p95_seconds"]),
+        )
+        for row in rows
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in values))
+        for index in range(len(headers))
+    ]
+    print("  ".join(value.ljust(widths[index]) for index, value in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in values:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Summarize persistent autoreview timing, fallback, and verified "
+            "finding-disposition history."
+        )
+    )
+    parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--last", type=int, help="Use only the most recent N runs.")
+    parser.add_argument("--engine", help="Filter reviewer attempts by engine.")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable summary JSON.")
+    parser.add_argument(
+        "--record-disposition",
+        metavar="RUN_ID",
+        help="Record verified finding dispositions for one completed run.",
+    )
+    parser.add_argument(
+        "--reviewer-run-id",
+        type=int,
+        help="Reviewer run to annotate with verified finding dispositions.",
+    )
+    parser.add_argument("--confirmed", type=int)
+    parser.add_argument("--false-positive", type=int)
+    parser.add_argument("--not-actionable", type=int)
+    args = parser.parse_args()
+    if args.last is not None and args.last <= 0:
+        raise SystemExit("--last must be greater than zero")
+    roots = (
+        [args.log_dir.expanduser().resolve()]
+        if args.log_dir is not None
+        else default_log_dirs()
+    )
+    if not roots:
+        raise SystemExit("autoreview history not found in private default roots")
+    disposition_requested = args.record_disposition is not None
+    disposition_options = (
+        args.reviewer_run_id,
+        args.confirmed,
+        args.false_positive,
+        args.not_actionable,
+    )
+    if not disposition_requested and any(
+        value is not None for value in disposition_options
+    ):
+        raise SystemExit(
+            "disposition options require --record-disposition RUN_ID"
+        )
+    if disposition_requested:
+        if args.reviewer_run_id is None:
+            raise SystemExit(
+                "--record-disposition requires --reviewer-run-id"
+            )
+        if args.last is not None or args.engine is not None:
+            raise SystemExit(
+                "--record-disposition cannot be combined with --last or --engine"
+            )
+        disposition = record_finding_disposition(
+            roots,
+            args.record_disposition,
+            args.reviewer_run_id,
+            confirmed=args.confirmed,
+            false_positive=args.false_positive,
+            not_actionable=args.not_actionable,
+        )
+        if args.json:
+            print(json.dumps(disposition, indent=2))
+        else:
+            print(
+                "recorded finding disposition: "
+                f"run={disposition['run_id']} "
+                f"reviewer_run_id={disposition['reviewer_run_id']} "
+                f"confirmed={disposition['confirmed']} "
+                f"false_positive={disposition['false_positive']} "
+                f"not_actionable={disposition['not_actionable']} "
+                f"pending={disposition['pending']}"
+            )
+        return 0
+    runs = load_run_roots(roots)
+    if args.last is not None:
+        runs = runs[-args.last :]
+    summary = summarize(runs, args.engine)
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        render(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

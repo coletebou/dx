@@ -1,0 +1,3 @@
+# LF on every checkout (the helper and harness run as scripts; Windows CRLF breaks the shebang).
+scripts/autoreview text eol=lf
+scripts/test-review-harness text eol=lf
