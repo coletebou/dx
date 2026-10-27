@@ -110,16 +110,18 @@ osc7_path="$(tmux_q '#{pane_path}')"
 # self-correcting: quit ssh and the pane reports its shell again on the next
 # keypress. There is no cached state that can go stale, and therefore nothing to
 # invalidate — which is why this whole feature needs no bookkeeping.
+#
+# Plain ssh only. sshpass, autossh and mosh have argv grammars of their own:
+# read as ssh's, `sshpass -p PASSWORD ssh host` would make the password ssh's
+# port (and ssh's "Bad port" error would print it), so they get the plain window.
 case "$pane_cmd" in
-    ssh|sshpass|autossh|mosh|mosh-client) ;;
+    ssh) ;;
     *) plain "$local_path" ;;
 esac
 [[ -n "$pane_pid" ]] || plain "$local_path"
 
 # ── Recover the ssh argv from the pane's DIRECT children (see note 1) ───────
 
-# NUL-delimited so an argument containing whitespace (e.g. -o "SetEnv=X=a b")
-# survives into the array intact.
 read_children() {
     if command -v pgrep >/dev/null 2>&1; then
         # -P is POSIX-ish and present on macOS + Linux; it is depth-1 by
@@ -134,20 +136,32 @@ read_children() {
     fi
 }
 
+# read_argv PID: the process's argv into ssh_argv, with its real boundaries where
+# the OS keeps them. Linux's /proc/PID/cmdline is NUL-separated, so an argument
+# with spaces (-i '/keys/my key', -o "SetEnv=X=a b") survives intact. BSD ps
+# (macOS) only has the flattened string, so there such an argument is split.
+read_argv() {
+    ssh_argv=()
+    if [[ -r "/proc/$1/cmdline" ]]; then
+        local a
+        while IFS= read -r -d '' a; do ssh_argv+=("$a"); done < "/proc/$1/cmdline"
+    else
+        local flat
+        flat="$(ps -o args= -p "$1" 2>/dev/null)"
+        set -f  # split the words, but never glob them
+        # shellcheck disable=SC2206  # deliberate word-split of a flat ps string
+        ssh_argv=($flat)
+        set +f
+    fi
+}
+
 ssh_argv=()
 for kid in $(read_children); do
-    kid_args="$(ps -o args= -p "$kid" 2>/dev/null)"
-    [[ -n "$kid_args" ]] || continue
-    # First word must be an ssh-family binary. Matching the whole string would
-    # hit `vim ssh_config` or `git commit -m "fix ssh"`.
-    kid_bin="${kid_args%% *}"; kid_bin="${kid_bin##*/}"
-    case "$kid_bin" in
-        ssh|sshpass|autossh|mosh|mosh-client) ;;
-        *) continue ;;
-    esac
-    # shellcheck disable=SC2206  # deliberate word-split of a flat ps string
-    ssh_argv=($kid_args)
-    break
+    read_argv "$kid"
+    # argv[0] must be ssh itself. Matching the whole command line would hit
+    # `vim ssh_config` or `git commit -m "fix ssh"`.
+    [[ ${#ssh_argv[@]} -gt 0 && "${ssh_argv[0]##*/}" == ssh ]] && break
+    ssh_argv=()
 done
 
 [[ ${#ssh_argv[@]} -gt 0 ]] || plain "$local_path"
@@ -159,7 +173,7 @@ done
 # ssh(1): the arg-taking set must be exact, since treating a bare flag as
 # arg-taking would swallow the destination as its value (and vice versa).
 split_argv() {
-    conn_args=(); dest=""; i=1
+    conn_args=(); dest=""; have_t=0; i=1
     local n=${#ssh_argv[@]}
     while (( i < n )); do
         local a="${ssh_argv[i]}"
@@ -173,6 +187,8 @@ split_argv() {
                 # Keeping any of them yields a window with no usable shell.
                 local keep="${a//[fNnMTsGV]/}"
                 [[ "$keep" != "-" && -n "$keep" ]] && conn_args+=("$keep")
+                # Only here is a t the -t flag: in -Jbastion or -lroot it is a value.
+                [[ "$keep" == *t* ]] && have_t=1
                 ((i++)) ;;
             -[bcDEeFIiJLlmOopQRSWw])
                 # Separated value: -o Foo=bar
@@ -198,8 +214,10 @@ split_argv
 # window to the existing master's socket; if that connection dies (or was
 # opened -O exit) the window dies with it. Multiplexing still applies via
 # ssh_config, which is where multiplexing belongs.
+# ${x[@]+"${x[@]}"}: an empty array is "unbound" to bash 3.2 (macOS) under set -u,
+# and plain `ssh host` has no connection args at all.
 filtered=(); skip_next=0
-for a in "${conn_args[@]}"; do
+for a in ${conn_args[@]+"${conn_args[@]}"}; do
     if (( skip_next )); then skip_next=0; continue; fi
     case "$a" in
         -S) skip_next=1; continue ;;
@@ -207,7 +225,7 @@ for a in "${conn_args[@]}"; do
     esac
     filtered+=("$a")
 done
-conn_args=("${filtered[@]}")
+conn_args=(${filtered[@]+"${filtered[@]}"})
 
 # ── Decide the remote directory (see note 2 on OSC 7) ──────────────────────
 
@@ -247,9 +265,7 @@ fi
 # ── Build the remote command ────────────────────────────────────────────────
 #
 # -t forces a pty (the recovered argv may have carried -T, and without a pty
-# there is no usable interactive shell).
-have_t=0
-for a in "${conn_args[@]}"; do [[ "$a" == "-t" || "$a" == -*t* ]] && have_t=1; done
+# there is no usable interactive shell). split_argv saw whether it was there.
 (( have_t )) || conn_args+=("-t")
 
 if [[ -n "$remote_dir" ]]; then
@@ -270,8 +286,12 @@ fi
 # for the `sh -c` that tmux will run it under.
 shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
-cmdline="exec command ssh"
-for a in "${conn_args[@]}"; do cmdline+=" $(shq "$a")"; done
+# tmux runs it with default-shell -c, which is any shell. `exec env ssh` works in
+# all of them and skips a shell function named ssh: `exec command ssh` fails in sh
+# and bash (exec runs files, and there is no file called `command`), and a bare
+# `exec ssh` runs such a function in zsh.
+cmdline="exec env ssh"
+for a in ${conn_args[@]+"${conn_args[@]}"}; do cmdline+=" $(shq "$a")"; done
 cmdline+=" $(shq "$dest") $(shq "$remote_cmd")"
 
 # Name the window for the host, and pin it: automatic-rename would immediately

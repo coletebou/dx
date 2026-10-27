@@ -21,16 +21,14 @@ elif command -v xsel >/dev/null 2>&1; then
 elif [[ -n "${SSH_CONNECTION:-}" || -n "${TMUX:-}" ]]; then
     # OSC 52: remote session. Ask outer terminal to copy.
     # Works in iTerm2, Ghostty, WezTerm, Kitty, Alacritty, Windows Terminal.
-    # Requires `set -g allow-passthrough on` in tmux.conf.
+    # Not by printing the sequence: run-shell captures this script's stdout and
+    # shows it in view mode, so it would never reach the terminal. load-buffer -w
+    # (tmux 3.2+) hands the text to tmux, which sends OSC 52 to the client itself
+    # (`set -s set-clipboard on` in tmux.conf).
     buf="$(tmux capture-pane -p -S - -E -)"
     lines="$(printf '%s\n' "$buf" | wc -l | tr -d ' ')"
     bytes="$(printf '%s' "$buf" | wc -c | tr -d ' ')"
-    b64="$(printf '%s' "$buf" | base64 | tr -d '\n')"
-    if [[ -n "${TMUX:-}" ]]; then
-        printf '\ePtmux;\e\e]52;c;%s\a\e\\' "$b64"
-    else
-        printf '\e]52;c;%s\a' "$b64"
-    fi
+    printf '%s' "$buf" | tmux load-buffer -w -
     tmux display-message "copied ${lines} lines / ${bytes} bytes via OSC 52"
     exit 0
 else
