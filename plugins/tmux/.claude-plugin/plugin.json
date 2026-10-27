@@ -1,0 +1,10 @@
+{
+  "name": "tmux",
+  "description": "tmux housekeeping for agent fleets: snapshot every pane of every session to disk with a manifest that links each pane to its Claude Code agent and transcript (tmux-archive), and rename and regroup windows from what is actually in them, through a reviewed plan that never kills a pane (tmux-organize)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cole Tebou"
+  },
+  "license": "MIT",
+  "keywords": ["claude-code", "tmux", "archive", "organize"]
+}

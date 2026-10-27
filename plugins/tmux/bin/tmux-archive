@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# tmux-archive — snapshot every pane in every window in every tmux session.
+#
+# Usage:
+#   tmux-archive [--session NAME]... [--no-transcripts] [--scrollback N]
+#                [--dry-run] [--out DIR] [--latest]
+#
+# Writes pane captures to:
+#   $HOME/.claude/skill-data/tmux-archive/archives/<YYYYMMDD-HHMMSS>/<session>/<win>/<pane>.txt
+# plus manifest.json and README.md.
+
+set -euo pipefail
+
+# Runtime data lives under ~/.claude/skill-data/ (separate from the skill
+# source dir, which may be a read-only symlink into a dotfiles repo).
+ROOT_DEFAULT="$HOME/.claude/skill-data/tmux-archive/archives"
+SESSIONS_FILTER=()
+INCLUDE_TRANSCRIPTS=1
+SCROLLBACK_ARG=(-S -)
+DRY_RUN=0
+OUT_ROOT="$ROOT_DEFAULT"
+UPDATE_LATEST=0
+
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --session)     SESSIONS_FILTER+=("$2"); shift 2 ;;
+        --no-transcripts) INCLUDE_TRANSCRIPTS=0; shift ;;
+        --scrollback)  SCROLLBACK_ARG=(-S "-$2"); shift 2 ;;
+        --dry-run)     DRY_RUN=1; shift ;;
+        --out)         OUT_ROOT="$2"; shift 2 ;;
+        --latest)      UPDATE_LATEST=1; shift ;;
+        -h|--help)
+            awk '
+                NR == 1 && /^#!/ { next }
+                /^#/            { sub(/^# ?/, ""); print; next }
+                                  { exit }
+            ' "$0"
+            exit 0 ;;
+        *) die "Unknown flag: $1" ;;
+    esac
+done
+
+command -v tmux >/dev/null || die "tmux is required"
+tmux list-sessions >/dev/null 2>&1 || die "No running tmux server / no sessions"
+
+# Capture authoritative Claude agent list (pid, cwd, sessionId, status, name)
+# from `claude agents --json` if available. Stored as a JSON array file so
+# python can read it during manifest assembly. Empty array on failure.
+AGENTS_JSON="$(mktemp)"
+trap 'rm -f "$AGENTS_JSON" "${RECORDS:-}"' EXIT
+if command -v claude >/dev/null 2>&1; then
+    claude agents --json >"$AGENTS_JSON" 2>/dev/null || echo '[]' >"$AGENTS_JSON"
+else
+    echo '[]' >"$AGENTS_JSON"
+fi
+
+TS="$(date +%Y%m%d-%H%M%S)"
+ARCHIVE_DIR="$OUT_ROOT/$TS"
+while [ -e "$ARCHIVE_DIR" ]; do
+    ARCHIVE_DIR="$ARCHIVE_DIR-$((RANDOM % 1000))"
+done
+
+[ "$DRY_RUN" -eq 0 ] && mkdir -p "$ARCHIVE_DIR"
+
+MANIFEST="$ARCHIVE_DIR/manifest.json"
+README="$ARCHIVE_DIR/README.md"
+
+# Build session list. mapfile is bash 4+; use a portable read-loop so this
+# also works on macOS's stock bash 3.2.
+ALL_SESSIONS=()
+while IFS= read -r _sess; do
+    [ -n "$_sess" ] && ALL_SESSIONS+=("$_sess")
+done < <(tmux list-sessions -F '#{session_name}')
+if [ "${#SESSIONS_FILTER[@]}" -gt 0 ]; then
+    SESSIONS=()
+    for want in "${SESSIONS_FILTER[@]}"; do
+        found=0
+        for have in "${ALL_SESSIONS[@]}"; do
+            [ "$have" = "$want" ] && { SESSIONS+=("$have"); found=1; break; }
+        done
+        [ "$found" -eq 1 ] || die "Session not found: $want"
+    done
+else
+    SESSIONS=("${ALL_SESSIONS[@]}")
+fi
+
+info "Archive dir: $ARCHIVE_DIR"
+info "Sessions:    ${SESSIONS[*]}"
+info
+
+# ------- Helpers ---------------------------------------------------------
+
+# Encode a cwd the way Claude Code names its projects/ dirs: every character
+# that is not a letter or digit becomes "-" (so "/a/.b_c" -> "-a--b-c").
+encode_cwd() {
+    printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'
+}
+
+# Sanitize a string to be safe as a filename fragment.
+sanitize() {
+    local s="$1"
+    s="${s//\//_}"
+    s="${s// /_}"
+    s="${s//[^A-Za-z0-9._-]/_}"
+    # collapse consecutive underscores
+    printf '%s' "$s" | tr -s '_'
+}
+
+# Find the descendant pid of $1 that matches any agent pid in $AGENTS_JSON.
+# Echoes the matching agent pid, or empty.
+find_agent_pid_in_subtree() {
+    local pane_pid="$1"
+    [ -z "$pane_pid" ] && { echo ""; return; }
+    # Build set of candidate agent pids
+    local agent_pids
+    agent_pids="$(jq -r '.[].pid' "$AGENTS_JSON" 2>/dev/null | tr '\n' ' ')"
+    [ -z "$agent_pids" ] && { echo ""; return; }
+    # Walk descendants via pgrep -P (one level), recursively. Use BFS.
+    local frontier=("$pane_pid")
+    local visited=" "
+    while [ "${#frontier[@]}" -gt 0 ]; do
+        local next=()
+        local p
+        for p in "${frontier[@]}"; do
+            case "$visited" in *" $p "*) continue ;; esac
+            visited="$visited$p "
+            # Match?
+            local ap
+            for ap in $agent_pids; do
+                [ "$p" = "$ap" ] && { echo "$ap"; return; }
+            done
+            # Add children
+            local children
+            children="$(pgrep -P "$p" 2>/dev/null || true)"
+            local c
+            for c in $children; do
+                next+=("$c")
+            done
+        done
+        # bash 3.2 throws "unbound variable" under `set -u` for an empty
+        # array unless we guard the expansion. The ${arr[@]+...} form
+        # substitutes the expansion only if `arr` is set, falling back
+        # to nothing (which becomes an empty assignment).
+        frontier=(${next[@]+"${next[@]}"})
+    done
+    echo ""
+}
+
+# Locate a Claude Code transcript for a given cwd. Returns empty if none.
+find_claude_transcript() {
+    local cwd="$1"
+    # Guard the empty cwd (dead pane): the encoded path would collapse to
+    # "$HOME/.claude/projects" itself, which IS a real directory, so the -d
+    # check below would pass and any stray jsonl there would be linked as
+    # though it belonged to this pane.
+    [ -n "$cwd" ] || { echo ""; return; }
+    local encoded
+    encoded="$(encode_cwd "$cwd")"
+    local proj="$HOME/.claude/projects/$encoded"
+    [ -d "$proj" ] || { echo ""; return; }
+    # Pick the newest jsonl. Avoid `ls | head -1` because under `set -o
+    # pipefail` a project with hundreds of jsonl files will SIGPIPE `ls`
+    # when `head` closes early, which propagates and kills the script.
+    local newest=""
+    local f
+    for f in "$proj"/*.jsonl; do
+        [ -e "$f" ] || continue
+        if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then
+            newest="$f"
+        fi
+    done
+    echo "$newest"
+}
+
+# Count error-ish keywords. Works on a file path.
+# `grep -c` prints the count AND exits 1 on zero matches, so the `|| echo 0`
+# fallback ran on top of grep's "0" output, producing a two-line value that
+# broke jq --argjson downstream. Suppress grep's stdout when it exits non-zero.
+count_signals() {
+    local f="$1"
+    local n
+    n="$(grep -icE '(^|[^a-z])(ERROR|error:|FAIL|Traceback|fatal:)' "$f" 2>/dev/null)" || n=0
+    echo "$n"
+}
+
+# Extract the most recent pytest/jest summary line, if present.
+# grep returns 1 on no-match; under `set -o pipefail` that tanks the subshell
+# even though tail -1 exits 0. Swallow no-match with `|| true`.
+extract_test_summary() {
+    local f="$1"
+    { grep -oE '[0-9]+ (passed|failed|error[s]?)(, [0-9]+ (passed|failed|error[s]?))*' "$f" 2>/dev/null || true; } | tail -1
+}
+
+# ------- Capture loop ----------------------------------------------------
+
+# Collect pane records into a temp file as JSON lines, then assemble manifest.
+RECORDS="$(mktemp)"
+# Cleanup trap already set above; it covers $RECORDS via "${RECORDS:-}".
+
+for session in "${SESSIONS[@]}"; do
+    session_safe="$(sanitize "$session")"
+    while IFS=$'\t' read -r win_idx win_name; do
+        # Same "::" guard as the pane loop below — an empty window name would
+        # otherwise collapse the tab run and leave win_name unset.
+        win_idx="${win_idx#::}"
+        win_name="${win_name#::}"
+        # An unnamed window (common for dead panes kept by remain-on-exit)
+        # would produce a bare "1-" directory; label it instead.
+        win_dir_name="$(sanitize "${win_idx}-${win_name:-unnamed}")"
+        # Each window can have multiple panes.
+        #
+        # Every field is emitted with a literal "::" prefix, stripped right
+        # after the read. This is load-bearing: tab is a *whitespace* IFS
+        # character, so bash collapses runs of tabs into ONE delimiter. A pane
+        # with an empty field (a dead pane under remain-on-exit reports an
+        # empty #{pane_current_path}) would otherwise yield 4 fields instead of
+        # 5, shifting pane_id into pane_path and pane_pid into pane_id — so the
+        # capture ran against a pid rather than a pane id and failed. The "::"
+        # prefix guarantees no field is ever empty, so nothing can collapse.
+        # A control char (\x1f/\x01) does NOT work here: tmux -F escapes
+        # non-printable bytes into literal "\037"/"\001" text.
+        while IFS=$'\t' read -r pane_idx pane_cmd pane_path pane_id pane_pid; do
+            pane_idx="${pane_idx#::}"
+            pane_cmd="${pane_cmd#::}"
+            pane_path="${pane_path#::}"
+            pane_id="${pane_id#::}"
+            pane_pid="${pane_pid#::}"
+            # A dead pane reports an empty path/command — fall back rather than
+            # emitting a filename like "1-zsh-.txt" or "1--.txt".
+            if [ -n "$pane_path" ]; then
+                pwd_base="$(sanitize "$(basename "$pane_path")")"
+            else
+                pwd_base="nopath"
+            fi
+            cmd_safe="$(sanitize "${pane_cmd:-nocmd}")"
+            target_dir="$ARCHIVE_DIR/$session_safe/$win_dir_name"
+            file_name="${pane_idx}-${cmd_safe}-${pwd_base}.txt"
+            target_file="$target_dir/$file_name"
+
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "DRY: $target_file"
+                echo "     session=$session window=${win_idx}.${win_name} pane=$pane_idx cmd=$pane_cmd path=$pane_path"
+                continue
+            fi
+
+            mkdir -p "$target_dir"
+            # -J joins wrapped lines, -p prints to stdout, scrollback flag controls range.
+            # Keep tmux's own stderr — swallowing it turned a diagnosable
+            # failure into a bare "capture failed" with no cause.
+            capture_err="$(
+                tmux capture-pane -t "$pane_id" -J -p "${SCROLLBACK_ARG[@]}" \
+                    2>&1 > "$target_file"
+            )" || {
+                    echo "WARN: capture failed for pane $pane_id" \
+                         "(${session}:${win_idx}.${pane_idx}, cmd=${pane_cmd:-?})${capture_err:+: $capture_err}" >&2
+                    continue
+                }
+
+            # Optional: link transcript if claude detected.
+            transcript=""
+            if [ "$INCLUDE_TRANSCRIPTS" -eq 1 ]; then
+                transcript="$(find_claude_transcript "$pane_path")"
+                if [ -n "$transcript" ]; then
+                    ln -sf "$transcript" "$target_dir/${pane_idx}-transcript.jsonl"
+                fi
+            fi
+
+            signals="$(count_signals "$target_file")"
+            tests="$(extract_test_summary "$target_file")"
+            size="$(wc -c < "$target_file" | tr -d ' ')"
+            lines="$(wc -l < "$target_file" | tr -d ' ')"
+
+            # Match this pane to a Claude agent via process-tree descent.
+            agent_pid="$(find_agent_pid_in_subtree "$pane_pid")"
+            agent_session_id=""
+            agent_status=""
+            agent_name=""
+            agent_started_at=""
+            agent_kind=""
+            if [ -n "$agent_pid" ]; then
+                # Pull fields for this agent out of the JSON.
+                agent_record="$(jq -c --argjson pid "$agent_pid" '.[] | select(.pid == $pid)' "$AGENTS_JSON" 2>/dev/null || echo "")"
+                if [ -n "$agent_record" ]; then
+                    agent_session_id="$(jq -r '.sessionId // ""' <<<"$agent_record")"
+                    agent_status="$(jq -r '.status // ""' <<<"$agent_record")"
+                    agent_name="$(jq -r '.name // ""' <<<"$agent_record")"
+                    agent_started_at="$(jq -r '.startedAt // empty' <<<"$agent_record")"
+                    agent_kind="$(jq -r '.kind // ""' <<<"$agent_record")"
+                fi
+                # Prefer the authoritative transcript path for this exact session.
+                if [ "$INCLUDE_TRANSCRIPTS" -eq 1 ] && [ -n "$agent_session_id" ]; then
+                    encoded_cwd="$(encode_cwd "$pane_path")"
+                    auth_transcript="$HOME/.claude/projects/$encoded_cwd/${agent_session_id}.jsonl"
+                    if [ -f "$auth_transcript" ]; then
+                        ln -sfn "$auth_transcript" "$target_dir/${pane_idx}-transcript.jsonl"
+                        transcript="$auth_transcript"
+                    fi
+                fi
+            fi
+
+            # One JSON record per pane via jq — handles all string escaping.
+            jq -nc \
+                --arg session "$session" \
+                --arg window_index "$win_idx" \
+                --arg window_name "$win_name" \
+                --arg pane_index "$pane_idx" \
+                --arg pane_id "$pane_id" \
+                --arg pane_pid "$pane_pid" \
+                --arg pane_command "$pane_cmd" \
+                --arg pane_path "$pane_path" \
+                --arg file "$target_file" \
+                --argjson size_bytes "$size" \
+                --argjson line_count "$lines" \
+                --argjson error_keyword_count "$signals" \
+                --arg test_summary "$tests" \
+                --arg claude_transcript "$transcript" \
+                --arg agent_pid "${agent_pid:-}" \
+                --arg agent_session_id "$agent_session_id" \
+                --arg agent_status "$agent_status" \
+                --arg agent_name "$agent_name" \
+                --arg agent_kind "$agent_kind" \
+                --arg agent_started_at "$agent_started_at" \
+                '{session:$session, window_index:$window_index, window_name:$window_name,
+                  pane_index:$pane_index, pane_id:$pane_id, pane_pid:$pane_pid,
+                  pane_command:$pane_command, pane_path:$pane_path,
+                  file:$file, size_bytes:$size_bytes,
+                  line_count:$line_count, error_keyword_count:$error_keyword_count,
+                  test_summary:$test_summary, claude_transcript:$claude_transcript,
+                  agent_pid:(if $agent_pid == "" then null else ($agent_pid|tonumber) end),
+                  agent_session_id:$agent_session_id,
+                  agent_status:$agent_status,
+                  agent_name:$agent_name,
+                  agent_kind:$agent_kind,
+                  agent_started_at:(if $agent_started_at == "" then null else ($agent_started_at|tonumber) end)}' \
+                >> "$RECORDS"
+
+        done < <(tmux list-panes -t "${session}:${win_idx}" \
+                    -F $'::#{pane_index}\t::#{pane_current_command}\t::#{pane_current_path}\t::#{pane_id}\t::#{pane_pid}')
+    done < <(tmux list-windows -t "$session" \
+                -F $'::#{window_index}\t::#{window_name}')
+done
+
+[ "$DRY_RUN" -eq 1 ] && { info "Dry run complete — no files written."; exit 0; }
+
+# ------- Manifest & README ----------------------------------------------
+
+PW_RECORDS="$RECORDS" PW_ARCHIVE_DIR="$ARCHIVE_DIR" PW_TS="$TS" \
+PW_MANIFEST="$MANIFEST" PW_README="$README" PW_AGENTS_JSON="$AGENTS_JSON" \
+python3 <<'PY'
+import json, os
+records = []
+with open(os.environ["PW_RECORDS"]) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+
+# Load full agents snapshot so the manifest preserves agents even if a pane
+# was missed during process-tree matching (orphan agents, daemonized, etc.).
+try:
+    with open(os.environ["PW_AGENTS_JSON"]) as f:
+        agents_snapshot = json.load(f)
+        if not isinstance(agents_snapshot, list):
+            agents_snapshot = []
+except Exception:
+    agents_snapshot = []
+
+matched_pids = {r["agent_pid"] for r in records if r.get("agent_pid")}
+unmatched_agents = [a for a in agents_snapshot if a.get("pid") not in matched_pids]
+
+manifest = {
+    "archive_dir": os.environ["PW_ARCHIVE_DIR"],
+    "captured_at": os.environ["PW_TS"],
+    "pane_count":  len(records),
+    "agent_count": len(agents_snapshot),
+    "agents":      agents_snapshot,
+    "unmatched_agents": unmatched_agents,
+    "panes":       records,
+}
+with open(os.environ["PW_MANIFEST"], "w") as f:
+    json.dump(manifest, f, indent=2)
+
+# README
+busy_count    = sum(1 for a in agents_snapshot if a.get("status") == "busy")
+idle_count    = sum(1 for a in agents_snapshot if a.get("status") == "idle")
+waiting_count = sum(1 for a in agents_snapshot
+                    if a.get("status") not in ("busy", "idle") and a.get("status"))
+
+lines = [
+    f"# tmux archive — {manifest['captured_at']}",
+    "",
+    f"- **Panes captured:** {manifest['pane_count']}",
+    f"- **Claude agents:** {manifest['agent_count']} "
+    f"(busy: {busy_count}, idle: {idle_count}"
+    + (f", other: {waiting_count}" if waiting_count else "")
+    + ")",
+    f"- **Manifest:** manifest.json",
+    "",
+]
+
+if unmatched_agents:
+    lines.append("## ⚠ Unmatched agents (no tmux pane)")
+    lines.append("")
+    lines.append("| PID | Status | Cwd | Session ID |")
+    lines.append("|-----|--------|-----|------------|")
+    for a in unmatched_agents:
+        lines.append(
+            f"| {a.get('pid','')} | {a.get('status','')} "
+            f"| `{a.get('cwd','')}` | `{a.get('sessionId','')[:8]}` |"
+        )
+    lines.append("")
+
+# Group by session → window.
+from collections import defaultdict
+by_session = defaultdict(lambda: defaultdict(list))
+for r in records:
+    by_session[r['session']][(r['window_index'], r['window_name'])].append(r)
+
+for sess, windows in sorted(by_session.items()):
+    # Backtick needs no escaping in Python; "\`" is an invalid escape that
+    # emits a SyntaxWarning AND leaks a literal backslash into the markdown.
+    lines.append(f"## Session `{sess}`")
+    lines.append("")
+    for (widx, wname), panes in sorted(windows.items(), key=lambda x: int(x[0][0])):
+        lines.append(f"### Window {widx}: {wname}")
+        lines.append("")
+        lines.append("| Pane | Command | Path | Lines | Errors | Tests | Agent | Transcript |")
+        lines.append("|------|---------|------|------:|-------:|-------|-------|------------|")
+        for p in sorted(panes, key=lambda x: int(x["pane_index"])):
+            transcript_mark = "✓" if p["claude_transcript"] else "—"
+            status = p.get("agent_status") or ""
+            if status == "busy":
+                agent_cell = "🟢 busy"
+            elif status == "idle":
+                agent_cell = "⚪ idle"
+            elif status:
+                agent_cell = f"🟡 {status}"
+            else:
+                agent_cell = "—"
+            if p.get("agent_name"):
+                agent_cell += f" — {p['agent_name']}"
+            lines.append(
+                f"| {p['pane_index']} | `{p['pane_command']}` | `{p['pane_path']}` "
+                f"| {p['line_count']} | {p['error_keyword_count']} "
+                f"| {p['test_summary'] or '—'} | {agent_cell} | {transcript_mark} |"
+            )
+        lines.append("")
+
+with open(os.environ["PW_README"], "w") as f:
+    f.write("\n".join(lines))
+PY
+
+# Update latest symlink if requested.
+if [ "$UPDATE_LATEST" -eq 1 ]; then
+    ln -sfn "$ARCHIVE_DIR" "$OUT_ROOT/latest"
+    info "Updated: $OUT_ROOT/latest -> $ARCHIVE_DIR"
+fi
+
+info "=========================================="
+info "Done. $(jq '.pane_count' "$MANIFEST" 2>/dev/null || echo '?') panes captured."
+info "  $ARCHIVE_DIR"
+info "  Open: $README"
+info "=========================================="

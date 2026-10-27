@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# tmux-apply-plan — apply a tmux-organize JSON plan.
+#
+# Usage: tmux-apply-plan [--dry-run] [--allow-empty-sessions] <plan.json>
+#
+# Plan schema:
+#   {
+#     "windows": [
+#       {"target": "%<pane_id>", "new_name": "…",
+#        "new_session": "<session>",   # optional — move window to another session
+#        "new_index": <int>, "reason": "…"}
+#     ],
+#     "sessions": [
+#       {"current_name": "…", "new_name": "…"}
+#     ]
+#   }
+#
+# Guarantees:
+#   - Only renames and moves. Never kills a pane, window, or session.
+#   - Refuses to drain a session that has attached clients (would yank the
+#     user's terminal out from under them).
+#   - Sessions left with zero windows are destroyed by tmux itself; that
+#     loses no pane or process, but it requires --allow-empty-sessions.
+#
+# Env:
+#   TMUX_ORGANIZE_SOCKET  use `tmux -L <name>` (for testing against a
+#                         throwaway server instead of the live one)
+#
+# Needs bash 4 or newer (mapfile, associative arrays); macOS ships 3.2, so
+# install a newer bash (e.g. Homebrew) ahead of it on PATH.
+
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    echo "Error: tmux-apply-plan needs bash 4 or newer (this is $BASH_VERSION); on macOS: brew install bash" >&2
+    exit 1
+fi
+
+set -euo pipefail
+
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+DRY_RUN=0
+ALLOW_EMPTY=0
+PLAN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)              DRY_RUN=1 ;;
+        --allow-empty-sessions) ALLOW_EMPTY=1 ;;
+        -*) die "unknown flag: $1" ;;
+        *)  [ -z "$PLAN" ] || die "unexpected extra argument: $1"
+            PLAN="$1" ;;
+    esac
+    shift
+done
+[ -n "$PLAN" ] || die "usage: tmux-apply-plan [--dry-run] [--allow-empty-sessions] <plan.json>"
+[ -f "$PLAN" ] || die "Plan file not found: $PLAN"
+
+command -v jq >/dev/null || die "jq required"
+command -v tmux >/dev/null || die "tmux required"
+
+TMUX_ARGS=()
+[ -n "${TMUX_ORGANIZE_SOCKET:-}" ] && TMUX_ARGS=(-L "$TMUX_ORGANIZE_SOCKET")
+tm() { tmux ${TMUX_ARGS[@]+"${TMUX_ARGS[@]}"} "$@"; }
+# Mutating tmux call — a no-op under --dry-run.
+run() {
+    if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+    tm "$@"
+}
+
+tm list-sessions >/dev/null 2>&1 || die "No tmux server running"
+
+jq -e '.windows // [] | type == "array"'  "$PLAN" >/dev/null || die "Plan: .windows must be an array"
+jq -e '.sessions // [] | type == "array"' "$PLAN" >/dev/null || die "Plan: .sessions must be an array"
+
+# ── Phase 1: validate every pane target exists ───────────────────────────
+mapfile -t LIVE_PANES < <(tm list-panes -a -F '#{pane_id}')
+in_list() { local needle="$1"; shift; local x; for x in "$@"; do [ "$x" = "$needle" ] && return 0; done; return 1; }
+
+missing=()
+while read -r target; do
+    [ -z "$target" ] && continue
+    in_list "$target" ${LIVE_PANES[@]+"${LIVE_PANES[@]}"} || missing+=("$target")
+done < <(jq -r '.windows[]?.target // empty' "$PLAN")
+[ "${#missing[@]}" -eq 0 ] || die "Plan references missing panes: ${missing[*]}"
+
+mapfile -t LIVE_SESSIONS < <(tm list-sessions -F '#{session_name}')
+missing_sess=()
+while read -r cur; do
+    [ -z "$cur" ] && continue
+    in_list "$cur" ${LIVE_SESSIONS[@]+"${LIVE_SESSIONS[@]}"} || missing_sess+=("$cur")
+done < <(jq -r '.sessions[]?.current_name // empty' "$PLAN")
+[ "${#missing_sess[@]}" -eq 0 ] || die "Plan references missing sessions: ${missing_sess[*]}"
+
+# ── Phase 2: rename sessions FIRST ───────────────────────────────────────
+# Window targets are pane ids (%N), which are stable across session renames,
+# so renaming up front lets .new_session refer to the post-rename names.
+sessions_renamed=0
+while IFS=$'\t' read -r cur new; do
+    { [ -z "$cur" ] || [ -z "$new" ] || [ "$cur" = "$new" ]; } && continue
+    if tm has-session -t "$new" 2>/dev/null; then
+        echo "Warn: session '$new' already exists; skipping rename from '$cur'" >&2
+        continue
+    fi
+    run rename-session -t "$cur" "$new"
+    info "renamed session: '$cur' → '$new'"
+    sessions_renamed=$((sessions_renamed+1))
+done < <(jq -r '.sessions[]? | [.current_name, .new_name] | @tsv' "$PLAN")
+
+# Post-rename session list (under --dry-run, simulate the renames).
+if [ "$DRY_RUN" -eq 1 ]; then
+    mapfile -t LIVE_SESSIONS < <(
+        tm list-sessions -F '#{session_name}'
+        jq -r '.sessions[]? | select(.new_name) | .new_name' "$PLAN"
+    )
+else
+    mapfile -t LIVE_SESSIONS < <(tm list-sessions -F '#{session_name}')
+fi
+
+# Under --dry-run the renames above did not really happen, so tmux still
+# reports pre-rename session names. Translate them so a session that is merely
+# *renamed* is not mistaken for one being drained.
+declare -A RENAME_MAP=()
+while IFS=$'\t' read -r cur new; do
+    { [ -z "$cur" ] || [ -z "$new" ] || [ "$cur" = "$new" ]; } && continue
+    RENAME_MAP["$cur"]="$new"
+done < <(jq -r '.sessions[]? | [.current_name, .new_name] | @tsv' "$PLAN")
+eff_sess() {
+    if [ "$DRY_RUN" -eq 1 ] && [ -n "${RENAME_MAP[$1]:-}" ]; then
+        printf '%s' "${RENAME_MAP[$1]}"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# ── Phase 3: rename windows ──────────────────────────────────────────────
+renamed=0
+while IFS=$'\t' read -r target new_name; do
+    { [ -z "$target" ] || [ -z "$new_name" ]; } && continue
+    current="$(tm display-message -p -t "$target" -F '#{window_name}' 2>/dev/null || echo "")"
+    [ "$current" = "$new_name" ] && continue
+    run rename-window -t "$target" "$new_name"
+    info "renamed $target: '$current' → '$new_name'"
+    renamed=$((renamed+1))
+done < <(jq -r '.windows[]? | select(.new_name) | [.target, .new_name] | @tsv' "$PLAN")
+
+# ── Phase 4: move windows across sessions and/or reindex ─────────────────
+# Build the move set: pane id → (destination session, final index).
+declare -a MV_PANE=() MV_DEST=() MV_IDX=() MV_SRC=()
+while IFS=$'\t' read -r target dest idx; do
+    [ -z "$target" ] && continue
+    src="$(eff_sess "$(tm display-message -p -t "$target" -F '#{session_name}')")"
+    cur_idx="$(tm display-message -p -t "$target" -F '#{window_index}')"
+    [ -z "$dest" ] || [ "$dest" = "null" ] && dest="$src"
+    [ -z "$idx" ] || [ "$idx" = "null" ] && idx=""
+    in_list "$dest" ${LIVE_SESSIONS[@]+"${LIVE_SESSIONS[@]}"} \
+        || die "Plan target $target: destination session '$dest' does not exist"
+    # Nothing to do when already in the right session at the right index.
+    [ "$dest" = "$src" ] && { [ -z "$idx" ] || [ "$idx" = "$cur_idx" ]; } && continue
+    MV_PANE+=("$target"); MV_DEST+=("$dest"); MV_IDX+=("$idx"); MV_SRC+=("$src")
+done < <(jq -r '.windows[]? | [.target, (.new_session // ""), (if .new_index == null then "" else (.new_index|tostring) end)] | @tsv' "$PLAN")
+
+moved=0
+if [ "${#MV_PANE[@]}" -gt 0 ]; then
+    # Safety: never drain a session that has clients attached, and require an
+    # explicit opt-in for sessions tmux will destroy once emptied.
+    declare -A LEAVING=() INBOUND=() WINCOUNT=() ATTACHED=()
+    while IFS=$'\t' read -r s n a; do
+        s="$(eff_sess "$s")"
+        WINCOUNT["$s"]=$n; ATTACHED["$s"]=$a
+    done < <(tm list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}')
+    for i in "${!MV_PANE[@]}"; do
+        [ "${MV_SRC[$i]}" = "${MV_DEST[$i]}" ] && continue
+        LEAVING["${MV_SRC[$i]}"]=$(( ${LEAVING["${MV_SRC[$i]}"]:-0} + 1 ))
+        INBOUND["${MV_DEST[$i]}"]=$(( ${INBOUND["${MV_DEST[$i]}"]:-0} + 1 ))
+    done
+    drained=()
+    for s in "${!LEAVING[@]}"; do
+        remaining=$(( ${WINCOUNT[$s]:-0} - ${LEAVING[$s]} + ${INBOUND[$s]:-0} ))
+        [ "$remaining" -gt 0 ] && continue
+        [ "${ATTACHED[$s]:-0}" != "0" ] && die "Refusing to empty session '$s': it has attached clients"
+        drained+=("$s")
+    done
+    if [ "${#drained[@]}" -gt 0 ]; then
+        info "Note: these sessions end up empty and tmux will destroy them (no pane or process is killed): ${drained[*]}"
+        [ "$ALLOW_EMPTY" -eq 1 ] || die "Pass --allow-empty-sessions to proceed."
+    fi
+
+    # Phase 4a — park each mover at a scratch-high index in its DESTINATION
+    # session. Ordering matters: a session that gives up its last window is
+    # destroyed, so any session that is both a source and a destination must
+    # receive its inbound windows before it is drained. Greedy passes resolve
+    # that without needing a real topological sort.
+    declare -a PENDING=("${!MV_PANE[@]}")
+    while [ "${#PENDING[@]}" -gt 0 ]; do
+        progress=0
+        declare -a STILL=()
+        for i in "${PENDING[@]}"; do
+            pane="${MV_PANE[$i]}"; dest="${MV_DEST[$i]}"
+            src="$(eff_sess "$(tm display-message -p -t "$pane" -F '#{session_name}' 2>/dev/null || echo "${MV_SRC[$i]}")")"
+            ok=1
+            if [ "$src" != "$dest" ]; then
+                cnt="$(tm display-message -p -t "$pane" -F '#{session_windows}' 2>/dev/null || echo 1)"
+                if [ "$cnt" -le 1 ]; then
+                    # Draining src now; block if src still owes inbound windows.
+                    for j in "${PENDING[@]}"; do
+                        [ "$j" = "$i" ] && continue
+                        [ "${MV_DEST[$j]}" = "$src" ] && { ok=0; break; }
+                    done
+                fi
+            fi
+            if [ "$ok" -eq 1 ]; then
+                run move-window -s "$pane" -t "${dest}:$((900 + i))"
+                progress=1
+            else
+                STILL+=("$i")
+            fi
+        done
+        if [ "$progress" -eq 0 ]; then
+            die "Cannot order moves without emptying a session that still needs inbound windows: ${STILL[*]}"
+        fi
+        PENDING=(${STILL[@]+"${STILL[@]}"})
+        # Under --dry-run nothing actually moved, so one pass is all we can model.
+        [ "$DRY_RUN" -eq 1 ] && break
+    done
+
+    # Phase 4b — place each mover at its final index, lowest first, so a
+    # window never lands on an index a later move still needs.
+    while IFS=$'\t' read -r i; do
+        pane="${MV_PANE[$i]}"; dest="${MV_DEST[$i]}"; want="${MV_IDX[$i]}"
+        if [ -z "$want" ]; then
+            info "moved $pane → ${dest} (index unspecified)"
+        else
+            run move-window -s "$pane" -t "${dest}:${want}"
+            info "moved $pane → ${dest}:${want}"
+        fi
+        moved=$((moved+1))
+    done < <(
+        for i in "${!MV_PANE[@]}"; do
+            printf '%s\t%s\t%s\n' "${MV_DEST[$i]}" "${MV_IDX[$i]:-99999}" "$i"
+        done | sort -k1,1 -k2,2n | cut -f3
+    )
+fi
+
+info "=========================================="
+if [ "$DRY_RUN" -eq 1 ]; then
+    info "DRY RUN — nothing changed."
+fi
+info "Applied: $renamed window rename(s), $moved move/reorder(s), $sessions_renamed session rename(s)."

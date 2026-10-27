@@ -22,6 +22,13 @@
       "version": "1.0.0",
       "source": "./plugins/worktrees",
       "category": "workflow"
+    },
+    {
+      "name": "tmux",
+      "description": "Snapshot every tmux pane with links to its agent and transcript (tmux-archive), and rename and regroup windows from their contents through a reviewed plan (tmux-organize)",
+      "version": "1.0.0",
+      "source": "./plugins/tmux",
+      "category": "utilities"
     }
   ]
 }
