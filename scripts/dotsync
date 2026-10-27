@@ -1008,4 +1008,6 @@ cd "$ORIGINAL_DIR" 2>/dev/null || true
 exit "$EXIT_CODE"
 }
 
-dotsync_main "$@"
+# One line, so the shell has parsed the exit before the run starts: a process that waited on the
+# lock otherwise reads on from a file the run may have replaced.
+dotsync_main "$@"; exit $?
