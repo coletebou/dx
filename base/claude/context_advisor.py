@@ -45,7 +45,8 @@ Codex compacts on its own, so there is no Jev, no handoff and no desktop notific
 Env: CONTEXT_ADVISOR_DISABLE=1, CONTEXT_ADVISOR_WINDOW (900000), CONTEXT_ADVISOR_BANDS
 ("0.55,0.70,0.85"), CONTEXT_ADVISOR_JEV=0 (skip Jev; it is off by default for the identities
 in DF_WORK_IDENTITIES, "work" unless set), TYPESAFE_API_KEY (else read from ~/.env_secrets;
-without a key Jev is never asked), JEV_ADVISOR_MODEL (jev-latest), JEV_ENDPOINT, CONTEXT_ADVISOR_STATE_DIR,
+without a key Jev is never asked; MEMORY_BOUNDARY_CMD keeps a restricted session's excerpts
+from it, see scripts/lib/memory-boundary.sh), JEV_ADVISOR_MODEL (jev-latest), JEV_ENDPOINT, CONTEXT_ADVISOR_STATE_DIR,
 CONTEXT_SENSOR_DIR, CLAUDE_CODE_AUTO_COMPACT_WINDOW (read, as Claude Code does),
 CONTEXT_ADVISOR_MODEL_WINDOW (force the model window), CONTEXT_ADVISOR_1M_MODELS (regex of
 model ids that are 1M without the suffix; none by default), CODEX_HOME.
@@ -382,6 +383,20 @@ def api_key():
         return ""
 
 
+def boundary_blocks(hook):
+    """True when MEMORY_BOUNDARY_CMD keeps this session's excerpts away from Jev. It is the
+    reflector's check (the contract in scripts/lib/memory-boundary.sh), asked with
+    MEMORY_BOUNDARY_TOOL=context-advisor; a check that cannot even load fails closed."""
+    if not os.environ.get("MEMORY_BOUNDARY_CMD", "").strip():
+        return False
+    try:
+        from session_reflector import boundary_skip  # run as the hook, this file's directory is on sys.path
+    except Exception:
+        return True
+    return boundary_skip(hook.get("transcript_path") or "", hook.get("session_id") or "",
+                         hook.get("hook_event_name") or "", tool="context-advisor")
+
+
 def questions(new_prompt):
     q = {
         "natural_boundary": {"type": "noul", "instructions": (
@@ -590,13 +605,17 @@ def run(hook, agent="claude"):
             out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text},
                    "systemMessage": banner}
         elif band >= 1:
-            p, err = None, None
+            p, err, skipped = None, None, None
             handed = handed_off(sid)
             # Jev sees conversation excerpts; on a work identity that is company content
             # going to a third-party API, so it is opt-in there (CONTEXT_ADVISOR_JEV=1).
+            # A session the data boundary restricts never sends any.
             jev_default = "0" if work_identity() else "1"
             if not handed and os.environ.get("CONTEXT_ADVISOR_JEV", jev_default) != "0" and api_key():
-                cs = conversation_state(hook.get("transcript_path") or "")
+                if boundary_blocks(hook):
+                    cs, skipped = None, "data boundary"
+                else:
+                    cs = conversation_state(hook.get("transcript_path") or "")
                 if cs:
                     cs["context"] = {"tokens": tokens, "advisory_budget": window, "share": round(share, 2),
                                      "auto_compaction_at": compaction}
@@ -606,7 +625,7 @@ def run(hook, agent="claude"):
                         err = str(exc)[:200]
             text, banner, hint = advise(band, tokens, window, compaction, p, st.get("reflected"), handed)
             st["hint"] = hint
-            log({**entry, "p": p, "jev_error": err, "hint": hint})
+            log({**entry, "p": p, "jev_error": err, "hint": hint, **({"jev_skipped": skipped} if skipped else {})})
             notify(hook, banner, round(100 * share))
             out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text},
                    "systemMessage": banner}

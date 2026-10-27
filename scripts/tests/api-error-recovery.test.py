@@ -132,6 +132,10 @@ class HookTest(unittest.TestCase):
             return []
         return [json.loads(line)["event"] for line in self.alerts.read_text().splitlines() if line.strip()]
 
+    def alert_messages(self):
+        self.alerts_seen()  # waits for the fire-and-forget writes
+        return [json.loads(line)["message"] for line in self.alerts.read_text().splitlines() if line.strip()]
+
     def wait_for(self, path, timeout=5):
         end = time.time() + timeout
         while time.time() < end:
@@ -230,6 +234,7 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.wait_for(Path(st["diag_report"])))
         self.assertEqual(len(list((self.state / "s1").glob("diagnosis-*.md"))), 1)
         self.assertEqual(self.alerts_seen(), ["api_error.config"])
+        self.assertIn(f"report: {st['diag_report']}", self.alert_messages()[0], "the alert says where to look")
 
     def test_quota_alerts_once(self):
         for _ in range(3):
@@ -267,6 +272,7 @@ class HookTest(unittest.TestCase):
         self.run_hook(self.payload(error="model_not_found", msg="bad model"), env=env)
         self.assertNotIn("diag_report", self.must_state(), "no agent sees transcripts by default")
         self.assertEqual(self.alerts_seen(), ["api_error.config"])
+        self.assertNotIn("diagnostic agent", self.alert_messages()[0], "the alert claims no agent that never ran")
         (self.state / "s1.json").unlink()
         # Opted in: a stand-in `claude` on PATH receives the briefing on stdin.
         fake = Path(self.tmp.name) / "bin"

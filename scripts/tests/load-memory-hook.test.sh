@@ -2,7 +2,8 @@
 # load-memory-hook.test.sh: base/claude/load-memory-hook.sh finds the auto-memory dir Claude Code
 # uses for the cwd, encoded the way Claude Code encodes it (every non-alphanumeric to "-", so a
 # dotted or underscored repo path works), maps a linked worktree to its main repo's dir, honors an
-# autoMemoryDirectory setting, and stays silent where there is no memory. Hermetic: HOME and the
+# autoMemoryDirectory setting (local settings read at the main checkout's root, as Claude Code
+# keeps them), survives a malformed settings file, and stays silent where there is no memory. Hermetic: HOME and the
 # repos in a temp dir, and DOTFILES_DIR points where no reflections CLI exists.
 #
 #   bash scripts/tests/load-memory-hook.test.sh
@@ -53,6 +54,26 @@ printf 'override handoff\n' > "$HOME/mem/session-handoff.md"
 out="$(run_in "$repo")"
 check "the override dir's handoff is shown" "override handoff" "$out"
 case "$out" in *"resume from step 3"*) bad "...instead of the default dir's" "only the override" "$out" ;; *) ok "...instead of the default dir's" ;; esac
+
+echo "the local settings live at the main checkout's root"
+check "a linked worktree reads them there" "override handoff" "$(run_in "$tmp/work/wt.one")"
+mkdir -p "$repo/sub/.claude" "$HOME/mem-legacy"
+check "...so does a subdirectory" "override handoff" "$(run_in "$repo/sub")"
+printf '{"autoMemoryDirectory": "~/mem-legacy"}\n' > "$repo/sub/.claude/settings.local.json"
+printf 'legacy handoff\n' > "$HOME/mem-legacy/session-handoff.md"
+check "...and the root's file wins over an older one in the starting dir" "override handoff" "$(run_in "$repo/sub")"
+
+echo "a malformed settings file"
+broken="$tmp/work/broken"
+mkdir -p "$broken/.claude"
+git -C "$broken" init -q -b master
+printf '{"autoMemoryDirectory": ' > "$broken/.claude/settings.local.json"
+bmem="$HOME/.claude/projects/$(enc "$broken")/memory"
+mkdir -p "$bmem"
+printf 'still here\n' > "$bmem/session-handoff.md"
+out="$(run_in "$broken")"; rc=$?
+equal "does not kill the hook" 0 "$rc"
+check "...which still shows the default dir's handoff" "still here" "$out"
 
 echo "nothing to show"
 mkdir -p "$tmp/plain"

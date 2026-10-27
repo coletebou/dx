@@ -187,7 +187,7 @@ class HookCase(unittest.TestCase):
         # ANTHROPIC_* and CODEX_* go because the window fallback and Codex config read them.
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("CONTEXT_", "TYPESAFE", "JEV_", "AGENT_", "CLAUDE_CODE_AUTO", "DF_",
-                                         "ANTHROPIC_", "CODEX_"))}
+                                         "ANTHROPIC_", "CODEX_", "MEMORY_BOUNDARY"))}
         self.env.update(CONTEXT_SENSOR_DIR=str(self.sensor_dir), CONTEXT_ADVISOR_STATE_DIR=str(self.root / "state"),
                         CONTEXT_ADVISOR_LOG=str(self.root / "advisor.jsonl"), REFLECTOR_DISABLE="1",
                         AGENT_NOTIFY_BIN="/nonexistent", TYPESAFE_API_KEY="test-key",
@@ -285,6 +285,30 @@ class AdvisorTest(HookCase):
         self.assertIn("handed off to handoffs:work-2", out["systemMessage"])
         self.assertEqual(FakeJev.requests, [], "no Jev call once handed off")
         self.assertEqual(self.state()["hint"], "handed-off")
+
+    def test_a_restricted_session_never_sends_excerpts_to_jev(self):
+        FakeJev.answers = {"natural_boundary": 0.9, "fresh_session_better": 0.9, "delicate_operation": 0.05}
+        asked = self.root / "boundary-asked"
+        self.env.update(MEMORY_BOUNDARY_CMD=f'echo "$MEMORY_BOUNDARY_TOOL $MEMORY_BOUNDARY_PATH" > {asked}; '
+                                            '[ "$RESTRICTED" = 1 ] || exit 1', RESTRICTED="1")
+        self.sense(150_000)
+        out = self.hook()
+        self.assertIn("advisory budget", out["hookSpecificOutput"]["additionalContext"], "the advice still comes")
+        self.assertEqual(FakeJev.requests, [], "a restricted session's excerpts reached Jev")
+        self.assertEqual(self.last_log()["jev_skipped"], "data boundary")
+        self.assertEqual(asked.read_text().split(), ["context-advisor", str(self.transcript)])
+
+    def test_a_broken_boundary_check_fails_closed_and_exit_1_lets_jev_be_asked(self):
+        FakeJev.answers = {"natural_boundary": 0.9, "fresh_session_better": 0.9, "delicate_operation": 0.05}
+        self.env["MEMORY_BOUNDARY_CMD"] = "/nonexistent/boundary-check"
+        self.sense(150_000)
+        self.hook()
+        self.assertEqual(FakeJev.requests, [], "a check that cannot run must keep the excerpts back")
+        (self.root / "state/s1.json").unlink()  # a fresh cycle, so the advise band fires again
+        self.env["MEMORY_BOUNDARY_CMD"] = "exit 1"
+        self.hook()
+        self.assertEqual(len(FakeJev.requests), 1, "exit 1 means unrestricted")
+        self.assertNotIn("jev_skipped", self.last_log())
 
     def test_delicate_operation_says_keep_going(self):
         FakeJev.answers = {"natural_boundary": 0.2, "fresh_session_better": 0.7, "delicate_operation": 0.9}
@@ -412,6 +436,18 @@ class AdvisorTest(HookCase):
         self.hook()
         self.assertEqual(self.spawns(), [("advisor", "deep", None)], "no re-arm while usage keeps growing")
         self.assertEqual(self.state()["band"], 0)
+
+    def test_a_small_directory_budget_fires_its_first_band_on_time_in_a_1m_window(self):
+        # The wrapper's floor is 100k here (20% of 1M is more); a 100k budget's bands are 55/70/85k.
+        self.record_spawns()
+        self.env["REFLECTOR_STAGES"] = ""
+        budgets = self.root / "budgets.json"
+        budgets.write_text(json.dumps({str(self.root): 100_000}))
+        self.env["CONTEXT_ADVISOR_BUDGETS"] = str(budgets)
+        self.sense(60_000, size=1_000_000)
+        self.hook()
+        self.assertEqual(self.state().get("band"), 0, "the reflect band fires at 60% of the budget")
+        self.assertEqual(self.spawns(), [("advisor", "deep", None)])
 
     def test_large_window_uses_the_advisory_budget(self):
         FakeJev.answers = {"natural_boundary": 0.1, "fresh_session_better": 0.1, "delicate_operation": 0.1}

@@ -198,14 +198,14 @@ class ParseAndModelTest(unittest.TestCase):
 class BoundaryTest(unittest.TestCase):
     """MEMORY_BOUNDARY_CMD: exit 0 skips, exit 1 reflects, anything else skips (fails closed)."""
 
-    def skip(self, cmd, **env):
+    def skip(self, cmd, tool="reflector", **env):
         saved = dict(os.environ)
         try:
             os.environ.pop("MEMORY_BOUNDARY_CMD", None)
             if cmd is not None:
                 os.environ["MEMORY_BOUNDARY_CMD"] = cmd
             os.environ.update(env)
-            return mod.boundary_skip("/tmp/t.jsonl", "s9", "sessionend")
+            return mod.boundary_skip("/tmp/t.jsonl", "s9", "sessionend", tool=tool)
         finally:
             os.environ.clear()
             os.environ.update(saved)
@@ -224,6 +224,11 @@ class BoundaryTest(unittest.TestCase):
                '[ "$RESTRICTED" = 1 ] || exit 1')
         self.assertTrue(self.skip(cmd, RESTRICTED="1"))
         self.assertFalse(self.skip(cmd, RESTRICTED="0"))
+
+    def test_another_tool_asks_under_its_own_name(self):
+        cmd = '[ "$MEMORY_BOUNDARY_TOOL" = context-advisor ] || exit 1'
+        self.assertTrue(self.skip(cmd, tool="context-advisor"))
+        self.assertFalse(self.skip(cmd))
 
 
 class EndToEndTest(unittest.TestCase):
@@ -342,6 +347,26 @@ open(args[args.index("--output") + 1], "w").write(reply)
         prompt = self.prompt_seen.read_text()
         self.assertIn("unrestricted step", prompt)
         self.assertNotIn("build the retry hook", prompt, "the restricted span reached a model")
+
+    def test_the_request_look_back_stops_at_a_restricted_span(self):
+        restricted = dict(self.env, MEMORY_BOUNDARY_CMD='[ "$RESTRICTED" = 1 ] || exit 1', RESTRICTED="1")
+        hook = json.dumps({"transcript_path": str(self.transcript), "session_id": "g4", "cwd": str(self.cwd)})
+        r = subprocess.run([sys.executable, str(SCRIPT), "hook", "sessionend"], input=hook, cwd=self.cwd,
+                           env=restricted, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Resumed unrestricted, the same turn keeps working with no new prompt, so the reflector
+        # looks back for the request in progress: that request is in the restricted span.
+        with open(self.transcript, "a") as f:
+            for n in range(6):
+                f.write(json.dumps(request()) + "\n")
+                f.write(json.dumps(assistant({"type": "text", "text": f"later step {n} " + "z" * 3000},
+                                             version="2.1.310")) + "\n")
+        r = self.run_reflector("run", "--transcript", str(self.transcript), "--session", "g4",
+                               "--cwd", str(self.cwd), "--trigger", "sessionend")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        prompt = self.prompt_seen.read_text()
+        self.assertIn("later step 5", prompt)
+        self.assertNotIn("build the retry hook", prompt, "the look-back reached into the restricted span")
 
     def test_run_writes_items_retries_on_sonnet_and_is_incremental(self):
         r = self.run_reflector("run", "--transcript", str(self.transcript), "--session", "s1",

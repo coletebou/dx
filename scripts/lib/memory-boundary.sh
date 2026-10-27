@@ -10,7 +10,7 @@
 #   any other   yes (not found, a crash, a timeout): a broken check fails closed
 #
 # It runs through `sh -c` with the caller's environment plus
-#   MEMORY_BOUNDARY_TOOL     reflector | consolidate | session-analyzer
+#   MEMORY_BOUNDARY_TOOL     reflector | consolidate | session-analyzer | context-advisor
 #   MEMORY_BOUNDARY_PATH     the file in question: a transcript, or a prompt or
 #                            input on its way to a model
 #   MEMORY_BOUNDARY_SESSION  and MEMORY_BOUNDARY_TRIGGER, when the caller knows them
@@ -22,7 +22,7 @@
 #   MEMORY_BOUNDARY_CMD='grep -q "acme-confidential" "$MEMORY_BOUNDARY_PATH"'  # by content
 #
 # Callers: claude-consolidate, session-analyzer, and base/claude/session_reflector.py
-# (the same contract, in Python).
+# (the same contract, in Python; base/claude/context_advisor.py reuses it).
 
 # memory_boundary_blocks TOOL PATH → status 0 when the data must be kept out.
 memory_boundary_blocks() {

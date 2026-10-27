@@ -19,5 +19,5 @@ somewhere, a tool that types into the wrong pane, a scrub or boundary check that
 
 - It holds none. Keys belong in `~/.env_secrets`, which is yours and never committed.
 - The git hooks (`base/git/hooks/`) scan every commit and push with gitleaks and fail closed.
-- The memory tools ask `MEMORY_BOUNDARY_CMD` before any transcript or file reaches a model
-  (see [docs/memory/README.md](docs/memory/README.md)).
+- The memory tools and the context advisor ask `MEMORY_BOUNDARY_CMD` before any transcript, file
+  or excerpt reaches a model (see [docs/memory/README.md](docs/memory/README.md)).

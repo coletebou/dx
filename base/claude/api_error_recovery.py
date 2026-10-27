@@ -9,9 +9,10 @@ This hook adds the OUTER loop, at the turn level:
   StopFailure (asyncRewake) ─┬─ transient ─── sleep(backoff) → exit 2 → Claude
                              │                wakes and continues the task
                              ├─ attempt == ESCALATE_AT → also start a diagnostic
-                             │   agent (Codex by default: a different provider
-                             │   still works during an Anthropic outage)
+                             │   agent, when one is opted in (Codex suits it: a
+                             │   different provider still works during an outage)
                              ├─ config error → no blind retry; diagnose at once
+                             │   (when opted in)
                              ├─ auth / quota / billing / safeguard / context →
                              │   no retry; alert once with the fix to apply
                              └─ attempts exhausted → alert, stop
@@ -112,7 +113,7 @@ ADVICE = {
     "billing": "The account has a billing problem or is on hold; fix it in the "
                "console before retrying.",
     "config": "The request is misconfigured (model id, provider deployment, or "
-              "request option). A diagnostic agent was started to find the cause.",
+              "request option).",
 }
 
 
@@ -420,6 +421,13 @@ def spawn_diagnosis(hook, st, klass):
         return None, None
 
 
+def diagnosis_started(st):
+    """What an alert says about the diagnostic agent: nothing unless one was started."""
+    if not st.get("diag_report"):
+        return ""
+    return f" A diagnostic agent ({st.get('diag_engine')}) is looking for the cause; report: {st['diag_report']}"
+
+
 def diagnosis_excerpt(st, n=1200):
     path = st.get("diag_report")
     if not path:
@@ -468,7 +476,7 @@ def on_stop_failure(hook):
         if first_alert:
             notify(f"api_error.{klass}", "error" if klass in ("config", "auth", "billing") else "warn",
                    f"Claude session stuck: {error}",
-                   f"{short(text, 200)}\n{ADVICE.get(klass, '')}", hook,
+                   f"{short(text, 200)}\n{ADVICE.get(klass, '')}{diagnosis_started(st)}", hook,
                    {"class": klass, "diag_report": st.get("diag_report")})
         log({**base, "decision": "no-retry", "failures": st["failures"]})
         return 0

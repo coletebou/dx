@@ -63,13 +63,14 @@ data, anything a contract says stays put. Set `MEMORY_BOUNDARY_CMD` to a command
 | `1` | fine: go ahead |
 | anything else | restricted: a check that is missing, crashes or times out fails closed |
 
-It runs through `sh -c` with `MEMORY_BOUNDARY_TOOL` (`reflector`, `consolidate` or
-`session-analyzer`), `MEMORY_BOUNDARY_PATH` (the transcript, or the prompt or input about to go to
+It runs through `sh -c` with `MEMORY_BOUNDARY_TOOL` (`reflector`, `consolidate`, `session-analyzer`
+or `context-advisor`), `MEMORY_BOUNDARY_PATH` (the transcript, or the prompt or input about to go to
 a model) and, when known, `MEMORY_BOUNDARY_SESSION` and `MEMORY_BOUNDARY_TRIGGER`. It is cut off
 after `MEMORY_BOUNDARY_TIMEOUT` seconds (default 20). Unset, nothing is restricted. The reflector,
 the analyzer and `claude-consolidate` (the one helper every model call goes through) all ask it, per
 file, before reading or sending anything; `scripts/lib/memory-boundary.sh` is the shared
-implementation, with examples.
+implementation, with examples. The context advisor asks it too before it sends conversation excerpts
+to Jev, and a restricted session gets its advice without them.
 
 ## Models
 

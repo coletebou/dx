@@ -15,21 +15,38 @@ set -euo pipefail
 
 # Resolve the same auto-memory dir Claude Code reads/writes.
 # Precedence mirrors the CLI: an `autoMemoryDirectory` override in
-# local/user settings wins (used LITERALLY — no per-cwd slug appended);
-# otherwise fall back to the default ~/.claude/projects/<encoded-cwd>/memory
-# (worktrees map to the main worktree's dir). Claude Code encodes the path by
-# turning every character that is not a letter or digit into "-", so
-# /home/me/.dotfiles is -home-me--dotfiles.
+# local/project/user settings wins (used LITERALLY — no per-cwd slug appended);
+# otherwise fall back to the default ~/.claude/projects/<encoded-root>/memory,
+# where the root is the main checkout's (worktrees and subdirectories share one
+# dir). Claude Code encodes the path by turning every character that is not a
+# letter or digit into "-", so /home/me/.dotfiles is -home-me--dotfiles.
 encode() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+# The main checkout's root, empty outside a repo. `|| true`: outside a repo git
+# exits 128, and under `set -e` that silently killed the hook — sessions in
+# non-git dirs with a memory dir (e.g. ~/code) lost their handoff and memory
+# index, and showed "SessionStart hook error".
+MAIN_ROOT=""
+GIT_COMMON=$(git rev-parse --git-common-dir 2>/dev/null || true)
+if [ -n "$GIT_COMMON" ]; then
+  MAIN_ROOT=$(cd "$(dirname "$GIT_COMMON")" 2>/dev/null && pwd || true)
+fi
+# Since 2.1.211 Claude Code keeps .claude/settings.local.json at that root, and
+# still reads one an older version left in the starting directory (the root's
+# value wins). It keeps the file in the starting directory when the root is HOME.
+LOCAL_ROOT="$MAIN_ROOT"
+[ "$LOCAL_ROOT" = "$HOME" ] && LOCAL_ROOT=""
 
 # Read autoMemoryDirectory from local then project then user settings (jq if available).
 AUTO_MEM_DIR=""
 if command -v jq >/dev/null 2>&1; then
-  for _sf in "$PWD/.claude/settings.local.json" \
+  for _sf in ${LOCAL_ROOT:+"$LOCAL_ROOT/.claude/settings.local.json"} \
+             "$PWD/.claude/settings.local.json" \
              "$PWD/.claude/settings.json" \
              "$HOME/.claude/settings.json"; do
     [ -f "$_sf" ] || continue
-    _v=$(jq -r '.autoMemoryDirectory // empty' "$_sf" 2>/dev/null)
+    # `|| true`: a malformed or half-written settings file must not kill the hook either.
+    _v=$(jq -r '.autoMemoryDirectory // empty' "$_sf" 2>/dev/null || true)
     if [ -n "$_v" ]; then
       # Expand a leading ~/ to $HOME (the CLI does the same).
       # shellcheck disable=SC2088  # intentional literal-tilde glob pattern, not expansion
@@ -43,17 +60,7 @@ fi
 if [ -n "$AUTO_MEM_DIR" ]; then
   MEMORY_DIR="$AUTO_MEM_DIR"
 else
-  # `|| true`: outside a repo git exits 128, and under `set -e` that silently
-  # killed the hook — sessions in non-git dirs with a memory dir (e.g. ~/code)
-  # lost their handoff and memory index, and showed "SessionStart hook error".
-  GIT_COMMON=$(git rev-parse --git-common-dir 2>/dev/null || true)
-  if [ -n "$GIT_COMMON" ] && [ "$GIT_COMMON" != ".git" ]; then
-    # Worktree: resolve main repo root from the shared .git dir
-    MAIN_ROOT=$(cd "$(dirname "$GIT_COMMON")" 2>/dev/null && pwd)
-    MEMORY_DIR="$HOME/.claude/projects/$(encode "$MAIN_ROOT")/memory"
-  else
-    MEMORY_DIR="$HOME/.claude/projects/$(encode "$PWD")/memory"
-  fi
+  MEMORY_DIR="$HOME/.claude/projects/$(encode "${MAIN_ROOT:-$PWD}")/memory"
 fi
 
 if [ -d "$MEMORY_DIR" ]; then

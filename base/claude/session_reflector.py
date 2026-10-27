@@ -124,13 +124,14 @@ def clip(text, n):
     return f"{text[:head]} …[{len(text) - n} chars]… {text[-(n - head):]}"
 
 
-def boundary_skip(transcript, session_id="", trigger=""):
+def boundary_skip(transcript, session_id="", trigger="", tool="reflector"):
     """True when MEMORY_BOUNDARY_CMD says this session must never be reflected (see the module
-    docstring). Exit 1 is the only answer that lets a reflection run."""
+    docstring). Exit 1 is the only answer that lets a reflection run. The context advisor asks
+    the same question before it sends excerpts to Jev, as tool "context-advisor"."""
     cmd = os.environ.get("MEMORY_BOUNDARY_CMD", "").strip()
     if not cmd:
         return False
-    env = {**os.environ, **CHILD_GUARDS, "MEMORY_BOUNDARY_TOOL": "reflector",
+    env = {**os.environ, **CHILD_GUARDS, "MEMORY_BOUNDARY_TOOL": tool,
            "MEMORY_BOUNDARY_PATH": str(transcript or ""), "MEMORY_BOUNDARY_SESSION": session_id or "",
            "MEMORY_BOUNDARY_TRIGGER": trigger or ""}
     try:
@@ -279,18 +280,21 @@ def condense(path, offset):
     return text, new_offset, entrypoint, sum(1 for p in parts if p.startswith("USER: "))
 
 
-def request_before(path, offset, window=2 * 1024 * 1024):
+def request_before(path, offset, floor=0, window=2 * 1024 * 1024):
     """The last human request before `offset` — the goal a continuation segment is
-    still working on, when an earlier reflection already consumed the prompt."""
+    still working on, when an earlier reflection already consumed the prompt. Never
+    reads before `floor`: the end of a span the data boundary kept out (skip_span)."""
     try:
         with open(path, "rb") as f:
-            start = max(0, offset - window)
+            start = max(floor, offset - window)
+            if start >= offset:
+                return ""
             f.seek(start)
             lines = f.read(offset - start).decode("utf-8", "replace").splitlines()
     except OSError:
         return ""
-    if start > 0:
-        lines = lines[1:]  # partial first line
+    if start > floor:
+        lines = lines[1:]  # partial first line (the floor is a line boundary)
     entries = []
     for line in lines:
         try:
@@ -539,7 +543,7 @@ def reflect(transcript, session_id, cwd, trigger, dry_run=False, tier="deep", st
             log({**base, "skipped": "too little new content"})
             return 0
         if prompts == 0 and offset > 0:
-            earlier = request_before(transcript, offset)
+            earlier = request_before(transcript, offset, int(state.get("skipped_until", 0)))
             if earlier:
                 condensed = f"USER (the request still in progress, from before this excerpt): {earlier}\n{condensed}"
         found = store_candidates(condensed, sid, cwd)

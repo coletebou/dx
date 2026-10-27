@@ -119,7 +119,8 @@ install.sh                        the installer
   which `zshenv` sources. The git hooks scan every commit and push with gitleaks and fail closed.
 - **Memory is data, not code.** Memory files, reflections, diaries and transcripts belong in a
   private repository; `.gitignore` keeps them out of a fork. A data boundary
-  (`MEMORY_BOUNDARY_CMD`) keeps chosen sessions away from every model call the memory tools make.
+  (`MEMORY_BOUNDARY_CMD`) keeps chosen sessions away from every model call the memory tools make,
+  and from the context advisor's optional third-party advice call.
 - **The installer never deletes.** Everything it replaces is moved into a dated backup with a
   change log, and `--dry-run` shows every change first.
 - **Tools that type into other agents' panes check them first.** `pw broadcast` never types into a
