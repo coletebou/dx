@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# autoreview-pair: the paired-review rule (base/claude/CLAUDE.base.md) as one command: Codex and Claude
+# as two independent runs of the autoreview skill's helper (openclaw/agent-skills), in parallel, over the
+# same scope.
+#
+#   autoreview-pair [--out DIR] [--engines codex,claude] <helper arguments>
+#   autoreview-pair --mode branch --base origin/master --prompt "what to look for"
+#   autoreview-pair --mode commit --commit HEAD --source-context web/core/remote.js
+#
+# Sources $AUTOREVIEW_ENV_FILE first, default ~/.env_secrets when it exists (set it empty to skip): a
+# reviewer on a Bedrock route reads its credentials from there, and a bash caller lacks what zshenv
+# exports, so a review would fail with what looks like an expired-credentials 403. Points TMPDIR at the
+# per-user temp directory on macOS, then runs the autoreview helper once per engine with the same arguments plus its own --engine and
+# output paths. Models, effort, auth and priority come from the AUTOREVIEW_* environment (the helper's own
+# settings; zshenv sets AUTOREVIEW_MAX_PRIORITY) or the flags passed through. Each engine's report, JSON, status and log land in one directory (default
+# ~/.local/state/autoreview-pair/<repo>-<time>). Do not edit the checkout while it runs: a reviewer
+# refuses a scope that changed under it.
+#
+# Exit status: 0 every review clean, 1 a review has findings, 2 a review did not finish (read its log),
+# 64 a usage error.
+set -uo pipefail
+
+engines="codex,claude" out="" args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --out|--engines)
+            if [[ $# -lt 2 || -z "$2" ]]; then echo "autoreview-pair: $1 needs a value" >&2; exit 64; fi
+            if [[ "$1" == --out ]]; then out="$2"; else engines="$2"; fi
+            shift 2 ;;
+        --out=*) out="${1#--out=}"; shift ;;
+        --engines=*) engines="${1#--engines=}"; shift ;;
+        --engine|--engine=*|--output|--output=*|--json-output|--json-output=*|--status-output|--status-output=*)
+            echo "autoreview-pair: $1 is set per engine by this wrapper; leave it out" >&2; exit 64 ;;
+        -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+if [[ ${#args[@]} -eq 0 ]]; then
+    echo "autoreview-pair: pass the helper's scope (for example --mode branch --base origin/master)" >&2; exit 64
+fi
+list=()
+IFS=, read -r -a list <<<"$engines"
+if [[ ${#list[@]} -eq 0 ]]; then echo "autoreview-pair: --engines is empty" >&2; exit 64; fi
+for e in "${list[@]}"; do
+    case "$e" in codex|claude|amp|pi) ;; *) echo "autoreview-pair: unknown engine '$e'" >&2; exit 64 ;; esac
+done
+
+helper="${AUTOREVIEW:-}"
+if [[ -z "$helper" ]]; then
+    for c in "$HOME/.agents/skills/autoreview/scripts/autoreview" "$HOME/.claude/skills/autoreview/scripts/autoreview"; do
+        if [[ -f "$c" ]]; then helper="$c"; break; fi
+    done
+fi
+if [[ -z "$helper" || ! -f "$helper" ]]; then
+    echo "autoreview-pair: autoreview helper not found; set AUTOREVIEW to its scripts/autoreview" >&2; exit 2
+fi
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "autoreview-pair: run it inside the git checkout to review" >&2; exit 64; }
+
+if [[ -z "$out" ]]; then
+    out="${XDG_STATE_HOME:-$HOME/.local/state}/autoreview-pair/$(basename "$top")-$(date +%Y%m%d-%H%M%S)"
+fi
+if ! { mkdir -p "$out" && chmod 700 "$out"; }; then echo "autoreview-pair: cannot create $out" >&2; exit 2; fi
+out="$(cd "$out" && pwd -P)"
+case "$out/" in
+    "$(cd "$top" && pwd -P)/"*) echo "autoreview-pair: --out must be outside the checkout under review" >&2; exit 64 ;;
+esac
+
+env_file="${AUTOREVIEW_ENV_FILE-$HOME/.env_secrets}"
+if [[ -n "$env_file" && -f "$env_file" ]]; then
+    set +u; set -a
+    # shellcheck source=/dev/null
+    . "$env_file" >/dev/null 2>&1
+    set +a; set -u
+fi
+if [[ "$(uname -s)" == Darwin ]]; then
+    t="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
+    if [[ -n "$t" ]]; then export TMPDIR="${t%/}"; unset TMP TEMP; fi
+fi
+
+for e in "${list[@]}"; do
+    # A reused --out must not hand this run an earlier run's verdict.
+    rm -f "$out/$e.md" "$out/$e.json" "$out/$e.status.json" "$out/$e.log" "$out/$e.rc"
+    (
+        python3 "$helper" "${args[@]}" --engine "$e" --output "$out/$e.md" --json-output "$out/$e.json" \
+            --status-output "$out/$e.status.json" > "$out/$e.log" 2>&1
+        echo "$?" > "$out/$e.rc"
+    ) &
+done
+printf 'autoreview-pair: %s in parallel; output in %s\n' "${list[*]}" "$out"
+wait
+
+# "<status> <findings>" from this run's files, read with python3 (the helper needs it anyway; jq may be absent).
+# -I: the working directory is the checkout under review, and a script read from stdin would put it first on
+# sys.path, so its json.py would run here, with the secrets sourced above.
+verdict() {
+    python3 -I - "$1" "$2" 2>/dev/null <<'PY' || true
+import json, sys
+def load(p):
+    try:
+        with open(p) as f: return json.load(f)
+    except Exception: return {}
+print(load(sys.argv[1]).get("status") or "-", len(load(sys.argv[2]).get("findings") or []))
+PY
+}
+
+worst=0
+for e in "${list[@]}"; do
+    rc="$(cat "$out/$e.rc" 2>/dev/null || echo '?')"
+    st="" n=""
+    read -r st n <<<"$(verdict "$out/$e.status.json" "$out/$e.json")"
+    [[ "$st" == - ]] && st=""
+    overall="$(grep -m1 '^overall:' "$out/$e.log" 2>/dev/null || true)"
+    # The helper exits 0 when clean and 1 with findings, but also 1 on a usage error: the status decides, and a
+    # clean status counts only with a clean exit.
+    if [[ "$st" == findings ]]; then v=1; label="findings${n:+ ($n)}"
+    elif [[ ( "$st" == clean || "$st" == scoped-clean ) && "$rc" == 0 ]]; then v=0; label="$st"
+    else v=2; label="did not finish (${st:-no status}, exit $rc)"; overall="$(tail -n 2 "$out/$e.log" 2>/dev/null | tr '\n' ' ')"
+    fi
+    if (( v > worst )); then worst=$v; fi
+    printf '%-7s %s  %s\n        %s\n' "$e" "$label" "$overall" "$out/$e.md"
+done
+exit "$worst"
