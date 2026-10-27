@@ -64,7 +64,7 @@ class WtClassifyTests(unittest.TestCase):
         git(env, seed, "remote", "add", "origin", str(remote))
         git(env, seed, "push", "-q", "-u", "origin", "main")
 
-        for name in ("clean", "dirty", "ahead"):
+        for name in ("clean", "dirty", "ahead", "broken"):
             git(env, code, "clone", "-q", str(remote), name)
             # Nested worktrees stay out of their repository's status, as .gitignore keeps them.
             (code / name / ".git" / "info" / "exclude").write_text(".claude/\n")
@@ -75,6 +75,8 @@ class WtClassifyTests(unittest.TestCase):
         git(env, code / "ahead", "commit", "-q", "-m", "local only")
         git(env, code / "clean", "worktree", "add", "-q", "-b", "feature",
             str(code / "clean" / ".claude" / "worktrees" / "feature"))
+        # An index git cannot read: `git status` fails while the ref queries still answer.
+        (code / "broken" / ".git" / "index").write_bytes(b"not an index")
         (code / "notes").mkdir()
         # A relocated checkout: the real one lives elsewhere, ~/code holds a symlink to it.
         git(env, root, "clone", "-q", str(remote), str(root / "elsewhere" / "moved"))
@@ -103,7 +105,7 @@ class WtClassifyTests(unittest.TestCase):
                                                      "on_remote", "last_commit_days", "live"])
 
     def test_every_checkout_gets_one_row_of_eight_columns(self):
-        self.assertEqual(sorted(self.rows), ["ahead", "clean", "dirty", "feature", "moved", "notes"])
+        self.assertEqual(sorted(self.rows), ["ahead", "broken", "clean", "dirty", "feature", "moved", "notes"])
         self.assertTrue(all(len(cols) == 8 for cols in self.rows.values()), self.rows)
 
     def test_a_clean_pushed_clone_is_idle_and_on_the_remote(self):
@@ -121,6 +123,10 @@ class WtClassifyTests(unittest.TestCase):
         cols = self.rows["feature"]
         self.assertEqual(cols[1:3], ["worktree", "feature"])
         self.assertTrue(cols[0].endswith("clean/.claude/worktrees/feature"), cols[0])
+
+    def test_a_status_git_cannot_read_is_unknown_not_clean(self):
+        # A failed `git status` must never read as 0 dirty files: that row would look removable.
+        self.assertEqual(self.rows["broken"][3], "?")
 
     def test_a_plain_directory_is_nogit(self):
         self.assertEqual(self.rows["notes"][1:], ["nogit", "-", "-", "-", "-", "-", "idle"])

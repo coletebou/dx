@@ -10,7 +10,8 @@
 # kind is worktree, standalone or nogit. unpushed counts commits ahead of the upstream ("-" without
 # one); for a standalone clone it is "<ahead>/<local-only>", the second number counting commits on
 # any local branch that no remote has. live means a process's working directory or a tmux pane is
-# inside the checkout: never move or delete those.
+# inside the checkout: never move or delete those. dirty is "?" when git cannot report the status
+# (an unreadable index, say): unknown, so never a removal candidate.
 set -u
 # git status may otherwise refresh a checkout's index, a write: this survey makes none.
 export GIT_OPTIONAL_LOCKS=0
@@ -36,7 +37,7 @@ is_live() {  # is_live DIR: a live path is DIR or inside it (component-wise, not
 }
 
 classify() {  # classify DIR: one row
-  local d="$1" real kind br dirty unp onr local_only lc days live=idle
+  local d="$1" real kind br st dirty unp onr local_only lc days live=idle
   # Process working directories are physical paths: a checkout behind a symlink is live when
   # either its own path or the one it resolves to holds one.
   real="$(cd "$d" 2>/dev/null && pwd -P)" || real="$d"
@@ -48,7 +49,12 @@ classify() {  # classify DIR: one row
   kind=standalone; [[ -f "$d/.git" ]] && kind=worktree
   br="$(git -C "$d" symbolic-ref --short -q HEAD 2>/dev/null \
     || echo "detached@$(git -C "$d" rev-parse --short HEAD 2>/dev/null)")"
-  dirty="$(git -C "$d" status --porcelain --untracked-files=normal 2>/dev/null | wc -l | tr -d ' ')"
+  # A status git cannot produce (an unreadable index, say) is unknown, never 0 dirty files.
+  if st="$(git -C "$d" status --porcelain --untracked-files=normal 2>/dev/null)"; then
+    dirty="$(printf '%s' "$st" | grep -c . || true)"
+  else
+    dirty="?"
+  fi
   if git -C "$d" rev-parse -q --verify '@{u}' >/dev/null 2>&1; then
     unp="$(git -C "$d" rev-list --count '@{u}..HEAD' 2>/dev/null)"
   else

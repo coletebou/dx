@@ -73,7 +73,9 @@ ssh <host> 'bash -s' < "$SKILL/scripts/wt-classify.sh"      # nothing installed 
 It prints one row per checkout directly under each DIR, and per worktree nested in a
 checkout's `.claude/worktrees/`: kind, branch, dirty count, unpushed count, whether HEAD is on
 a remote, days since the last commit, and `live` when a process's working directory or a tmux
-pane is inside it. Never move or delete a live checkout.
+pane is inside it. Never move or delete a live checkout. A dirty count of `?` means git could not
+report the status (an unreadable index, a broken worktree): unknown, so inspect it by hand and never
+treat it as clean.
 
 - **Clean, HEAD on a remote, idle**: a candidate for removal within the selected scope. For a
   worktree, run `git worktree remove <path>` from its main repository (no `--force`; list
