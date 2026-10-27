@@ -132,11 +132,27 @@ backup() {
     record backup "$dest" "$BACKUP_DIR/$rel"
 }
 
+# A DEST whose nearest existing parent resolves into this checkout (say ~/.local/bin is a link
+# to its scripts/) would make a run write into the repo, or move a source to the backup and
+# link it to itself. Such a DEST is left alone.
+into_checkout() {  # into_checkout DEST
+    local dir
+    dir="$(dirname "$1")"
+    while [ ! -d "$dir" ]; do dir="$(dirname "$dir")"; done
+    dir="$(cd "$dir" && pwd -P)" || return 1
+    case "$dir/" in "$DOTFILES_DIR"/*) return 0 ;; esac
+    return 1
+}
+
 # link SRC DEST: DEST becomes a symlink to SRC, unless it already is one.
 link() {
     local src="$1" dest="$2"
     [ -e "$src" ] || die "missing in this checkout: $src"
     if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then
+        return 0
+    fi
+    if into_checkout "$dest"; then
+        warn "$(tilde "$dest") is inside this checkout (a linked parent directory); leaving it alone"
         return 0
     fi
     if [ -e "$dest" ] || [ -L "$dest" ]; then
@@ -158,6 +174,11 @@ link() {
 generate() {
     local dest="$1" tmp="$2"
     if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$tmp" "$dest"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    if into_checkout "$dest"; then
+        warn "$(tilde "$dest") is inside this checkout (a linked parent directory); leaving it alone"
         rm -f "$tmp"
         return 0
     fi
@@ -242,23 +263,26 @@ c_shell() {
 }
 
 c_git() {
-    local tmp name="" email=""
+    local tmp name="" email="" local_cfg="$HOME/.gitconfig.local"
     # An identity in the ~/.gitconfig this replaces is carried into ~/.gitconfig.local, which
-    # git reads last, so commits keep it.
+    # git reads last, so commits keep it. A field ~/.gitconfig.local already sets is never
+    # overwritten, so that file only ever gains keys.
     if [ -f "$HOME/.gitconfig" ] && [ ! -L "$HOME/.gitconfig" ]; then
         name="$(git config --file "$HOME/.gitconfig" --get user.name 2>/dev/null || true)"
         email="$(git config --file "$HOME/.gitconfig" --get user.email 2>/dev/null || true)"
     fi
+    [ -n "$(git config --file "$local_cfg" --get user.name 2>/dev/null || true)" ] && name=""
+    [ -n "$(git config --file "$local_cfg" --get user.email 2>/dev/null || true)" ] && email=""
     link "$DOTFILES_DIR/base/gitconfig.base" "$HOME/.gitconfig"
-    if [ -n "$email" ] && [ -z "$(git config --file "$HOME/.gitconfig.local" --get user.email 2>/dev/null || true)" ]; then
+    if [ -n "$name$email" ]; then
         if [ "$DRY_RUN" -eq 1 ]; then
-            say "  [dry-run] would keep your git identity ($email) in ~/.gitconfig.local"
+            say "  [dry-run] would keep your git identity (${email:-$name}) in ~/.gitconfig.local"
             CHANGES=$((CHANGES + 1))
         else
-            [ -n "$name" ] && git config --file "$HOME/.gitconfig.local" user.name "$name"
-            git config --file "$HOME/.gitconfig.local" user.email "$email"
+            [ -n "$name" ] && git config --file "$local_cfg" user.name "$name"
+            [ -n "$email" ] && git config --file "$local_cfg" user.email "$email"
             say "  kept your git identity in ~/.gitconfig.local"
-            record git-identity "$HOME/.gitconfig.local" "$email"
+            record git-identity "$local_cfg" "${email:-$name}"
         fi
     fi
     tmp="$(mktemp)"

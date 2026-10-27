@@ -129,6 +129,32 @@ case "$(uname -s)" in
 esac
 equal "...writing nothing" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
 
+echo "a git identity split across files"
+newhome 5
+printf '[user]\n\tname = Sam Example\n\temail = sam@example.com\n' > "$HOME/.gitconfig"
+printf '[user]\n\tname = Local Name\n' > "$HOME/.gitconfig.local"
+out="$(inst --with git)"; rc=$?
+equal "the install succeeds" 0 "$rc"
+equal "...keeps the name ~/.gitconfig.local already had" "Local Name" \
+  "$(git config --file "$HOME/.gitconfig.local" --get-all user.name 2>&1)"
+equal "...and carries the email it lacked" "sam@example.com" \
+  "$(git config --file "$HOME/.gitconfig.local" --get user.email 2>&1)"
+
+echo "a ~/.local/bin that links into the checkout"
+# From a copy of the checkout, so a regression cannot damage the real one.
+copy="$tmp/copy"
+mkdir -p "$copy"
+(cd "$root" && git ls-files -co --exclude-standard -z | xargs -0 tar -cf - 2>/dev/null) | tar -xf - -C "$copy"
+newhome 6
+mkdir -p "$HOME/.local"
+ln -s "$copy/scripts" "$HOME/.local/bin"
+out="$("$run_bash" "$copy/install.sh" --with worktrees 2>&1)"; rc=$?
+equal "the install succeeds" 0 "$rc"
+check "...says why it skips those links" "inside this checkout" "$out"
+equal "...leaves the checkout's own script a file" "file" \
+  "$([[ -f "$copy/scripts/wt-helper" && ! -L "$copy/scripts/wt-helper" ]] && echo file || ls -l "$copy/scripts/wt-helper" 2>&1)"
+equal "...and links nothing into it" "" "$(find "$copy/scripts" -maxdepth 1 -type l | head -3)"
+
 echo "the checkout"
 equal "nothing was written into the repo" "$before_status" "$(git -C "$root" status --porcelain)"
 
