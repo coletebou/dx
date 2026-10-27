@@ -89,7 +89,7 @@ after each phase ([Overlays](#overlays)).
 |---|---|
 | **system** | `hostname`: with `--hostname`, the hostname, Debian's `127.0.1.1` line, and cloud-init's `preserve_hostname` so a reboot keeps it. `hosts`: `--hosts-entry` lines, in one marked block rewritten each run. `inotify`: raised watch, instance and queue limits in `/etc/sysctl.d/60-dx-inotify.conf` (many file watchers otherwise fail with ENOSPC far from the cause). `locale`: `LANG=C.UTF-8` in `/etc/default/locale` unless a UTF-8 locale is already set. `apt-config`: 30-second network timeouts and 3 retries, so a stalled mirror cannot hold the apt lock forever. `packages`: the base packages (git, curl, gnupg, unzip, zsh, jq, python3, tmux, fzf, ripgrep, fd, bat, tree, htop, the zsh plugins) plus `BOOTSTRAP_APT_EXTRA`, with `fd` and `bat` shims. `ec2-swap`: with `--ec2`, see below. |
 | **nvme** | `detect`: always, read-only: which local instance-store disks there are. `apply`: with `--nvme`, see [Instance-store NVMe](#instance-store-nvme). |
-| **docker** | `engine`: Docker Engine, buildx and compose from Docker's apt repository, its signing key checked against the fingerprint Docker publishes; the user joins the `docker` group. `binfmt`: `qemu-user-static`, so Docker runs and builds images of the other architecture. `--no-docker` skips both. |
+| **docker** | `engine`: Docker Engine, buildx and compose from Docker's apt repository, its signing key checked against the fingerprint Docker publishes (a download holding any other key is refused, and only the pinned key is installed for apt to trust); the user joins the `docker` group. `binfmt`: `qemu-user-static`, so Docker runs and builds images of the other architecture. `--no-docker` skips both. |
 | **toolchains** | Pinned and sha256-checked (see [Pins](#pins)): tmux built from source into `/usr/local`; gitleaks (the git hooks need it), lazygit, eza, delta and zoxide into `/usr/local/bin`; Ghostty's terminfo. For the user, as the user: fnm and Node (also linked into `~/.local/bin` for non-interactive shells), starship, Claude Code (its native binary, laid out as its own installer does), and the four tmux plugins `tmux.conf` names, each at a pinned commit. `--no-toolchains` skips them. |
 | **modules** | Opt-in: `--aws`, `--terraform`, `--tailscale` ([Modules](#modules)). |
 | **install** | `install.sh` as the user (`--all --dry-run` by default; `--install`, `--with LIST`, or `--no-install`), then the login shell becomes zsh when the shell component is really installed. |
@@ -151,9 +151,14 @@ finds; with `--nvme` (or `--ec2`) it uses one.
   serial and leaves the rest. Right before formatting, it probes the disk directly (`blkid -p`,
   `wipefs`) and refuses if either finds anything.
 - **What goes there.** `/srv/nvme` holds bind mounts for `/var/lib/docker`, `/var/lib/containerd`
-  and the user's `~/.cache` (`NVME_BINDS` lists the system ones), and an 8 GB swap file
-  (`NVME_SWAP_GB`, 0 for none). The phase runs before Docker is installed, so Docker's data starts
-  out there. A target that already holds data is left on the root disk, with a warning.
+  and the user's `~/.cache` (`NVME_BINDS` lists them; an entry `DIR:USER` is a directory of USER's,
+  created as theirs when missing, with its place on the disk given to them on every run), and an
+  8 GB swap file (`NVME_SWAP_GB`, 0 for none). The phase runs before Docker is installed, so
+  Docker's data starts out there. A target that already holds data is left on the root disk, with a
+  warning.
+- **Where it is mounted** is read from `/proc/self/mountinfo`, which tells the disk's own mount from
+  the bind mounts made from it (lsblk names only one of the places a disk is mounted), so a second
+  run, or the boot unit run again, finds its disk in place.
 - **At every boot.** `dx-nvme-setup.service` runs `/usr/local/sbin/dx-nvme-setup apply` before
   Docker, containerd and logins: after a stop and start the disk is blank again, so it formats,
   mounts and binds it anew. Docker and containerd require that unit, so a box whose instance store
@@ -175,7 +180,7 @@ the network.
 |---|---|
 | `--aws` | AWS CLI v2 through AWS's own installer (`/usr/local/aws-cli`, `/usr/local/bin/aws`), from the versioned zip, its sha256 pinned. It installs the CLI only: credentials and profiles stay yours ([infra/aws.md](infra/aws.md)). |
 | `--terraform` | Terraform from HashiCorp's versioned release zip, sha256 pinned, into `/usr/local/bin`. |
-| `--tailscale` | Tailscale from its apt repository (the signing key's fingerprint pinned), then a join. |
+| `--tailscale` | Tailscale from its apt repository (the signing key's fingerprint pinned, and only that key installed), then a join. |
 
 The Tailscale join:
 
@@ -189,9 +194,13 @@ The Tailscale join:
   authorized but untagged, which a tag-based policy then cuts off.
 - **Tailscale SSH is off** unless `--tailscale-ssh`.
 - **Rejoin.** A node already on the tailnet is left alone, unless `--tailscale-rejoin`, or unless
-  its machine-id differs from the one recorded when it joined: a box started from an image of
-  another would otherwise share that box's node identity. Either way it logs out and joins anew,
-  and it refuses to log out when it has no key to join again with.
+  its machine-id differs from the one recorded when it joined. A box started from an image of
+  another carries that box's tailscaled state, and with it the machine key that is its identity on
+  the tailnet; a logout and a new login keep that key, so the clone would come back as the same
+  device. Either way it stops tailscaled, deletes its state (`/var/lib/tailscale/tailscaled.state`,
+  or `BOOTSTRAP_TAILSCALE_STATE`), starts it again and joins as a new device. It refuses to do that
+  without a key to join with, which would leave the box off the tailnet. The old device stays in the
+  admin console until you remove it.
 - With no key, Tailscale is installed and the command to join is printed.
 
 ## The fast path and baked images
@@ -206,13 +215,20 @@ When every marker holds, the base packages are installed and Docker is there, th
 (hostname, hosts, sysctl, the instance store, Tailscale, `install.sh`) do anything. That is what
 makes a baked image fast: provision a box fully, clean what is per-box, snapshot it, and every box
 started from the image provisions in seconds. Before the snapshot, remove the per-box state:
-`sudo tailscale logout` (if it joined), `/var/lib/dx-bootstrap/done` and `tailscale-machine-id`,
+
+```bash
+sudo systemctl stop tailscaled                   # if it joined: a logout keeps the machine key
+sudo rm -f /var/lib/tailscale/tailscaled.state   # so delete the state that holds it
+sudo rm -f /var/lib/dx-bootstrap/done
+```
+
 and whatever your image tooling resets (machine-id, ssh host keys, cloud-init's instance state).
-Keep `/var/lib/dx-bootstrap/ready/`.
+Keep `/var/lib/dx-bootstrap/ready/`, and keep `tailscale-machine-id`: a box started from the image
+has a new machine-id, which is how it knows to join as a new device even if the state was left in.
 
 Outside a baked image the markers still pay off: a second run skips each tool that is in place
-(`skip-ready`). `--full` ignores every marker; `BOOTSTRAP_FAST=0` turns the fast path off while
-still letting each step check its own marker. Timings of every run are appended to
+(`skip-ready`). `--full` ignores every marker, and `--upgrade` turns the fast path off (an upgrade
+always runs); `BOOTSTRAP_FAST=0` turns it off while still letting each step check its own marker. Timings of every run are appended to
 `/var/lib/dx-bootstrap/timings.tsv` (start, milliseconds, step, status) to compare the two.
 
 ## cloud-init
