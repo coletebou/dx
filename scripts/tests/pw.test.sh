@@ -35,7 +35,7 @@ done
 export TMUX_TMPDIR="$tmp/sock" HOME="$tmp/home" SHELL=/bin/sh GIT_CONFIG_NOSYSTEM=1
 mkdir -p "$TMUX_TMPDIR" "$HOME" "$tmp/bin"
 unset TMUX WT_BASE_DIR WT_LAYOUT WT_NESTED_SUBDIR XDG_CONFIG_HOME
-trap 'tmux kill-server 2>/dev/null; rm -rf "$tmp"; [[ -n "$unmounted" && -d "$unmounted" ]] && rm -rf "$unmounted"' EXIT
+trap 'tmux kill-server 2>/dev/null; tmux -L pw-slow kill-server 2>/dev/null; rm -rf "$tmp"; [[ -n "$unmounted" && -d "$unmounted" ]] && rm -rf "$unmounted"' EXIT
 
 pass=0 fail=0
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass + 1)); }
@@ -385,6 +385,22 @@ if [[ -n "$unmounted" ]]; then
 else
   echo "  skip no mount container that is not itself a mount point"
 fi
+
+echo "a window whose shell drops what is typed while it starts still runs the agent"
+# The login shell takes a second to start and discards the keys typed meanwhile, as a loaded
+# macOS runner's did: pw has to wait for the shell, not type ahead of it. Its own tmux server,
+# so the stand-in shell is that server's default and no other window gets it.
+printf '#!/bin/bash\nsleep 1\nwhile read -r -t 1 _; do :; done\nexec /bin/sh "$@"\n' > "$tmp/bin/slowsh"
+chmod +x "$tmp/bin/slowsh"
+setting "$tmp/ext"
+manifest slow kappa
+: > "$calls"
+out="$(in_repo SHELL="$tmp/bin/slowsh" PW_TMUX_SOCKET=pw-slow "$pw" launch "$tmp/slow.tsv" --no-bootstrap 2>&1)"
+equal "launch succeeds" 0 "$?"
+equal "...and the agent window runs the fake claude" 1 "$(stub_runs 1)"
+check "...with its session id" "--session-id " "$(cat "$calls")"
+in_repo PW_TMUX_SOCKET=pw-slow "$pw" teardown "$tmp/slow.tsv" >/dev/null 2>&1
+command tmux -L pw-slow kill-server 2>/dev/null || true
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

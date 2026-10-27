@@ -211,6 +211,24 @@ tmux() {
     command tmux ${PW_TMUX_SOCKET:+-L "$PW_TMUX_SOCKET"} "$@"
 }
 
+# pw_shell_ready TARGET: wait (60 s at most) until the shell in a new window runs what is
+# typed into it. A login shell that is still starting can discard the keys typed meanwhile
+# (a loaded macOS runner's does), and then the agent never starts. The probe prints its
+# token in upper case, so the terminal echoing the keystrokes cannot pass for its output;
+# a probe the shell dropped is typed again every 2 s. No pipe tests the screen: under
+# pipefail an early-exiting grep can fail the test it just passed.
+pw_shell_ready() {
+    local target="$1" tok="pw-ready-$$-$RANDOM" want screen i
+    want="$(printf '%s' "$tok" | tr a-z A-Z)"
+    for ((i = 0; i < 300; i++)); do
+        (( i % 10 )) || tmux send-keys -t "$target" "echo $tok | tr a-z A-Z" C-m
+        screen="$(tmux capture-pane -p -J -t "$target" 2>/dev/null)" || screen=""
+        [[ $'\n'"$screen"$'\n' == *$'\n'"$want"$'\n'* ]] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
 repo_root() {
     # Caller sits inside a git repo when launching. Worktrees of that repo
     # become siblings of the repo dir.
@@ -544,6 +562,7 @@ cmd_launch() {
 
     # Auto-tail the merged log in window 0. Use `pw log <manifest>` so it
     # picks up the right log via the .log-path sidecar we just wrote.
+    pw_shell_ready "$session:log" || warn "the log window's shell did not answer within 60 s; typing anyway"
     tmux send-keys -t "$session:log" \
         "$(printf %q "$0") log $(printf %q "$manifest")" C-m
 
@@ -605,6 +624,7 @@ cmd_launch() {
         # window index first, so with base-index 1 tag "1" would be the log.
         local win; win="$(tmux new-window -P -F '#{window_id}' -t "=$session:" -n "$tag" -c "$wt")"
         [ -n "$first_win" ] || first_win="$win"
+        pw_shell_ready "$win" || warn "window $tag: its shell did not answer within 60 s; typing anyway"
 
         # Export env vars into the window so the prompt footer works.
         # PARALLEL_APPEND points at the portable mkdir-mutex append helper —
