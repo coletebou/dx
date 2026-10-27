@@ -1,0 +1,906 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2088  # the messages name paths with a literal ~ on purpose
+# codesync: keep every Git repository under ~/code in step with its origin, on this machine and
+# then on your other machines, uncommitted work included. What you were in the middle of on one
+# machine is waiting on the next. Options and settings: codesync --help; the guide:
+# docs/codesync.md.
+#
+# A repository is a checkout on a branch whose origin URL matches CODESYNC_REMOTE_MATCH (an
+# extended regex, default github\.com). For each one:
+#   1. uncommitted changes, untracked files included, become a commit "WIP: codesync <time>";
+#   2. commits origin has and it lacks are pulled, rebasing on top of them;
+#   3. it pushes: a WIP commit is force-pushed only when the remote holds nothing it lacks;
+#   4. its own WIP commit is unwrapped again, back to uncommitted changes.
+# A WIP commit pulled from another machine is not unwrapped: it becomes the real commit
+# "sync: apply codesync changes", pushed for the machine that made it to pick up.
+#
+# Safety:
+#   - Uncommitted changes are never lost. A repository it cannot sync (a conflict, a refused
+#     commit or push) is put back with them uncommitted, and the run reports it.
+#   - It never force-pushes over commits it lacks: only a WIP commit is force-pushed, only when
+#     the remote's base is in its own, and with --force-with-lease, so a push that lands after
+#     its fetch is refused rather than overwritten.
+#   - Every commit it force-pushes over or unwraps keeps a tag (codesync-backup-*,
+#     codesync-unwrap-*): the newest five of each, and any younger than a week.
+#   - Another machine is synced only when its own ~/.df-profile names this machine's identity;
+#     profiles, like the config file (~/.config/codesync/config), are read as data, never run.
+set -euo pipefail
+
+WIP_PREFIX="WIP: codesync"
+FINAL_SUBJECT="sync: apply codesync changes"
+MACHINE_TRAILER="Codesync-Machine"
+TAG_KEEP_RECENT=5
+TAG_KEEP_DAYS=7
+
+DRY_RUN=false VERBOSE=false LOCAL_ONLY=false LIST_PEERS=false MACHINE="" made_wip=false
+HOSTS=()
+synced=0 skipped=0 failed=0 wip_created=0 wip_unwrapped=0 peers_synced=0 peer_problems=0
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+if [[ ! -t 1 || -n "${NO_COLOR:-}" ]]; then RED="" GREEN="" YELLOW="" BLUE="" NC=""; fi
+
+log() { echo -e "[codesync] $1"; }
+vlog() { if $VERBOSE; then echo -e "  $1"; fi; }
+warn() { printf 'codesync: %s\n' "$*" >&2; }
+die() { printf 'codesync: %s\n' "$*" >&2; exit 2; }
+
+usage() {
+    cat <<'EOF'
+Usage: codesync [--dry-run] [--verbose] [--local | --host HOST ...] [--peers]
+
+Syncs every Git repository under ~/code with its origin, uncommitted work included, then runs
+`codesync --local` on each of your other machines over ssh.
+
+Options:
+  --dry-run, -n   say what it would do, change nothing, contact no peer
+  --verbose, -v   show each step, and each peer's whole output
+  --local, -l     this machine only
+  --host HOST     after this machine, sync HOST only (repeatable; an ssh alias)
+  --peers         list the peers it would contact and where each comes from, then exit
+  -h, --help      this help
+
+Per repository (a checkout on a branch whose origin matches CODESYNC_REMOTE_MATCH):
+  1. uncommitted changes, untracked files included, become a commit "WIP: codesync <time>"
+  2. commits on origin it lacks are pulled, rebasing on top of them
+  3. it pushes; a WIP commit is force-pushed only when the remote holds nothing it lacks
+  4. its own WIP commit is unwrapped back to uncommitted changes
+  A WIP commit pulled from another machine becomes "sync: apply codesync changes" there.
+
+Safety:
+  - a repository it cannot sync is put back with your changes uncommitted, and reported
+  - never force-pushes over commits it lacks (ancestry check plus --force-with-lease)
+  - backup tags codesync-backup-* and codesync-unwrap-* mark what it replaced or unwrapped
+  - a peer is synced only when its ~/.df-profile names this machine's DF_IDENTITY
+
+Peers (one ssh alias per line, then optionally its identity; '#' starts a comment):
+  CODESYNC_PEERS_FILE if set, else ~/.config/codesync/peers if it exists, else dotsync's
+  list: ~/.config/dotsync/peers (or DOTSYNC_PEERS_FILE) plus
+  ~/.dotfiles/identities/<identity>/dotsync-peers. A peer runs `codesync --local` from its
+  PATH (with ~/.local/bin added); ssh never prompts (BatchMode) and each peer is cut off at
+  CODESYNC_PEER_TIMEOUT.
+
+Settings (environment, else ~/.config/codesync/config as literal KEY=value lines):
+  CODE_DIR               where the repositories are (default: ~/code)
+  CODESYNC_NESTED_DIRS   directories under CODE_DIR whose subdirectories are repositories
+                         too, ':'-separated (e.g. oss; default: none)
+  CODESYNC_EXTRA_DIRS    more repositories anywhere, ':'-separated (default: none)
+  CODESYNC_REMOTE_MATCH  extended regex an origin URL must match (default: github\.com)
+  CODESYNC_PEERS_FILE    the peers file (default: see above)
+  CODESYNC_PEER_TIMEOUT  seconds one peer may take (default: 300)
+  CODESYNC_SSH_TIMEOUT   ssh ConnectTimeout in seconds (default: 5)
+  CODESYNC_REMOTE_CMD    the command a peer runs (default: codesync)
+  CODESYNC_DOTSYNC       auto: run ~/.local/bin/dotsync --local at the end when it exists;
+                         0: never (default: auto)
+  CODESYNC_CONFIG        the config file itself (default: ~/.config/codesync/config)
+
+Exit status: 0 everything synced or was skipped, 1 a repository or peer did not, 2 usage.
+EOF
+}
+
+# ── configuration ────────────────────────────────────────────────────────
+# A file that sets what runs, or where, must be yours and writable only by you.
+codesync_private_file() {
+    local mode
+    [[ -O "$1" ]] || return 1
+    mode="$(ls -ldL "$1" 2>/dev/null | cut -c1-10)"
+    [[ "${mode:5:1}" != w && "${mode:8:1}" != w ]]
+}
+
+CODESYNC_SETTINGS="CODE_DIR CODESYNC_EXTRA_DIRS CODESYNC_NESTED_DIRS CODESYNC_REMOTE_MATCH CODESYNC_PEERS_FILE CODESYNC_PEER_TIMEOUT CODESYNC_SSH_TIMEOUT CODESYNC_REMOTE_CMD CODESYNC_DOTSYNC"
+
+# Literal KEY=value lines, optionally `export `-prefixed and simply quoted. Never sourced, so a
+# line that would run a command only sets a strange value. The environment wins over the file.
+codesync_load_config() {
+    local file="$1" line key value quote
+    [[ -f "$file" ]] || return 0
+    if ! codesync_private_file "$file"; then
+        warn "ignoring $file: it must be yours and writable only by you"
+        return 0
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -n "$line" && "$line" != '#'* ]] || continue
+        line="${line#export }"
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        case " $CODESYNC_SETTINGS " in
+            *" $key "*) ;;
+            *) warn "$file: unknown setting $key"; continue ;;
+        esac
+        value="${line#*=}"
+        quote="${value:0:1}"
+        if [[ ( "$quote" == '"' || "$quote" == "'" ) && ${#value} -ge 2 && "${value: -1}" == "$quote" ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+        [[ -z "${!key+set}" ]] || continue
+        printf -v "$key" '%s' "$value"
+    done < "$file"
+}
+
+# ~/x in a setting means $HOME/x.
+codesync_expand() {
+    case "$1" in
+        "~") printf '%s' "$HOME" ;;
+        "~/"*) printf '%s/%s' "$HOME" "${1#"~/"}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+codesync_valid_host() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$1" != *..* ]]
+}
+
+codesync_valid_identity() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+codesync_lower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# ── ~/.df-profile, read as data ──────────────────────────────────────────
+# The last `KEY=value` line wins (optionally `export `-prefixed, simply quoted); a value with
+# anything but [A-Za-z0-9._:-] reads as nothing, so a line that would run a command yields no
+# identity. No single quote appears in the program: a peer runs it inside a single-quoted word.
+CODESYNC_PROFILE_AWK='
+{
+    line = $0
+    gsub("\r", "", line)
+    sub(/^[ \t]+/, "", line)
+    sub(/^export[ \t]+/, "", line)
+    if (index(line, key "=") != 1) next
+    value = substr(line, length(key) + 2)
+    sub(/[ \t]+$/, "", value)
+    q = substr(value, 1, 1)
+    if ((q == "\"" || q == "\047") && length(value) >= 2 && substr(value, length(value), 1) == q)
+        value = substr(value, 2, length(value) - 2)
+    found = (value ~ /^[A-Za-z0-9][A-Za-z0-9._:-]*$/) ? value : ""
+}
+END { if (found != "") print found }'
+
+codesync_profile_value() {  # KEY FILE
+    awk -v key="$1" "$CODESYNC_PROFILE_AWK" "$2" 2>/dev/null
+}
+
+# This machine's identity: the installed profile when there is one (an ambient DF_IDENTITY
+# never overrides it), else the environment.
+codesync_sender_identity() {
+    local id
+    if [[ -r "$HOME/.df-profile" ]]; then
+        id="$(codesync_profile_value DF_IDENTITY "$HOME/.df-profile")"
+    else
+        id="${DF_IDENTITY:-}"
+    fi
+    if codesync_valid_identity "$id"; then printf '%s' "$id"; fi
+}
+
+# This machine's id, lowercased: DF_MACHINE from the profile, else the short hostname.
+codesync_machine() {
+    local m=""
+    if [[ -r "$HOME/.df-profile" ]]; then
+        m="$(codesync_profile_value DF_MACHINE "$HOME/.df-profile")"
+    fi
+    [[ -n "$m" ]] || m="${DF_MACHINE:-}"
+    if [[ -z "$m" ]]; then
+        m="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+        m="${m%%.*}"
+    fi
+    m="$(codesync_lower "$m" | LC_ALL=C tr -cs 'a-z0-9._:-' '-')"
+    m="${m%-}"
+    if [[ "$m" =~ ^[a-z0-9][a-z0-9._:-]*$ ]]; then printf '%s' "$m"; fi
+}
+
+# ── timeouts ─────────────────────────────────────────────────────────────
+# codesync_timeout SECONDS COMMAND...: exit 124 when COMMAND outlives SECONDS. GNU timeout (or
+# gtimeout) when there is one, else a watchdog. Standard input reaches COMMAND either way.
+codesync_timeout() {
+    local secs="$1" pid watchdog rc=0 marker
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 5 "$secs" "$@" || return $?
+        return 0
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout -k 5 "$secs" "$@" || return $?
+        return 0
+    fi
+    marker="$(mktemp "${TMPDIR:-/tmp}/codesync.XXXXXX")"
+    # Without job control a background command reads /dev/null, unless it says otherwise.
+    { "$@" <&3 3<&- & } 3<&0
+    pid=$!
+    (
+        trap 'kill "$s" 2>/dev/null; exit 0' TERM
+        sleep "$secs" & s=$!
+        wait "$s"
+        if kill -0 "$pid" 2>/dev/null; then
+            echo timeout > "$marker"
+            kill -TERM "$pid" 2>/dev/null
+            sleep 5 & s=$!
+            wait "$s"
+            kill -KILL "$pid" 2>/dev/null
+        fi
+    ) </dev/null >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid" || rc=$?
+    kill -TERM "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    if [[ -s "$marker" ]]; then rc=124; fi
+    rm -f "$marker"
+    return "$rc"
+}
+
+# ── timing ───────────────────────────────────────────────────────────────
+ts_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local t="$EPOCHREALTIME"
+        local frac="${t#*.}000"
+        printf '%s%s' "${t%.*}" "${frac:0:3}"
+    else
+        printf '%s000' "$(date +%s)"
+    fi
+}
+
+fmt_dur() {
+    local ms="$1"
+    if [[ "$ms" -lt 1000 ]]; then
+        printf '%dms' "$ms"
+    elif [[ "$ms" -lt 60000 ]]; then
+        printf '%d.%02ds' "$((ms / 1000))" "$(((ms % 1000) / 10))"
+    else
+        printf '%dm%02ds' "$((ms / 60000))" "$(((ms / 1000) % 60))"
+    fi
+}
+
+# ── one repository ───────────────────────────────────────────────────────
+is_wip_commit() {
+    [[ "$1" == "$WIP_PREFIX"* ]]
+}
+
+current_branch() {
+    git rev-parse --abbrev-ref HEAD 2>/dev/null
+}
+
+has_uncommitted_changes() {
+    ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null
+}
+
+has_untracked_files() {
+    [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]
+}
+
+# The machine a WIP commit names in its trailer, lowercased (empty for one without it).
+wip_machine() {
+    codesync_lower "$(git log -1 --format=%b "$1" 2>/dev/null | sed -n "s/^$MACHINE_TRAILER: //p" | tail -n 1)"
+}
+
+# Stage everything and commit it as a WIP. A refused commit (a hook, a lock) unstages again and
+# fails: the changes stay as they were.
+commit_wip() {
+    local out
+    if ! out="$(git add -A 2>&1)"; then
+        git reset -q 2>/dev/null || true
+        log "  ${RED}could not stage the changes${NC}"
+        [[ -z "$out" ]] || printf '%s\n' "$out" | sed 's/^/    /' >&2
+        return 1
+    fi
+    if ! out="$(git commit --quiet -m "$WIP_PREFIX $(date '+%Y-%m-%d %H:%M:%S')" \
+            -m "$MACHINE_TRAILER: ${MACHINE:-unknown}" 2>&1)"; then
+        git reset -q 2>/dev/null || true
+        log "  ${RED}the WIP commit was refused (a hook?); changes left uncommitted${NC}"
+        [[ -z "$out" ]] || printf '%s\n' "$out" | sed 's/^/    /' >&2
+        return 1
+    fi
+    made_wip=true
+}
+
+# Pull with rebase. A pull that stops (a conflict) is aborted, so no repository is ever left in
+# the middle of a rebase with conflict markers in its files.
+try_rebase() {
+    local branch="$1" out git_dir
+    if out="$(git pull --rebase --quiet origin "$branch" 2>&1)"; then
+        return 0
+    fi
+    git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+    if [[ -n "$git_dir" && ( -d "$git_dir/rebase-merge" || -d "$git_dir/rebase-apply" ) ]]; then
+        git rebase --abort >/dev/null 2>&1 || true
+    fi
+    log "  ${RED}pull failed; resolve it by hand (git pull --rebase)${NC}"
+    [[ -z "$out" ]] || printf '%s\n' "$out" | sed 's/^/    /' >&2
+    return 1
+}
+
+# A repository that cannot be synced gets its changes back uncommitted: the WIP commit this run
+# made is unwrapped again.
+give_back() {
+    if $made_wip && is_wip_commit "$(git log -1 --format=%s 2>/dev/null || true)"; then
+        if unwrap_wip; then
+            made_wip=false
+            log "  ${YELLOW}your changes are back as uncommitted changes${NC}"
+        fi
+    fi
+}
+
+# Force-push a WIP, only if no remote commit would be lost.
+# Args: branch, remote_head (empty when the remote branch does not exist), remote_msg.
+safe_force_push() {
+    local branch="$1" remote_head="${2-}" remote_msg="${3-}"
+    local remote_branch="origin/$branch"
+    local local_head local_msg local_count local_base remote_count remote_base backup_tag push_err rc
+
+    if [[ -z "$remote_head" ]]; then
+        vlog "Remote branch doesn't exist, creating..."
+        git push -u origin "$branch" --quiet 2>/dev/null
+        return $?
+    fi
+
+    local_head=$(git rev-parse HEAD 2>/dev/null)
+    local_msg=$(git log -1 --format=%s 2>/dev/null || echo "")
+    local_count=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+    if is_wip_commit "$local_msg"; then
+        # The WIP-on-base model needs HEAD~1.
+        if [[ "$local_count" -lt 2 ]]; then
+            log "  ${RED}ERROR: Local WIP on single-commit history; cannot validate base.${NC}"
+            log "  ${YELLOW}Refusing force-push. Resolve manually.${NC}"
+            return 1
+        fi
+        local_base=$(git rev-parse HEAD~1 2>/dev/null || echo "")
+    else
+        local_base="$local_head"
+    fi
+
+    remote_count=$(git rev-list --count "$remote_branch" 2>/dev/null || echo "0")
+    if is_wip_commit "$remote_msg"; then
+        if [[ "$remote_count" -lt 2 ]]; then
+            log "  ${RED}ERROR: Remote WIP on single-commit history; cannot validate base.${NC}"
+            log "  ${YELLOW}Refusing force-push. Resolve manually.${NC}"
+            return 1
+        fi
+        remote_base=$(git rev-parse "$remote_branch~1" 2>/dev/null || echo "")
+    else
+        remote_base="$remote_head"
+    fi
+
+    if [[ "$local_head" == "$remote_head" ]]; then
+        vlog "Already up to date"
+        return 0
+    fi
+
+    # Our base must contain the remote's. A base that cannot be resolved refuses too.
+    if [[ -z "$local_base" || -z "$remote_base" ]]; then
+        log "  ${RED}ERROR: Could not resolve local/remote base; refusing force-push.${NC}"
+        return 1
+    fi
+    if [[ "$local_base" == "$remote_base" ]]; then
+        vlog "Bases match, safe to force push"
+    elif git merge-base --is-ancestor "$remote_base" "$local_base" 2>/dev/null; then
+        vlog "Remote base is ancestor of local, safe to force push"
+    else
+        log "  ${RED}ERROR: Remote has commits you don't have!${NC}"
+        log "  ${YELLOW}Run 'git pull' manually to merge, then retry.${NC}"
+        return 1
+    fi
+
+    backup_tag="codesync-backup-$(date +%Y%m%d-%H%M%S)"
+    git tag "$backup_tag" "$remote_head" 2>/dev/null || true
+    vlog "Created backup tag: $backup_tag"
+
+    # The lease is origin/<branch> as fetched: a push that landed since is refused, not lost.
+    if push_err=$(git push --force-with-lease --quiet origin "$branch" 2>&1); then
+        return 0
+    else
+        rc=$?
+        log "  ${RED}push failed (rc=$rc):${NC}"
+        [[ -z "$push_err" ]] || printf '%s\n' "$push_err" >&2
+        return 1
+    fi
+}
+
+# Keep the newest $TAG_KEEP_RECENT safety tags of each kind, and any younger than
+# $TAG_KEEP_DAYS days. Runs only after a repository synced, so a failure keeps its tag.
+prune_codesync_tags() {
+    local prefix tags candidates cutoff tag tag_ts
+    for prefix in codesync-backup codesync-unwrap; do
+        tags=$(git tag --list "${prefix}-*" --sort=-creatordate 2>/dev/null) || continue
+        [[ -n "$tags" ]] || continue
+        candidates=$(printf '%s\n' "$tags" | tail -n "+$((TAG_KEEP_RECENT + 1))")
+        [[ -n "$candidates" ]] || continue
+        # GNU date, else BSD date.
+        cutoff=$(date -d "${TAG_KEEP_DAYS} days ago" +%s 2>/dev/null \
+                 || date -v-"${TAG_KEEP_DAYS}"d +%s 2>/dev/null) || continue
+        while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            tag_ts=$(git log -1 --format=%ct "$tag" 2>/dev/null) || continue
+            if [[ -n "$tag_ts" && "$tag_ts" -lt "$cutoff" ]]; then
+                git tag -d "$tag" >/dev/null 2>&1 || true
+            fi
+        done <<< "$candidates"
+    done
+}
+
+# Unwrap a WIP commit back to uncommitted changes, behind a backup tag.
+unwrap_wip() {
+    local msg backup_tag
+    msg=$(git log -1 --format=%s 2>/dev/null || echo "")
+    is_wip_commit "$msg" || return 1
+
+    vlog "Detected WIP commit, unwrapping..."
+    backup_tag="codesync-unwrap-$(date +%Y%m%d-%H%M%S)"
+    git tag "$backup_tag" HEAD 2>/dev/null || true
+    vlog "Created backup tag: $backup_tag"
+    git reset --soft HEAD~1 --quiet 2>/dev/null || return 1
+    git reset HEAD --quiet 2>/dev/null || true
+    return 0
+}
+
+# sync_repo BRANCH: one repository, in the current directory. 0 synced, 1 failed (counted by
+# the caller). Uses and sets the per-repository state below.
+sync_repo() {
+    local branch="$1" remote_head remote_msg local_head local_msg local_tree remote_tree
+    local remote_only_count push_err
+    made_wip=false
+
+    if ! git fetch --quiet origin "$branch" 2>/dev/null; then
+        log "  ${RED}fetch failed${NC}"
+        return 1
+    fi
+    remote_head=$(git rev-parse "origin/$branch" 2>/dev/null || echo "")
+    remote_msg=""
+    if [[ -n "$remote_head" ]]; then
+        remote_msg=$(git log -1 --format=%s "origin/$branch" 2>/dev/null || echo "")
+    fi
+
+    # Step 1: uncommitted changes become a WIP commit.
+    if has_uncommitted_changes || has_untracked_files; then
+        commit_wip || return 1
+        log "  ${YELLOW}committed WIP${NC}"
+        wip_created=$((wip_created + 1))
+    fi
+
+    local_head=$(git rev-parse HEAD 2>/dev/null)
+    local_msg=$(git log -1 --format=%s 2>/dev/null || echo "")
+
+    # Step 2: pull what origin has and we lack.
+    if [[ -n "$remote_head" && "$remote_head" != "$local_head" ]] \
+        && ! git merge-base --is-ancestor "$remote_head" HEAD 2>/dev/null; then
+        if is_wip_commit "$remote_msg" && is_wip_commit "$local_msg" \
+            && [[ -n "$MACHINE" && "$(wip_machine "origin/$branch")" == "$MACHINE" ]] \
+            && git merge-base --is-ancestor "origin/$branch~1" HEAD~1 2>/dev/null; then
+            # The remote WIP is this machine's own from an earlier run, and nothing was built on
+            # it: everything in it came from this working tree, which is the newer copy. Our WIP
+            # replaces it (step 3 force-pushes behind a backup tag of it).
+            vlog "Remote WIP is this machine's earlier one; replacing it"
+        elif is_wip_commit "$remote_msg" && is_wip_commit "$local_msg"; then
+            # Both WIPs, the remote one from another machine. Integrate it, never drop it:
+            # soft-reset ours so the rebase reconciles content instead of stacking two WIPs,
+            # and refuse when it does not apply.
+            if unwrap_wip; then
+                made_wip=false
+                vlog "Unwrapped local WIP to integrate remote WIP"
+            fi
+            if ! try_rebase "$branch"; then
+                log "  ${RED}WIP-vs-WIP rebase conflicted; refusing to drop remote WIP.${NC}"
+                log "  ${YELLOW}Resolve manually, then re-run codesync.${NC}"
+                return 1
+            fi
+            # Whatever of ours remains goes on top as a fresh WIP, so steps 3 and 4 run as usual.
+            if has_uncommitted_changes || has_untracked_files; then
+                commit_wip || return 1
+            fi
+            log "  ${GREEN}integrated remote WIP${NC}"
+        elif is_wip_commit "$remote_msg"; then
+            # Remote is WIP, we have real commits.
+            local_tree=$(git rev-parse "HEAD^{tree}" 2>/dev/null || echo "")
+            remote_tree=$(git rev-parse "origin/$branch^{tree}" 2>/dev/null || echo "")
+            # Equal trees are not enough: remote history we lack would be dropped.
+            remote_only_count=$(git rev-list --count "origin/$branch" "^HEAD" 2>/dev/null || echo "0")
+            if [[ -n "$local_tree" && -n "$remote_tree" && "$local_tree" == "$remote_tree" \
+                  && "$remote_only_count" -eq 0 ]]; then
+                vlog "Real commit has same content as remote WIP, will replace"
+            elif ! try_rebase "$branch"; then
+                give_back
+                return 1
+            elif is_wip_commit "$(git log -1 --format=%s 2>/dev/null)"; then
+                # The pulled WIP is now our HEAD: it becomes a real commit here.
+                if git commit --amend --quiet -m "$FINAL_SUBJECT" 2>/dev/null; then
+                    log "  ${GREEN}integrated and finalized WIP${NC}"
+                else
+                    log "  ${YELLOW}rebased but failed to rename WIP commit${NC}"
+                fi
+            else
+                log "  ${GREEN}rebased on remote${NC}"
+            fi
+        elif ! try_rebase "$branch"; then
+            # Remote has real commits: our WIP or commits go on top, or nothing changes.
+            give_back
+            return 1
+        else
+            log "  ${GREEN}rebased on remote${NC}"
+        fi
+    fi
+
+    # Step 3: push.
+    local_msg=$(git log -1 --format=%s 2>/dev/null || echo "")
+    if is_wip_commit "$local_msg"; then
+        if safe_force_push "$branch" "$remote_head" "$remote_msg"; then
+            log "  ${GREEN}pushed${NC}"
+        else
+            give_back
+            return 1
+        fi
+    else
+        push_err=""
+        if push_err=$(git push --quiet origin "$branch" 2>&1); then
+            log "  ${GREEN}pushed${NC}"
+        elif safe_force_push "$branch" "$remote_head" "$remote_msg"; then
+            # After a rebase over a remote WIP, our history replaces it.
+            log "  ${GREEN}pushed (force)${NC}"
+        else
+            log "  ${RED}push failed${NC}"
+            [[ -z "$push_err" ]] || printf '%s\n' "$push_err" >&2
+            give_back
+            return 1
+        fi
+    fi
+
+    # Step 4: our own WIP goes back to uncommitted changes: this run's, or one an earlier run
+    # left committed (cut off at a timeout, say). Another machine's WIP is not ours to unwrap.
+    if { $made_wip || [[ -n "$MACHINE" && "$(wip_machine HEAD)" == "$MACHINE" ]]; } && unwrap_wip; then
+        log "  ${YELLOW}unwrapped to uncommitted${NC}"
+        wip_unwrapped=$((wip_unwrapped + 1))
+    fi
+    made_wip=false
+
+    prune_codesync_tags
+    return 0
+}
+
+# ── the repositories ─────────────────────────────────────────────────────
+# Candidate directories, one per line: CODE_DIR/*, CODE_DIR/<nested>/* and the extra dirs.
+repo_dirs() {
+    local d n seen="|" list=() parts=()
+    for d in "$CODE_DIR"/*/; do list+=("$d"); done
+    if [[ -n "$CODESYNC_NESTED_DIRS" ]]; then
+        IFS=: read -r -a parts <<<"$CODESYNC_NESTED_DIRS"
+        for n in ${parts[@]+"${parts[@]}"}; do
+            [[ -n "$n" ]] || continue
+            n="$(codesync_expand "$n")"
+            [[ "$n" == /* ]] || n="$CODE_DIR/$n"
+            for d in "$n"/*/; do list+=("$d"); done
+        done
+    fi
+    if [[ -n "$CODESYNC_EXTRA_DIRS" ]]; then
+        IFS=: read -r -a parts <<<"$CODESYNC_EXTRA_DIRS"
+        for n in ${parts[@]+"${parts[@]}"}; do
+            [[ -n "$n" ]] || continue
+            list+=("$(codesync_expand "$n")")
+        done
+    fi
+    for d in ${list[@]+"${list[@]}"}; do
+        [[ -d "$d" ]] || continue
+        d="${d%/}"
+        [[ "$seen" != *"|$d|"* ]] || continue
+        seen="$seen$d|"
+        printf '%s\n' "$d"
+    done
+}
+
+display_name() {
+    case "$1" in
+        "$CODE_DIR"/*) printf '%s' "${1#"$CODE_DIR"/}" ;;
+        "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+sync_all_repos() {
+    local dir name remote branch repo_start_ms
+    while IFS= read -r dir; do
+        name="$(display_name "$dir")"
+        if [[ ! -d "$dir/.git" ]]; then
+            vlog "$name: not a git repo, skipping"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        cd "$dir"
+        remote=$(git remote get-url origin 2>/dev/null || echo "")
+        if [[ -z "$remote" ]] || ! [[ "$remote" =~ $CODESYNC_REMOTE_MATCH ]]; then
+            vlog "$name: origin does not match CODESYNC_REMOTE_MATCH (${remote:-none}), skipping"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        branch=$(current_branch || true)
+        if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+            vlog "$name: detached HEAD, skipping"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        log "${BLUE}$name${NC} ($branch)"
+        repo_start_ms="$(ts_ms)"
+        if $DRY_RUN; then
+            if has_uncommitted_changes || has_untracked_files; then
+                log "  would commit WIP and push"
+            else
+                log "  would pull and push"
+            fi
+            synced=$((synced + 1))
+            continue
+        fi
+        if sync_repo "$branch" </dev/null; then
+            log "  ${GREEN}synced${NC} ($(fmt_dur "$(( $(ts_ms) - repo_start_ms ))"))"
+            synced=$((synced + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done < <(repo_dirs)
+}
+
+# ── peers ────────────────────────────────────────────────────────────────
+# codesync_read_peers FILE SOURCE: alias<TAB>identity<TAB>source for each valid line.
+codesync_read_peers() {
+    local file="$1" source="$2" line alias identity rest
+    [[ -f "$file" ]] || return 0
+    if ! codesync_private_file "$file"; then
+        warn "ignoring $file: it must be yours and writable only by you"
+        return 0
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        alias="" identity="" rest=""
+        read -r alias identity rest <<<"$line" || true
+        [[ -n "$alias" ]] || continue
+        if ! codesync_valid_host "$alias"; then
+            warn "$file: skipping an invalid peer name: $alias"
+            continue
+        fi
+        [[ "$identity" != - ]] || identity=""
+        if [[ -n "$identity" ]] && ! codesync_valid_identity "$identity"; then
+            warn "$file: skipping $alias: invalid identity $identity"
+            continue
+        fi
+        printf '%s\t%s\t%s\n' "$alias" "${identity:--}" "$source"
+    done < "$file"
+}
+
+# The peers to contact, deduplicated case-insensitively, first source first: the --host names,
+# else CODESYNC_PEERS_FILE, else ~/.config/codesync/peers, else dotsync's peer lists.
+codesync_peers() {
+    local identity="$1" cfg="${XDG_CONFIG_HOME:-$HOME/.config}" seen="|" alias rest key h
+    {
+        if [[ ${#HOSTS[@]} -gt 0 ]]; then
+            for h in "${HOSTS[@]}"; do printf '%s\t-\t--host\n' "$h"; done
+        elif [[ -n "$CODESYNC_PEERS_FILE" ]]; then
+            codesync_read_peers "$(codesync_expand "$CODESYNC_PEERS_FILE")" CODESYNC_PEERS_FILE
+        elif [[ -f "$cfg/codesync/peers" ]]; then
+            codesync_read_peers "$cfg/codesync/peers" "$(display_name "$cfg/codesync/peers")"
+        else
+            h="${DOTSYNC_PEERS_FILE:-$cfg/dotsync/peers}"
+            codesync_read_peers "$h" "$(display_name "$h")"
+            if [[ -n "$identity" ]]; then
+                h="${DOTFILES_DIR:-$HOME/.dotfiles}/identities/$identity/dotsync-peers"
+                codesync_read_peers "$h" "identities/$identity/dotsync-peers"
+            fi
+        fi
+    } | while IFS=$'\t' read -r alias rest; do
+        key="$(codesync_lower "$alias")"
+        [[ "$seen" != *"|$key|"* ]] || continue
+        seen="$seen$key|"
+        printf '%s\t%s\n' "$alias" "$rest"
+    done
+}
+
+# The POSIX sh a peer runs, on its standard input. It refuses (77) unless the peer's own
+# profile names IDENTITY, steps aside (78) when the peer is the machine the sync started on,
+# then runs COMMAND --local from the peer's PATH, with ~/.local/bin added.
+codesync_peer_script() {  # IDENTITY MACHINE COMMAND
+    cat <<EOF
+profile="\$HOME/.df-profile"
+identity=\$(awk -v key=DF_IDENTITY '$CODESYNC_PROFILE_AWK' "\$profile" 2>/dev/null)
+if [ "\$identity" != '$1' ]; then
+    printf 'codesync: refusing a sync from identity %s: this machine runs %s\n' '$1' "\${identity:-no known identity}" >&2
+    exit 77
+fi
+machine=\$(awk -v key=DF_MACHINE '$CODESYNC_PROFILE_AWK' "\$profile" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+if [ -n "\$machine" ] && [ "\$machine" = '$2' ]; then
+    printf 'codesync: %s is the machine this sync started on\n' "\$machine" >&2
+    exit 78
+fi
+PATH="\$PATH:\$HOME/.local/bin"
+export PATH
+if ! command -v $3 >/dev/null 2>&1; then
+    printf 'codesync: %s is not on PATH here\n' '$3' >&2
+    exit 127
+fi
+exec $3 --local
+EOF
+}
+
+codesync_same_machine() {  # ALIAS: is it this machine's own name?
+    local a
+    a="$(codesync_lower "$1")"
+    [[ -n "$MACHINE" && ( "$a" == "$MACHINE" || "${a%%.*}" == "$MACHINE" ) ]]
+}
+
+# codesync_sync_peer ALIAS LISTED_IDENTITY SOURCE IDENTITY: one peer; counts problems.
+codesync_sync_peer() {
+    local host="$1" listed="$2" source="$3" identity="$4" named=false script out rc=0 secs
+    [[ "$source" != --host ]] || named=true
+    if codesync_same_machine "$host"; then
+        log "  $host: skipped (this machine)"
+        return 0
+    fi
+    if [[ "$listed" != - && "$listed" != "$identity" ]]; then
+        log "  $host: skipped (listed as identity $listed, this machine runs $identity)"
+        return 0
+    fi
+    if $DRY_RUN; then
+        log "  would sync $host"
+        return 0
+    fi
+    secs="$CODESYNC_PEER_TIMEOUT"
+    script="$(codesync_peer_script "$identity" "$MACHINE" "$CODESYNC_REMOTE_CMD")"
+    log "  $host: syncing..."
+    out="$(codesync_timeout "$secs" ssh -o ConnectTimeout="$CODESYNC_SSH_TIMEOUT" -o BatchMode=yes \
+        "$host" sh -s <<<"$script" 2>&1)" || rc=$?
+    if $VERBOSE || [[ "$rc" -ne 0 ]]; then
+        [[ -z "$out" ]] || printf '%s\n' "$out" | sed "s/^/    $host| /"
+    else
+        printf '%s\n' "$out" | grep -E 'Done:' | sed "s/^/    $host| /" || true
+    fi
+    case "$rc" in
+        0)   log "  $host: ${GREEN}synced${NC}"; peers_synced=$((peers_synced + 1)) ;;
+        77)  log "  $host: ${YELLOW}refused: it runs another identity; nothing there was touched${NC}"
+             if $named; then peer_problems=$((peer_problems + 1)); fi ;;
+        78)  log "  $host: skipped (it is this machine)" ;;
+        124) log "  $host: ${RED}timed out after ${secs}s; cut off${NC}"; peer_problems=$((peer_problems + 1)) ;;
+        127) log "  $host: ${RED}$CODESYNC_REMOTE_CMD is not installed there${NC}"; peer_problems=$((peer_problems + 1)) ;;
+        255) log "  $host: ${YELLOW}unreachable${NC}"
+             if $named; then peer_problems=$((peer_problems + 1)); fi ;;
+        *)   log "  $host: ${RED}sync incomplete (codesync exited $rc there)${NC}"; peer_problems=$((peer_problems + 1)) ;;
+    esac
+}
+
+sync_peers() {
+    local identity entries alias listed source
+    identity="$(codesync_sender_identity)"
+    echo ""
+    if [[ -z "$identity" ]]; then
+        log "Skipping the other machines: this machine's identity is unknown (no DF_IDENTITY in ~/.df-profile)"
+        if [[ ${#HOSTS[@]} -gt 0 ]]; then peer_problems=$((peer_problems + 1)); fi
+        return 0
+    fi
+    entries="$(codesync_peers "$identity")"
+    if [[ -z "$entries" ]]; then
+        log "No other machines listed (see codesync --help: Peers)"
+        return 0
+    fi
+    log "Syncing the other machines (identity $identity)..."
+    while IFS=$'\t' read -r alias listed source; do
+        [[ -n "$alias" ]] || continue
+        codesync_sync_peer "$alias" "$listed" "$source" "$identity" </dev/null
+    done <<<"$entries"
+}
+
+list_peers() {
+    local identity entries alias listed source note
+    identity="$(codesync_sender_identity)"
+    printf 'identity: %s\nmachine:  %s\n' "${identity:-unknown (no fan-out)}" "${MACHINE:-unknown}"
+    entries="$(codesync_peers "$identity")"
+    if [[ -z "$entries" ]]; then
+        echo "peers:    none"
+        return 0
+    fi
+    echo "peers:"
+    while IFS=$'\t' read -r alias listed source; do
+        note=""
+        if codesync_same_machine "$alias"; then note=" (this machine: skipped)"
+        elif [[ "$listed" != - && "$listed" != "$identity" ]]; then note=" (identity $listed: skipped)"
+        fi
+        printf '  %-20s %-12s %s%s\n' "$alias" "$listed" "$source" "$note"
+    done <<<"$entries"
+}
+
+# ── main ─────────────────────────────────────────────────────────────────
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n) DRY_RUN=true ;;
+            --verbose|-v) VERBOSE=true ;;
+            --local|-l) LOCAL_ONLY=true ;;
+            --peers) LIST_PEERS=true ;;
+            --host) [[ $# -ge 2 ]] || die "--host needs an ssh alias"; HOSTS+=("$2"); shift ;;
+            --host=*) HOSTS+=("${1#--host=}") ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "unknown option: $1 (see --help)" ;;
+        esac
+        shift
+    done
+    if $LOCAL_ONLY && [[ ${#HOSTS[@]} -gt 0 ]]; then die "--local and --host do not go together"; fi
+    local h
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
+        codesync_valid_host "$h" || die "not an ssh alias: $h"
+    done
+
+    codesync_load_config "$(codesync_expand "${CODESYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/codesync/config}")"
+    CODE_DIR="$(codesync_expand "${CODE_DIR:-$HOME/code}")"
+    CODE_DIR="${CODE_DIR%/}"
+    CODESYNC_EXTRA_DIRS="${CODESYNC_EXTRA_DIRS:-}"
+    CODESYNC_NESTED_DIRS="${CODESYNC_NESTED_DIRS:-}"
+    CODESYNC_REMOTE_MATCH="${CODESYNC_REMOTE_MATCH:-github\.com}"
+    CODESYNC_PEERS_FILE="${CODESYNC_PEERS_FILE:-}"
+    CODESYNC_PEER_TIMEOUT="${CODESYNC_PEER_TIMEOUT:-300}"
+    CODESYNC_SSH_TIMEOUT="${CODESYNC_SSH_TIMEOUT:-5}"
+    CODESYNC_REMOTE_CMD="${CODESYNC_REMOTE_CMD:-codesync}"
+    CODESYNC_DOTSYNC="${CODESYNC_DOTSYNC:-auto}"
+    [[ "$CODESYNC_PEER_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "CODESYNC_PEER_TIMEOUT must be whole seconds"
+    [[ "$CODESYNC_SSH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "CODESYNC_SSH_TIMEOUT must be whole seconds"
+    [[ "$CODESYNC_REMOTE_CMD" =~ ^(~/)?[A-Za-z0-9._/-]+$ ]] \
+        || die "CODESYNC_REMOTE_CMD must be a command name or path, no spaces or quotes"
+    MACHINE="$(codesync_machine)"
+
+    if $LIST_PEERS; then
+        list_peers
+        exit 0
+    fi
+
+    local run_start_ms dotsync
+    run_start_ms="$(ts_ms)"
+    sync_all_repos
+    cd "$HOME"
+
+    echo ""
+    log "Done: ${GREEN}$synced synced${NC}, $skipped skipped, ${RED}$failed failed${NC} ($(fmt_dur "$(( $(ts_ms) - run_start_ms ))"))"
+    if [[ $wip_created -gt 0 ]]; then log "      ${YELLOW}$wip_created WIP commits created${NC}"; fi
+    if [[ $wip_unwrapped -gt 0 ]]; then log "      ${YELLOW}$wip_unwrapped WIP commits unwrapped${NC}"; fi
+
+    if ! $LOCAL_ONLY; then
+        sync_peers
+    fi
+
+    # The dotfiles last, this machine only: each peer's own run did its own.
+    dotsync="$HOME/.local/bin/dotsync"
+    if [[ "$CODESYNC_DOTSYNC" != 0 && -x "$dotsync" ]]; then
+        echo ""
+        if $DRY_RUN; then
+            log "would run dotsync --local"
+        elif "$dotsync" --local; then
+            log "${GREEN}dotfiles synced${NC}"
+        else
+            log "${RED}dotsync failed${NC}"
+            failed=$((failed + 1))
+        fi
+    fi
+
+    if [[ $failed -gt 0 || $peer_problems -gt 0 ]]; then exit 1; fi
+    exit 0
+}
+
+# Sourced (the tests do), it only defines the functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
