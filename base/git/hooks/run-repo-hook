@@ -31,7 +31,11 @@ case "$name" in
     pre-push|post-checkout|post-commit|post-merge) ;;
     *) exit 0 ;;
 esac
+# Git LFS's object store (.git/lfs) says the repo has used LFS, whichever branch is checked out
+# and even when the current tree has dropped its .gitattributes: a push from such a checkout
+# can still carry LFS objects. The attributes cover a repo where git-lfs never ran.
 uses_lfs() {
+    [[ -d "$common/lfs" ]] && return 0
     grep -qs 'filter=lfs' "$common/info/attributes" && return 0
     git grep -q -F 'filter=lfs' -- .gitattributes ':(glob)**/.gitattributes' 2>/dev/null
 }

@@ -92,6 +92,13 @@ out="$(PATH="$tmp/nolfs" git -C "$r" push origin other 2>&1)"; rc=$?
 equal "without git-lfs the push is blocked, as Git LFS's own hook does" 2 "$([[ $rc -ne 0 ]] && echo 2 || echo "$rc")"
 check "...saying why" "configured for Git LFS but 'git-lfs' was not found" "$out"
 
+echo "a repo whose LFS history is not in the checked-out tree"
+r="$(newrepo lfs-history)"
+mkdir -p "$r/.git/lfs/objects"   # Git LFS's store: objects were committed on some branch
+rm -f "$tmp/lfs.log"
+PATH="$tmp/lfsbin:$PATH" git -C "$r" push -q origin master 2>/dev/null
+check "the push still runs git lfs pre-push" "git-lfs pre-push origin $tmp/lfs-history.git" "$(cat "$tmp/lfs.log" 2>&1)"
+
 echo "a repo without LFS"
 r="$(newrepo plain)"
 rm -f "$tmp/lfs.log"
