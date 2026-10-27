@@ -373,17 +373,20 @@ EOF
         if [[ "$dest" == "repo" ]]; then
             file="$repo_root/.gitignore"
         else
-            file="$repo_root/.git/info/exclude"
+            # Ask git: in a linked worktree or a submodule .git is a file, and the
+            # exclude file lives in the (shared) git dir.
+            file=$(git rev-parse --git-path info/exclude 2>/dev/null) || {
+                echo "ignore: cannot find this repo's info/exclude" >&2
+                return 1
+            }
+            file="${file:A}"
         fi
     else
         # Global: prefer git's configured excludesFile, else XDG default.
-        # git stores the value as the user typed it — `~/.gitignore`,
-        # `~user/...`, or `$HOME/...` may all be present literally.
-        file=$(git config --global --get core.excludesFile 2>/dev/null)
-        if [[ -n "$file" ]]; then
-            # zsh: ~ expansion via (e) flag handles ~/, ~user/, $HOME/.
-            file=${(e)file}
-        else
+        # --path makes git expand a `~/` or `~user/` the way it does when it
+        # reads the file (nothing else is expanded, as in git itself).
+        file=$(git config --global --path --get core.excludesFile 2>/dev/null)
+        if [[ -z "$file" ]]; then
             # XDG default. macOS doesn't set XDG_CONFIG_HOME; fall back to ~/.config.
             file="${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore"
         fi
@@ -447,23 +450,24 @@ EOF
 
     # ── Auto-untrack tracked files matching new patterns ─────────────
     # Scoped to repo/local dests — see header comment for rationale.
-    # Builds the pathspec by stripping the leading gitignore anchor and
-    # dedupes via zsh's unique-array type so overlapping patterns don't
-    # cause `git rm` to error on a duplicate path.
+    # git matches each new rule against the index with gitignore semantics
+    # (a pathspec would not: `/*.json` would also take src/x.json, and a bare
+    # `notes.md` would miss sub/notes.md). zsh's unique-array type dedupes, so
+    # overlapping patterns don't make `git rm` fail on a duplicate path.
     if (( added > 0 )) && [[ "$dest" != "global" ]]; then
         local -aU to_untrack=()
-        local pat ps f
+        local pat f
         for pat in "${added_patterns[@]}"; do
-            ps="${pat#/}"  # gitignore pattern → git pathspec (drop leading /)
             while IFS= read -r -d '' f; do
                 to_untrack+=("$f")
-            done < <(git -C "$repo_root" ls-files -z -- "$ps" 2>/dev/null)
+            done < <(git -C "$repo_root" ls-files -z --cached --ignored --exclude="$pat" 2>/dev/null)
         done
         if (( ${#to_untrack[@]} > 0 )); then
             if [[ -n "$keep_tracked" ]]; then
                 printf '  ! %d tracked file(s) match (keeping tracked per --keep-tracked)\n' ${#to_untrack[@]}
             else
-                (cd "$repo_root" && git rm --cached --quiet -- "${to_untrack[@]}") || {
+                # --literal-pathspecs: a file named like a glob is that file only.
+                (cd "$repo_root" && git --literal-pathspecs rm --cached --quiet -- "${to_untrack[@]}") || {
                     echo "ignore: git rm --cached failed (pattern added, files still tracked)" >&2
                     return 1
                 }
@@ -616,7 +620,7 @@ _claude_effort_arg() {
                 | (if $env | has("ANTHROPIC_MODEL") then .e = ($env.ANTHROPIC_MODEL // "" | tostring) else . end)
                 | (if ($l.model | type) == "string" and $l.model != "" then .m = $l.model else . end))
             | if .e != "" then .e else .m end
-            ' "${files[@]}" 2>/dev/null)"
+            ' "${files[@]}" </dev/null 2>/dev/null)"  # no files: `inputs` would read the terminal
     fi
     local max_models=${CLAUDE_MAX_EFFORT_MODELS:-'opus|opus\[1m\]|*opus-5-5*'}
     [[ -n "$model" && "$model" == ${~max_models} ]] && print -r -- --effort=max
@@ -648,8 +652,8 @@ yuma() {
 # Claude dangerous + continue
 yuc() {
     local effort
-    effort="$(_claude_effort_arg "" "$*")"
-    claude --dangerously-skip-permissions ${effort:+"$effort"} --continue "$*"
+    effort="$(_claude_effort_arg "" "$@")"
+    claude --dangerously-skip-permissions ${effort:+"$effort"} --continue "$@"
 }
 # Claude dangerous + resume (supports last-5 of session ID)
 yur() { _claude_resume --dangerously-skip-permissions "$@"; }
@@ -732,7 +736,10 @@ _claude_resume() {
                 ((i++))
             done
             echo ""
-            read -rp "Pick [1-${#matches[@]}]: " choice
+            # printf + read, not `read -p`: in zsh -p reads from a coprocess.
+            local choice
+            printf 'Pick [1-%d]: ' "${#matches[@]}"
+            read -r choice
             if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#matches[@]} )); then
                 claude "${extra_flags[@]}" --resume "${matches[$((choice-1))]}"
             else
@@ -747,6 +754,24 @@ _claude_resume() {
 # whose terminal is gone: no TTY and over 5 minutes old. Headless `-p`/`--print`
 # runs have no TTY by design (hooks, reflections, diagnostic agents), so they
 # are never counted.
+# _claude_orphan_pids prints one "PID AGE_SECONDS" line per orphan, in one ps +
+# awk pass that works with GNU ps (etimes, "?" for no TTY) and BSD ps on macOS
+# (no etimes, so etime is parsed; "??" for no TTY). The [y] keeps awk's own
+# argv from matching the pattern.
+_claude_orphan_pids() {
+    if [[ "$OSTYPE" == darwin* ]]; then
+        ps -axo pid=,tty=,etime=,args= 2>/dev/null | awk '
+            function secs(e,  d, p, n, i, s) { d = 0
+                if (index(e, "-")) { split(e, p, "-"); d = p[1]; e = p[2] }
+                n = split(e, p, ":"); s = 0; for (i = 1; i <= n; i++) s = s * 60 + p[i]
+                return d * 86400 + s }
+            ($2 == "??" || $2 == "?") && /claude.*--dangerousl[y]/ && !/ (-p|--print)( |$)/ && secs($3) > 300 { print $1, secs($3) }'
+    else
+        ps -eo pid=,tty=,etimes=,args= 2>/dev/null | awk '
+            $2 == "?" && $3 > 300 && /claude.*--dangerousl[y]/ && !/ (-p|--print)( |$)/ { print $1, $3 }'
+    fi
+}
+
 # List orphaned Claude processes
 claude-orphans() {
     local YELLOW='\033[1;33m'
@@ -755,22 +780,15 @@ claude-orphans() {
 
     echo -e "${GREY}Checking for orphaned Claude processes...${NC}"
 
-    local found=0
-    while IFS= read -r line; do
-        local pid=$(echo "$line" | awk '{print $1}')
-        local tty=$(echo "$line" | awk '{print $2}')
-        local age_sec=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
-        local age_min=$((age_sec / 60))
-        local mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.0fMB", $1/1024}')
-
-        if [[ "$tty" == "?" && "$age_sec" -gt 300 ]]; then
-            if [[ $found -eq 0 ]]; then
-                printf "${YELLOW}%-8s %-6s %-10s %s${NC}\n" "PID" "TTY" "AGE" "MEM"
-            fi
-            printf "%-8s %-6s %-10s %s\n" "$pid" "$tty" "${age_min}m" "$mem"
-            ((found++))
+    local found=0 pid age mem
+    while read -r pid age; do
+        if [[ $found -eq 0 ]]; then
+            printf "${YELLOW}%-8s %-10s %s${NC}\n" "PID" "AGE" "MEM"
         fi
-    done < <(ps -eo pid,tty,args 2>/dev/null | grep -E "claude.*--dangerously" | grep -vE ' (-p|--print)( |$)' | grep -v grep)
+        mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.0fMB", $1/1024}')
+        printf "%-8s %-10s %s\n" "$pid" "$((age / 60))m" "$mem"
+        ((found++))
+    done < <(_claude_orphan_pids)
 
     if [[ $found -eq 0 ]]; then
         echo "No orphaned Claude processes found."
@@ -780,7 +798,8 @@ claude-orphans() {
     fi
 }
 
-# Kill only orphaned Claude processes
+# Kill only orphaned Claude processes. The force-kill pass covers only the PIDs
+# that were sent TERM, never a session that was not an orphan a second ago.
 claude-kill-orphans() {
     local RED='\033[0;31m'
     local GREEN='\033[0;32m'
@@ -789,30 +808,24 @@ claude-kill-orphans() {
 
     echo -e "${YELLOW}Killing orphaned Claude processes only...${NC}"
 
-    local killed=0
-    while IFS= read -r line; do
-        local pid=$(echo "$line" | awk '{print $1}')
-        local tty=$(echo "$line" | awk '{print $2}')
-        local age_sec=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
-
-        if [[ "$tty" == "?" && "$age_sec" -gt 300 ]]; then
-            pkill -TERM -P "$pid" 2>/dev/null
-            kill -TERM "$pid" 2>/dev/null
-            echo -e "  ${RED}Killed${NC} PID $pid"
-            ((killed++))
-        fi
-    done < <(ps -eo pid,tty,args 2>/dev/null | grep -E "claude.*--dangerously" | grep -vE ' (-p|--print)( |$)' | grep -v grep)
+    local killed=0 pid age
+    local -a pids=()
+    while read -r pid age; do
+        pkill -TERM -P "$pid" 2>/dev/null
+        kill -TERM "$pid" 2>/dev/null
+        echo -e "  ${RED}Killed${NC} PID $pid"
+        pids+=("$pid")
+        ((killed++))
+    done < <(_claude_orphan_pids)
 
     if [[ $killed -gt 0 ]]; then
         sleep 1
-        while IFS= read -r line; do
-            local pid=$(echo "$line" | awk '{print $1}')
-            local tty=$(echo "$line" | awk '{print $2}')
-            if [[ "$tty" == "?" ]] && kill -0 "$pid" 2>/dev/null; then
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
                 kill -9 "$pid" 2>/dev/null
                 echo -e "  ${RED}Force killed${NC} PID $pid"
             fi
-        done < <(ps -eo pid,tty,args 2>/dev/null | grep -E "claude.*--dangerously" | grep -vE ' (-p|--print)( |$)' | grep -v grep)
+        done
     fi
 
     if [[ $killed -eq 0 ]]; then
@@ -901,25 +914,10 @@ claude-kill() {
 alias ck='claude-kill'
 
 # Warn on login if orphaned Claude processes exist (called from zshrc).
-# One ps + awk pass (the old per-PID ps/awk forks cost ~250 ms per login, and on
-# macOS never matched: BSD ps has no etimes and shows daemons' tty as "??").
-# The [y] keeps awk's own argv from matching the pattern; headless -p/--print
-# runs are skipped as in claude-orphans.
+# One ps + awk pass (the old per-PID ps/awk forks cost ~250 ms per login).
 _claude_orphan_warning() {
     local found
-    if [[ "$OSTYPE" == darwin* ]]; then
-        found=$(ps -axo pid=,tty=,etime=,args= 2>/dev/null | awk '
-            function secs(e,  d, p, n, i, s) { d = 0
-                if (index(e, "-")) { split(e, p, "-"); d = p[1]; e = p[2] }
-                n = split(e, p, ":"); s = 0; for (i = 1; i <= n; i++) s = s * 60 + p[i]
-                return d * 86400 + s }
-            ($2 == "??" || $2 == "?") && /claude.*--dangerousl[y]/ && !/ (-p|--print)( |$)/ && secs($3) > 300 { c++; ids = ids " " $1 }
-            END { if (c) print c ids }')
-    else
-        found=$(ps -eo pid=,tty=,etimes=,args= 2>/dev/null | awk '
-            $2 == "?" && $3 > 300 && /claude.*--dangerousl[y]/ && !/ (-p|--print)( |$)/ { c++; ids = ids " " $1 }
-            END { if (c) print c ids }')
-    fi
+    found=$(_claude_orphan_pids | awk '{ c++; ids = ids " " $1 } END { if (c) print c ids }')
     [[ -z "$found" ]] && return 0
     printf '\033[1;33m⚠ %s orphaned Claude process(es) detected (PIDs: %s)\033[0m\n' "${found%% *}" "${found#* }"
     printf '\033[1;33m  Run %s to inspect or %s to terminate\033[0m\n' "'claude-orphans'" "'claude-kill-orphans' (cko)"
