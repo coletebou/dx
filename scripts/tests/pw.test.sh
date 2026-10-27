@@ -269,6 +269,22 @@ equal "A's teardown leaves B's worktree: the launch order, not the logs' mtimes"
 out="$(in_repo "$pw" teardown "$tmp/fourteen.tsv" 2>&1)"
 equal "B's own teardown still removes it" "gone" "$(gone "$tmp/ext/proj-lambda")"
 
+echo "...after A's log came from a pw that recorded no launch time"
+manifest fifteen mu                                         # A: feat/mu at proj-mu
+cp "$tmp/fifteen.tsv" "$tmp/sixteen.tsv"                    # B: the same tag and branch
+out="$(in_repo "$pw" launch "$tmp/fifteen.tsv" --no-bootstrap 2>&1)"
+equal "A launches" 0 "$?"
+logA="$(cat "$tmp/fifteen.tsv.log-path")"
+grep -v '^# launched_epoch=' "$logA" > "$logA.old" && mv "$logA.old" "$logA"
+out="$(in_repo "$pw" teardown "$tmp/fifteen.tsv" 2>&1)"
+out="$(in_repo "$pw" launch "$tmp/sixteen.tsv" --no-bootstrap 2>&1)"
+: > "$tmp/ext/proj-mu/uncommitted.txt"
+out="$(in_repo "$pw" teardown "$tmp/fifteen.tsv" 2>&1)"
+equal "A's teardown leaves B's worktree: B's log has a launch time, A's predates it" "present" \
+  "$(gone "$tmp/ext/proj-mu/uncommitted.txt")"
+out="$(in_repo "$pw" teardown "$tmp/sixteen.tsv" 2>&1)"
+equal "B's own teardown removes it: A's older log does not hold the path" "gone" "$(gone "$tmp/ext/proj-mu")"
+
 echo "launch types each agent's lines into its own window, quoted"
 # base-index 1 (a common setting): a numeric tag read as a window index would be the log.
 tmux new-session -d -s keeper

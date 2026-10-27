@@ -714,8 +714,8 @@ launch_epoch() {
 }
 # newer_elsewhere PATH OWN FOREIGN: 0 when a FOREIGN record of PATH (lines "path<TAB>log") is
 # not from an earlier launch than every OWN record of it, or when OWN has none: the fleet that
-# launched there last has it now. A tie, or a log with no launch time, counts as later: the
-# path is left, never taken.
+# launched there last has it now. A log with no launch time predates one with it; a tie, or
+# two logs without one, counts as later: the path is left, never taken.
 newer_elsewhere() {
     local p="$1" own="$2" foreign="$3" fp fl op ol fe oe later
     while IFS=$'\t' read -r fp fl; do
@@ -724,7 +724,8 @@ newer_elsewhere() {
         while IFS=$'\t' read -r op ol; do
             [ "$op" = "$p" ] || continue
             oe="$(launch_epoch "$ol")"
-            if [ -n "$fe" ] && [ -n "$oe" ] && [ "$fe" -lt "$oe" ]; then later=0; break; fi
+            [ -n "$oe" ] || continue
+            if [ -z "$fe" ] || [ "$fe" -lt "$oe" ]; then later=0; break; fi
         done <<< "$own"
         [ "$later" = 1 ] && return 0
     done <<< "$foreign"
