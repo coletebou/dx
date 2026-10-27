@@ -239,7 +239,7 @@ out="$(in_repo "$pw" launch "$tmp/eleven.tsv" --no-bootstrap 2>&1)"
 equal "A launches" 0 "$?"
 out="$(in_repo "$pw" teardown "$tmp/eleven.tsv" 2>&1)"
 equal "...and is torn down" "gone" "$(gone "$tmp/ext/proj-kappa")"
-sleep 1   # B's launch log must be newer than A's on a filesystem with 1 s timestamps
+sleep 1   # B launches a later second than A
 out="$(in_repo "$pw" launch "$tmp/twelve.tsv" --no-bootstrap 2>&1)"
 equal "B launches into the same path" "present" "$(gone "$tmp/ext/proj-kappa")"
 : > "$tmp/ext/proj-kappa/uncommitted.txt"
@@ -249,6 +249,24 @@ equal "A's teardown again (its old log still records the path) leaves B's worktr
 check "...saying why" "Leaving $tmp/ext/proj-kappa" "$out"
 out="$(in_repo "$pw" teardown "$tmp/twelve.tsv" 2>&1)"
 equal "B's own teardown still removes it" "gone" "$(gone "$tmp/ext/proj-kappa")"
+
+echo "...on the same branch, while A's agents still write to A's log"
+manifest thirteen lambda                                    # A: feat/lambda at proj-lambda
+cp "$tmp/thirteen.tsv" "$tmp/fourteen.tsv"                  # B: the same tag and branch
+out="$(in_repo "$pw" launch "$tmp/thirteen.tsv" --no-bootstrap 2>&1)"
+equal "A launches" 0 "$?"
+logA="$(cat "$tmp/thirteen.tsv.log-path")"
+out="$(in_repo "$pw" teardown "$tmp/thirteen.tsv" 2>&1)"
+sleep 1   # B's launch is a later second than A's
+out="$(in_repo "$pw" launch "$tmp/fourteen.tsv" --no-bootstrap 2>&1)"
+equal "B launches into the same path" "present" "$(gone "$tmp/ext/proj-lambda")"
+: > "$tmp/ext/proj-lambda/uncommitted.txt"
+printf '[lambda] a line an agent appends\n' >> "$logA"   # A's log is now the newest file
+out="$(in_repo "$pw" teardown "$tmp/thirteen.tsv" 2>&1)"
+equal "A's teardown leaves B's worktree: the launch order, not the logs' mtimes" "present" \
+  "$(gone "$tmp/ext/proj-lambda/uncommitted.txt")"
+out="$(in_repo "$pw" teardown "$tmp/fourteen.tsv" 2>&1)"
+equal "B's own teardown still removes it" "gone" "$(gone "$tmp/ext/proj-lambda")"
 
 echo "launch types each agent's lines into its own window, quoted"
 # base-index 1 (a common setting): a numeric tag read as a window index would be the log.

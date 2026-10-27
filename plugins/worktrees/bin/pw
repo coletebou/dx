@@ -470,6 +470,7 @@ cmd_launch() {
     echo "# manifest=$manifest" >> "$log_file"
     echo "# session=$session" >> "$log_file"
     echo "# started_at=$(date -Iseconds)" >> "$log_file"
+    echo "# launched_epoch=$(date +%s)" >> "$log_file"
     echo "# test_mode=$test_mode" >> "$log_file"
     echo "# tasks=${#TAGS[@]}" >> "$log_file"
     echo "" >> "$log_file"
@@ -706,18 +707,24 @@ manifest_logs() {
 
 # log_worktrees LOG: "<tag>\t<worktree>" for each agent of the launch header (read up to the
 # blank line that ends it: agents append to the log after it).
+# launch_epoch LOG: the second its launch header records, or nothing (a log from before pw
+# wrote it). Agents append to a log for as long as they run, so its mtime is not its launch.
+launch_epoch() {
+    awk '!NF { exit } sub(/^# launched_epoch=/, "") { if ($0 ~ /^[0-9]+$/) print; exit }' "$1"
+}
 # newer_elsewhere PATH OWN FOREIGN: 0 when a FOREIGN record of PATH (lines "path<TAB>log") is
-# from a launch log newer than every OWN record of it, or when OWN has none: the fleet that
-# launched there last has it now. Launch logs keep their launch-time mtime (teardown only
-# removes the sidecar), and -nt compares them on any bash.
+# not from an earlier launch than every OWN record of it, or when OWN has none: the fleet that
+# launched there last has it now. A tie, or a log with no launch time, counts as later: the
+# path is left, never taken.
 newer_elsewhere() {
-    local p="$1" own="$2" foreign="$3" fp fl op ol later
+    local p="$1" own="$2" foreign="$3" fp fl op ol fe oe later
     while IFS=$'\t' read -r fp fl; do
         [ -n "$fp" ] && [ "$fp" = "$p" ] || continue
-        later=1
+        fe="$(launch_epoch "$fl")" later=1
         while IFS=$'\t' read -r op ol; do
             [ "$op" = "$p" ] || continue
-            [ "$fl" -nt "$ol" ] || { later=0; break; }
+            oe="$(launch_epoch "$ol")"
+            if [ -n "$fe" ] && [ -n "$oe" ] && [ "$fe" -lt "$oe" ]; then later=0; break; fi
         done <<< "$own"
         [ "$later" = 1 ] && return 0
     done <<< "$foreign"
