@@ -5,12 +5,18 @@
 #
 #   scripts/install-node-tools.sh            install from the lock (or reuse a matching install), publish
 #   scripts/install-node-tools.sh --check    verify only: exit 1 unless the published tools match the lock
+#   scripts/install-node-tools.sh --prune    the same as a plain run, then remove older installs (below)
 #
 # NODE_TOOLS_PREFIX (default ~/.npm-global) holds node-tools-installs/<lock-sha256>-node-v<x.y.z>-<platform>/,
-# node-tools-current (a link to the install in use) and bin/<command> (links into it); put its bin/ on
-# PATH. A changed lock or a different Node version gets a fresh install directory, published with an
-# atomic rename; older ones are removed once no running process may use them. Installs run `npm ci`:
+# node-tools-current (a link to the install in use), node-tools-previous (the one before it) and
+# bin/<command> (links into the current one); put its bin/ on PATH. A changed lock or a different Node
+# version gets a fresh install directory, published with an atomic rename. Installs run `npm ci`:
 # exactly the locked versions, nothing newer, with npm's usual install scripts.
+#
+# Older installs are never deleted on their own: a tool that is still running may need its files,
+# and whether one is can only be guessed. A plain run says how many there are and how much space
+# they hold. --prune keeps the current and the previous install, and deletes an older one only
+# when a best-effort look at the running processes finds nothing that may use it.
 #
 # Needs Node NODE_TOOLS_NODE_MAJOR (default 24) and npm. To change the tools, edit
 # node-tools/package.json, run `npm install --package-lock-only --ignore-scripts` in node-tools/,
@@ -22,14 +28,17 @@ SOURCE_DIR="${NODE_TOOLS_SOURCE:-$DOTFILES_DIR/node-tools}"
 PREFIX="${NODE_TOOLS_PREFIX:-$HOME/.npm-global}"
 INSTALL_ROOT="$PREFIX/node-tools-installs"
 TARGET="$PREFIX/node-tools-current"
+PREVIOUS="$PREFIX/node-tools-previous"
 BIN_DIR="$PREFIX/bin"
 NODE_MAJOR="${NODE_TOOLS_NODE_MAJOR:-24}"
 CHECK_ONLY=0
+PRUNE=0
 
-usage() { printf 'usage: %s [--check]\n' "${0##*/}" >&2; exit 2; }
+usage() { printf 'usage: %s [--check | --prune]\n' "${0##*/}" >&2; exit 2; }
 case "${1:-}" in
     "") [[ $# -eq 0 ]] || usage ;;
     --check) [[ $# -eq 1 ]] || usage; CHECK_ONLY=1 ;;
+    --prune) [[ $# -eq 1 ]] || usage; PRUNE=1 ;;
     *) usage ;;
 esac
 
@@ -261,27 +270,62 @@ process.stdout.write(all ? "*\n" : [...used].map((i) => i + "\n").join(""));
 NODE
 }
 
-# Remove installs other than the current one that no running process may still use. When the
-# processes cannot be listed, nothing is removed.
-prune_obsolete_node_tools() {
-    local candidate candidate_name in_use kept=0
-    if ! in_use=$(installs_in_use 2>/dev/null); then
-        printf 'skipping Node tool pruning: could not inspect running processes\n' >&2
+# The install directories other than the current one, one per line.
+older_installs() {
+    local candidate
+    for candidate in "$INSTALL_ROOT"/*; do
+        [[ -d "$candidate" && ! -L "$candidate" && "$candidate" != "$install_dir" ]] || continue
+        [[ "${candidate##*/}" =~ ^[0-9a-f]{64}-node-v[0-9]+\.[0-9]+\.[0-9]+-(linux|darwin)-(x64|arm64)$ ]] || continue
+        printf '%s\n' "$candidate"
+    done
+}
+
+# The install that was current before this one: node-tools-previous, else (installs from before
+# that link existed) the most recently modified older install.
+previous_install() {
+    local link newest="" candidate
+    if link=$(readlink "$PREVIOUS" 2>/dev/null) && [[ "$PREFIX/$link" != "$install_dir" && -d "$PREFIX/$link" ]]; then
+        printf '%s\n' "$PREFIX/$link"
         return 0
     fi
-    for candidate in "$INSTALL_ROOT"/*; do
-        [[ -e "$candidate" && "$candidate" != "$install_dir" ]] || continue
-        candidate_name="${candidate##*/}"
-        [[ "$candidate_name" =~ ^[0-9a-f]{64}-node-v[0-9]+\.[0-9]+\.[0-9]+-(linux|darwin)-(x64|arm64)$ ]] || continue
+    while IFS= read -r candidate; do
+        [[ -z "$newest" || "$candidate" -nt "$newest" ]] && newest="$candidate"
+    done < <(older_installs)
+    [[ -z "$newest" ]] || printf '%s\n' "$newest"
+}
+
+# --prune: delete the older installs that are neither the previous one nor possibly in use. When
+# the processes cannot be listed completely, nothing is deleted.
+prune_obsolete_node_tools() {
+    local candidate previous in_use kept=0 removed=0
+    previous=$(previous_install)
+    if ! in_use=$(installs_in_use 2>/dev/null); then
+        printf 'not pruning Node tool installs: could not list every running process\n' >&2
+        return 0
+    fi
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" && "$candidate" != "$previous" ]] || continue
         if [[ "$in_use" == "*" ]] || grep -qxF -- "$candidate" <<<"$in_use"; then
             kept=$((kept + 1))
             continue
         fi
         delete_owned_path "$candidate"
-    done
-    if (( kept > 0 )); then
-        printf 'kept %d older Node tool install(s) a running process may still use; a later run removes them\n' "$kept"
-    fi
+        removed=$((removed + 1))
+    done < <(older_installs)
+    printf 'pruned %d older Node tool install(s)' "$removed"
+    [[ -z "$previous" ]] || printf '; kept the previous one'
+    (( kept == 0 )) || printf '; kept %d a running process may still use' "$kept"
+    printf '\n'
+}
+
+# One line about the older installs left, when there are any.
+report_older_installs() {
+    local n kib
+    n=$(older_installs | grep -c . || true)
+    (( n > 0 )) || return 0
+    kib=$(older_installs | tr '\n' '\0' | xargs -0 du -sk 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+    printf '%d older Node tool install(s) (%d MB) under %s; %s --prune removes those no running process uses\n' \
+        "$n" "$(( (kib + 1023) / 1024 ))" "$INSTALL_ROOT" "${0##*/}"
 }
 
 if (( CHECK_ONLY == 1 )); then
@@ -336,6 +380,10 @@ if ! current_payload_ready >/dev/null 2>&1; then
             exit 1
         fi
     fi
+    # The install being replaced becomes the previous one, which --prune always keeps.
+    if current_link=$(readlink "$TARGET" 2>/dev/null) && [[ "$current_link" != "$install_link" ]]; then
+        atomic_symlink "$current_link" "$PREVIOUS"
+    fi
     atomic_symlink "$install_link" "$TARGET"
     trap - EXIT
 fi
@@ -348,5 +396,6 @@ installation_ready || {
     printf 'Node tool publication failed validation\n' >&2
     exit 1
 }
-prune_obsolete_node_tools
+(( PRUNE == 0 )) || prune_obsolete_node_tools
+report_older_installs
 printf 'Pinned Node tools ready under %s\n' "$TARGET"

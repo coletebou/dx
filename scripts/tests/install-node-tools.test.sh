@@ -4,7 +4,8 @@
 # the lock's packages declare, skips other platforms' optional packages but requires this one's, and
 # a second run reuses it without npm; --check verifies; a wrong Node major, a package.json that
 # disagrees with its lock, a non-symlink command in the way and a missing platform package are
-# refused without publishing anything; a changed lock gets a new install and the old one is pruned.
+# refused without publishing anything; a changed lock gets a new install, and the old one stays:
+# only --prune deletes, never the current or previous install, nor one a running tool may use.
 #
 #   bash scripts/tests/install-node-tools.test.sh
 set -uo pipefail
@@ -183,8 +184,27 @@ check "...through npm" "ci --prefix" "$(cat "$FAKE_NPM_LOG")"
 second="$(readlink "$p/node-tools-current")"
 lacks "...into a new directory" "$first" "$second"
 equal "...that the commands now run from" "@scope/beta 4.5.7" "$("$p/bin/beta" 2>&1)"
-equal "the old install is pruned" "no" "$([[ -e "$p/$first" ]] && echo yes || echo no)"
-equal "...leaving only the current one" "1" "$(cd "$p/node-tools-installs" && ls -A | wc -l | tr -d ' ')"
+equal "...recording the one it replaced as the previous install" "$first" "$(readlink "$p/node-tools-previous")"
+equal "the old install is kept: nothing is deleted without --prune" "yes" "$([[ -e "$p/$first" ]] && echo yes || echo no)"
+check "...and the run counts it, with the space it holds" "1 older Node tool install(s) (" "$out"
+check "...and says how to remove it" "install-node-tools.sh --prune removes those no running process uses" "$out"
+
+echo "--prune"
+run "$tmp/src" "$p" --prune
+equal "--prune succeeds" 0 "$rc"
+equal "...and keeps the previous install" "yes" "$([[ -e "$p/$first" ]] && echo yes || echo no)"
+check "...saying so" "pruned 0 older Node tool install(s); kept the previous one" "$out"
+write_source "$tmp/src" 4.5.8
+run "$tmp/src" "$p"
+third="$(readlink "$p/node-tools-current")"
+equal "a plain run after another lock change still deletes nothing" "yes" "$([[ -e "$p/$first" ]] && echo yes || echo no)"
+check "...counting both older installs" "2 older Node tool install(s) (" "$out"
+run "$tmp/src" "$p" --prune
+equal "--prune deletes an install older than the previous one" "no" "$([[ -e "$p/$first" ]] && echo yes || echo no)"
+equal "...keeps the previous one" "yes" "$([[ -e "$p/$second" ]] && echo yes || echo no)"
+equal "...and the current one" "yes" "$([[ -e "$p/$third" ]] && echo yes || echo no)"
+check "...and says what it did" "pruned 1 older Node tool install(s); kept the previous one" "$out"
+equal "...leaving two installs" "2" "$(find "$p/node-tools-installs" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
 
 echo "a running consumer"
 # A stand-in for a tool still running: its argv holds PATH, as node's does for a CLI started
@@ -202,22 +222,35 @@ consume() {  # consume PATH: start it, and wait until the process list shows it 
     "$(ps -o command= -p "${consumers[${#consumers[@]}-1]}" 2>&1)"
 }
 stop_consumers() { local c; for c in "${consumers[@]}"; do kill "$c" 2>/dev/null; wait "$c" 2>/dev/null; done; consumers=(); }
-consume "$p/bin/beta"
-write_source "$tmp/src" 4.5.8
-run "$tmp/src" "$p"
-equal "an install while a tool started through its link runs succeeds" 0 "$rc"
-equal "...and keeps the install that tool may be running" "yes" "$([[ -e "$p/$second" ]] && echo yes || echo no)"
-check "...saying so" "kept 1 older Node tool install(s) a running process may still use" "$out"
-third="$(readlink "$p/node-tools-current")"
+step() {  # step PREFIX VERSION: install the tool set with beta at VERSION into PREFIX
+  write_source "$tmp/s-$2" "$2"
+  run "$tmp/s-$2" "$1"
+}
+# Three installs per case, so the oldest is neither current nor previous: only a consumer saves it.
+q="$tmp/pq-link"
+step "$q" 1.0.1
+oldest="$(readlink "$q/node-tools-current")"
+consume "$q/bin/beta"
+step "$q" 1.0.2
+step "$q" 1.0.3
+run "$tmp/s-1.0.3" "$q" --prune
+equal "--prune keeps an install a tool started through its published link may run" "yes" \
+  "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
+check "...saying so" "kept 1 a running process may still use" "$out"
 stop_consumers
-run "$tmp/src" "$p"
-equal "once it exits, the next run prunes it" "no" "$([[ -e "$p/$second" ]] && echo yes || echo no)"
-ln -s "$p/$third/node_modules/@scope/beta/cli.js" "$tmp/beta-elsewhere"
+run "$tmp/s-1.0.3" "$q" --prune
+equal "once that tool exits, --prune removes it" "no" "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
+
+q="$tmp/pq-elsewhere"
+step "$q" 2.0.1
+oldest="$(readlink "$q/node-tools-current")"
+ln -s "$q/$oldest/node_modules/@scope/beta/cli.js" "$tmp/beta-elsewhere"
 consume "$tmp/beta-elsewhere"
-write_source "$tmp/src" 4.5.9
-run "$tmp/src" "$p"
-equal "an install reached through another symlink is kept while its tool runs" "yes" \
-  "$([[ -e "$p/$third" ]] && echo yes || echo no)"
+step "$q" 2.0.2
+step "$q" 2.0.3
+run "$tmp/s-2.0.3" "$q" --prune
+equal "--prune keeps an install a tool reached through another symlink runs" "yes" \
+  "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
 stop_consumers
 
 echo "usage"
