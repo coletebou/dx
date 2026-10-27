@@ -1,0 +1,86 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/track-cwd.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/context-advisor-hook.sh codex",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/tmux-rename-hook.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/context-advisor-hook.sh codex",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/tmux-rename-hook.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/turn-timestamp-hook.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/reflections-context-hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/session-reflector-hook.sh precompact",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.dotfiles/base/claude/session-reflector-hook.sh sessionend",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+# Codex defaults from this repository. install.sh (the codex component) copies this file to
+# ~/.codex/config.toml only when you have none, and never overwrites it afterwards: Codex writes
+# to that file itself (project trust, hook approvals, notices), so it is seeded, not linked.
+# Merge later changes from here by hand.
+#
+# Model, provider and sign-in are left to Codex's own defaults (your ChatGPT login or API key).
+# Set `model`, `model_provider` or `model_reasoning_effort` here, or in a profile
+# (`codex -p <name>`), when you want something else.
+# Reference: https://developers.openai.com/codex/config-reference
+
+# A repository without an AGENTS.md gives Codex its CLAUDE.md instead, so one file serves both
+# agents (see AGENTS.md next to this file).
+project_doc_fallback_filenames = ["CLAUDE.md"]
+
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "pull-request-number", "permissions", "run-state", "context-used", "task-progress", "context-window-size"]
+status_line_use_colors = true
+
+[features]
+# Let Codex remember durable facts across sessions. Only stable features are set here; an
+# experimental one makes Codex print a warning at every start.
+memories = true

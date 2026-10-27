@@ -1,0 +1,78 @@
+# =============================================================================
+# Ghostty config. install.sh (the ghostty component) links it to
+# ~/.config/ghostty/config, which Ghostty reads on macOS and Linux.
+#
+# Reference:      https://ghostty.org/docs/config/reference
+# 1.3.0 notes:    https://ghostty.org/docs/install/release-notes/1-3-0
+# Check it:       ghostty +validate-config
+#
+# Keys marked (1.3.0) need Ghostty 1.3.0 or newer: older versions report them
+# as configuration errors and apply the rest of the file.
+# =============================================================================
+
+# --- Input & scrolling ---
+
+mouse-scroll-multiplier = 0.3
+
+# Left-Option acts as Alt/Meta so TUI alt-keybindings work (fzf, tmux, editors).
+# Right-Option still types accented characters, so normal macOS text entry is
+# unaffected: only the left key becomes a modifier. Without this, macOS
+# swallows Option into dead-key composition and alt-* bindings never fire.
+macos-option-as-alt = left
+
+# (1.3.0) Auto-follow terminal output when it arrives while scrolled up,
+# the way `tail -f` keeps scrolling. Off here: uncomment to enable.
+#scroll-to-bottom = output
+
+# (1.3.0) Extend double-click word selection to path and URL characters, so
+# clicking "feat/my-branch-name" grabs the whole identifier. The default stops
+# at -, _, /, ., and so on. Tune to taste.
+selection-word-chars = "-_./:@~?&=%+#"
+
+# --- Splits & windows ---
+
+unfocused-split-opacity = 1.0
+
+# (1.3.0) New tabs, splits and windows open in the current directory instead
+# of $HOME.
+window-inherit-working-directory = true
+tab-inherit-working-directory = true
+split-inherit-working-directory = true
+
+# (1.3.0) Keep a zoomed split zoomed when navigating between splits. Without
+# this, moving focus silently un-zooms.
+split-preserve-zoom = navigation
+
+# --- Notifications ---
+
+# (1.3.0) Notify when a long-running command finishes in an unfocused window.
+# A 30 s threshold (the default is 5 s) keeps quick commands quiet.
+notify-on-command-finish = unfocused
+notify-on-command-finish-action = bell,notify
+notify-on-command-finish-after = 30s
+
+# --- SSH integration ---
+
+# Fix the TERM=xterm-ghostty problem on remote servers (broken backspace,
+# arrows, clear, vim colors). `ssh-env` forwards a sane TERM; `ssh-terminfo`
+# installs Ghostty's terminfo on the remote on first connect (infocmp | tic),
+# so Ghostty-specific features survive instead of falling back to
+# xterm-256color. Needs `tic` (ncurses) on the remote. For a box you reach
+# some other way, `tic -x ghostty.terminfo` next to this file does the same.
+shell-integration-features = ssh-env,ssh-terminfo
+
+# --- Keybinds ---
+
+# (1.3.0) Toggle TUI mouse reporting, for apps like lazygit or btop that
+# capture the mouse and block text selection: tap cmd+shift+m to free the
+# mouse, tap again to give it back to the app.
+keybind = cmd+shift+m=toggle_mouse_reporting
+
+# (1.3.0) Close all tabs to the right of the current tab (Chrome-style).
+keybind = cmd+opt+w=close_tab:right
+
+# Ghostty's kitty-keyboard-protocol output for ctrl+/ (a CSI u sequence) is
+# not parsed by fzf, so the bytes leak into the query. Send the legacy single
+# byte 0x1f instead: what ctrl+_ sent on serial terminals, and what fzf has
+# always read as `ctrl-/`. Restores ctrl+/ in fzf, fzf-tab and their kin.
+keybind = ctrl+slash=text:\x1f

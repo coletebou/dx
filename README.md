@@ -60,8 +60,13 @@ installer stops and tells you your options.
 | `git` | global git config with identity routing, a global ignore file, gitleaks pre-commit and pre-push hooks |
 | `tmux` | `tmux.conf` and its status helpers, Claude Code and Codex resume after a tmux-resurrect restore, the tmux plugin's CLIs |
 | `claude` | Claude Code: a generated `settings.json` (hooks, statusline), a `CLAUDE.md` rules stub, MCP servers |
-| `codex` | the Codex skills |
-| `session`, `worktrees`, `memory`, `review` | each plugin's CLIs in `~/.local/bin` and its skills in `~/.claude/skills` |
+| `codex` | Codex: global rules (`AGENTS.md`) and hooks, a provider-neutral `config.toml` copied once (Codex writes to it), the Codex skills |
+| `session`, `worktrees`, `memory`, `review`, `toolbox` | each plugin's CLIs in `~/.local/bin` and its skills in `~/.claude/skills` |
+| `ghostty` | the Ghostty config, and the `xterm-ghostty` terminfo for your user where it is missing |
+| `vscode` | VS Code user settings (Prettier off); `vscode/extensions.json` lists the recommended extensions |
+| `brew` | `~/.Brewfile`, a commented developer Brewfile for `brew bundle --global` |
+| `music-video` | the `music-video` skill. Not part of `--all`: it drives paid APIs. |
+| `node-tools` | the pinned global Node CLIs (Codex, pnpm, tsx, language servers, ...) from `node-tools/`'s lock, with `npm ci` into `~/.npm-global`. Needs Node 24. Not part of `--all`. |
 | `schedules` | launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, the nightly dream sweep, tmux autosave. Not part of `--all`. |
 | `github-kit` | the [GitHub repo kit](github-kit/README.md) (issue forms, a PR template and its rules, a label set with a sync script, PR-labeling, secret-scan, Claude Code and CI-lane workflows), copied into the `.github/` of the repository `--target` names. Not part of `--all`. |
 | `manager` | a Drover setting that points its OpenClaw fleet manager at your identity's overlay (below). Not part of `--all`. |
@@ -107,6 +112,9 @@ identities/example/               a synthetic identity to copy
 scripts/                          the CLIs (cc-handoff, wt-helper, reflections, dream, ...)
 scripts/tests/                    the test suites
 claude/*.conf.example             memory tool configuration templates
+codex/                            Codex rules, hooks and config defaults
+ghostty/, vscode/, Brewfile       terminal and editor settings, Homebrew packages
+node-tools/                       the pinned global Node CLIs (package.json and its lock)
 launchagents/, systemd/user/      schedule templates
 docs/                             handoff chains, hooks, memory, workflow, infrastructure
 install.sh                        the installer
@@ -128,7 +136,8 @@ install.sh                        the installer
   and most scripts; `session-analyzer` and `tmux-apply-plan` need bash 4 or newer).
 - tmux 3.4 or newer, jq, Python 3, and [Claude Code](https://code.claude.com).
 - Optional: Codex CLI, [gitleaks](https://github.com/gitleaks/gitleaks) (the git hooks refuse to
-  run without it), starship, fzf, and Node 24 for `mcp-agent-safety`.
+  run without it), starship, fzf, and Node 24 for `mcp-agent-safety` and the `node-tools`
+  component. On a Mac, the `Brewfile` covers most of these.
 - Claude Code on Amazon Bedrock is optional and documented in [docs/infra/aws.md](docs/infra/aws.md).
 
 ## Security notes

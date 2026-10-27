@@ -1,0 +1,138 @@
+// VS Code user settings. install.sh (the vscode component) links the user settings.json to this
+// file: ~/Library/Application Support/Code/User/settings.json on macOS, ~/.config/Code/User/settings.json
+// on Linux. VS Code writes through the link, so a setting changed in the UI lands here, in your clone.
+// Recommended extensions: extensions.json next to this file.
+{
+  // ── Formatting ──────────────────────────────────────────
+  // Prettier is off; nothing formats on save. A repository that wants a formatter configures it.
+  "prettier.enable": false,
+  "editor.formatOnSave": false,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit",
+  },
+
+  // ── Editor ──────────────────────────────────────────────
+  "editor.tabSize": 2,
+  "editor.guides.bracketPairs": "active",
+  "editor.minimap.enabled": false,
+  "editor.linkedEditing": true,
+  "editor.renderWhitespace": "boundary",
+  "editor.smoothScrolling": true,
+  "editor.cursorSmoothCaretAnimation": "on",
+  "editor.inlayHints.enabled": "onUnlessPressed",
+  "editor.accessibilitySupport": "off",
+
+  // ── Workbench ───────────────────────────────────────────
+  "workbench.colorTheme": "Dark Modern",
+  "workbench.startupEditor": "none",
+  "workbench.list.smoothScrolling": true,
+  "workbench.tree.indent": 16,
+  "workbench.editor.wrapTabs": true,
+  "workbench.editor.tabSizing": "shrink",
+
+  // ── Files ───────────────────────────────────────────────
+  "files.eol": "\n",
+  "files.autoSave": "onFocusChange",
+  "files.trimTrailingWhitespace": true,
+  "files.trimFinalNewlines": true,
+  "files.insertFinalNewline": true,
+  "files.exclude": {
+    "**/.DS_Store": true,
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+  },
+  // Worktrees nested under .claude/worktrees are full checkouts: don't watch or search them twice.
+  "files.watcherExclude": {
+    "**/.claude/worktrees/**": true,
+  },
+  "[markdown]": {
+    // Two trailing spaces are a Markdown line break.
+    "files.trimTrailingWhitespace": false,
+  },
+
+  // ── Search ──────────────────────────────────────────────
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/.next": true,
+    "**/build": true,
+    "**/.turbo": true,
+    "**/.claude/worktrees": true,
+  },
+
+  // ── Terminal ────────────────────────────────────────────
+  "terminal.integrated.defaultProfile.osx": "zsh",
+  "terminal.integrated.profiles.osx": {
+    "zsh": {
+      "path": "/bin/zsh",
+      "args": ["-l"],
+    },
+  },
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.defaultLocation": "editor",
+  "terminal.integrated.scrollback": 10000,
+  "terminal.integrated.enableMultiLinePasteWarning": "never",
+  "terminal.integrated.smoothScrolling": true,
+  // Nerd Fonts carry the icons eza and the starship prompt draw; the Brewfile installs both.
+  "terminal.integrated.fontFamily": "'JetBrainsMono Nerd Font', 'MesloLGS Nerd Font', monospace",
+  "terminal.integrated.macOptionIsMeta": true,
+  "terminal.integrated.initialHint": false,
+
+  // ── Git ─────────────────────────────────────────────────
+  "git.autofetch": true,
+  "git.enableSmartCommit": true,
+  "git.confirmSync": false,
+  "git.openRepositoryInParentFolders": "never",
+  "git.replaceTagsWhenPull": true,
+
+  // ── TypeScript / JavaScript ─────────────────────────────
+  "js/ts.updateImportsOnFileMove.enabled": "always",
+  "js/ts.preferences.importModuleSpecifier": "relative",
+  "js/ts.inlayHints.parameterNames.enabled": "literals",
+  "js/ts.inlayHints.functionLikeReturnTypes.enabled": true,
+
+  // ── Python ──────────────────────────────────────────────
+  "python.terminal.activateEnvironment": false,
+  "[python]": {
+    "editor.tabSize": 4,
+  },
+
+  // ── YAML ────────────────────────────────────────────────
+  // CI workflow files get their schema from the GitHub Actions extension, not the YAML one.
+  "yaml.disableSchemaDetection": [
+    "**/.github/workflows/*.yml",
+    "**/.github/workflows/*.yaml",
+    "**/.gitea/workflows/*.yml",
+    "**/.gitea/workflows/*.yaml",
+    "**/.forgejo/workflows/*.yml",
+    "**/.forgejo/workflows/*.yaml",
+  ],
+
+  // ── Diff ────────────────────────────────────────────────
+  "diffEditor.maxComputationTime": 0,
+
+  // ── Remote / Containers ─────────────────────────────────
+  "remote.autoForwardPortsSource": "hybrid",
+  "containers.containerClient": "com.microsoft.visualstudio.containers.docker",
+  "containers.orchestratorClient": "com.microsoft.visualstudio.orchestrators.dockercompose",
+
+  // ── Claude Code ─────────────────────────────────────────
+  "claudeCode.respectGitIgnore": false,
+  "claudeCode.enableNewConversationShortcut": true,
+  "claudeCode.usePythonEnvironment": false,
+
+  // ── Chat / agents ───────────────────────────────────────
+  "chat.mcp.gallery.enabled": true,
+  "chat.agent.thinkingStyle": "collapsedPreview",
+  "chat.checkpoints.showFileChanges": true,
+  "chat.implicitContext.enabled": {
+    "terminal": "always",
+  },
+  "chat.viewSessions.orientation": "stacked",
+  "github.copilot.chat.codesearch.enabled": true,
+  "github.copilot.chat.languageContext.inline.typescript.enabled": true,
+
+  // ── Telemetry ───────────────────────────────────────────
+  "telemetry.telemetryLevel": "off",
+  "redhat.telemetry.enabled": false,
+}

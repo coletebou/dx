@@ -40,8 +40,17 @@ esac
 EOF
 chmod +x "$tmp/bin/claude"
 export PATH="$tmp/bin:$PATH" GIT_CONFIG_NOSYSTEM=1
-unset XDG_CONFIG_HOME
+# Anything that could point a component outside the throwaway HOME, or change what it finds.
+unset XDG_CONFIG_HOME CODEX_HOME TERMINFO TERMINFO_DIRS NODE_TOOLS_PREFIX NODE_TOOLS_SOURCE NODE_TOOLS_NODE_MAJOR
 newhome() { export HOME="$tmp/home$1"; mkdir -p "$HOME"; }
+perms() { python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$1" 2>&1; }
+case "$(uname -s)" in
+  Darwin) vscode_user="Library/Application Support/Code/User" ;;
+  *)      vscode_user=".config/Code/User" ;;
+esac
+# Whether this system already knows xterm-ghostty without any HOME (then nothing is compiled).
+mkdir -p "$tmp/nohome"
+system_ghostty="$(HOME="$tmp/nohome" infocmp -x xterm-ghostty >/dev/null 2>&1 && echo yes || echo no)"
 inst() { "$run_bash" "$root/install.sh" "$@" 2>&1; }
 before_status="$(git -C "$root" status --porcelain)"
 
@@ -49,7 +58,7 @@ echo "usage"
 newhome 0
 out="$(inst)"; rc=$?
 equal "no components is a usage error" 2 "$rc"
-check "...that lists the components" "worktrees  wt-helper, pw" "$out"
+check "...that lists the components" "worktrees   wt-helper, pw" "$out"
 out="$(inst --with bogus)"; rc=$?
 equal "an unknown component is refused" 1 "$rc"
 out="$(inst --all --identity nobody)"; rc=$?
@@ -61,6 +70,11 @@ newhome 1
 out="$(inst --all --dry-run)"; rc=$?
 equal "a dry run succeeds" 0 "$rc"
 check "...and says what it would do" "would link ~/.zshrc" "$out"
+check "...for Ghostty" "would link ~/.config/ghostty/config" "$out"
+check "...for VS Code" "would link ~/$vscode_user/settings.json" "$out"
+check "...for Homebrew" "would link ~/.Brewfile" "$out"
+check "...for Codex's rules" "would link ~/.codex/AGENTS.md" "$out"
+check "...and its config, as a copy" "would create ~/.codex/config.toml (a copy of" "$out"
 equal "...without touching HOME" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
 
 echo "a real install"
@@ -99,6 +113,24 @@ lacks "schedules are not part of --all" "systemctl" "$(cat "$tmp/calls" 2>/dev/n
 equal "the manager overlay setting is not part of --all" "absent" \
   "$([[ -e "$HOME/.config/drover/dx-openclaw-manager.env" ]] && echo present || echo absent)"
 equal "...nor is music-video" "absent" "$([[ -e "$HOME/.claude/skills/music-video" ]] && echo present || echo absent)"
+equal "...nor node-tools" "absent" "$([[ -e "$HOME/.npm-global" ]] && echo present || echo absent)"
+equal "the Ghostty config is linked" "$root/ghostty/config" "$(readlink "$HOME/.config/ghostty/config")"
+if ! command -v tic >/dev/null 2>&1 || ! command -v infocmp >/dev/null 2>&1; then
+  ok "# SKIP no tic/infocmp"
+elif [[ "$system_ghostty" == yes ]]; then
+  equal "...and no terminfo is compiled where the system has xterm-ghostty" "absent" \
+    "$([[ -e "$HOME/.terminfo" ]] && echo present || echo absent)"
+else
+  equal "...and xterm-ghostty is compiled into ~/.terminfo" "found" \
+    "$(TERMINFO="$HOME/.terminfo" infocmp -x xterm-ghostty >/dev/null 2>&1 && echo found || echo missing)"
+fi
+equal "VS Code's user settings are linked" "$root/vscode/settings.jsonc" "$(readlink "$HOME/$vscode_user/settings.json")"
+equal "~/.Brewfile is linked" "$root/Brewfile" "$(readlink "$HOME/.Brewfile")"
+equal "Codex's AGENTS.md is linked" "$root/codex/AGENTS.md" "$(readlink "$HOME/.codex/AGENTS.md")"
+equal "...and its hooks.json" "$root/codex/hooks.json" "$(readlink "$HOME/.codex/hooks.json")"
+equal "...its config.toml is a copy, not a link" "copy" \
+  "$([[ -f "$HOME/.codex/config.toml" && ! -L "$HOME/.codex/config.toml" ]] && cmp -s "$root/codex/config.toml" "$HOME/.codex/config.toml" && echo copy)"
+equal "...in a ~/.codex only you can read" "700" "$(perms "$HOME/.codex")"
 
 echo "idempotent"
 out="$(inst --all)"; rc=$?
@@ -112,6 +144,81 @@ if command -v zsh >/dev/null 2>&1; then
 else
   ok "# SKIP zsh not installed"
 fi
+
+echo "a Codex config of your own"
+newhome 7
+mkdir -p "$HOME/.codex"
+chmod 755 "$HOME/.codex"
+printf 'model = "mine"\n' > "$HOME/.codex/config.toml"
+out="$(inst --with codex)"; rc=$?
+equal "the install succeeds" 0 "$rc"
+equal "...and keeps your config.toml as it was" 'model = "mine"' "$(cat "$HOME/.codex/config.toml")"
+check "...saying where the defaults are" "note: kept your ~/.codex/config.toml" "$out"
+equal "...and leaves an existing ~/.codex's mode alone" "755" "$(perms "$HOME/.codex")"
+out="$(inst --with codex)"; rc=$?
+check "...and a rerun changes nothing" "Everything was already in place." "$out"
+
+echo "node-tools"
+newhome 8
+out="$(NODE_TOOLS_NODE_MAJOR=1 inst --with node-tools)"; rc=$?
+equal "without the Node it needs, the install still succeeds" 0 "$rc"
+check "...saying what is missing" "the pinned Node tools need Node 1 and npm" "$out"
+equal "...and installs nothing" "absent" "$([[ -e "$HOME/.npm-global" ]] && echo present || echo absent)"
+if command -v node >/dev/null 2>&1; then
+  # A one-package lock and a fake npm that "installs" it offline: the component's own wiring.
+  mkdir -p "$tmp/nt-src" "$tmp/npmbin"
+  printf '{"name":"t","private":true,"version":"1.0.0","dependencies":{"tool":"1.0.0"}}\n' > "$tmp/nt-src/package.json"
+  printf '%s\n' '{"name":"t","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{' \
+    '"":{"name":"t","version":"1.0.0","dependencies":{"tool":"1.0.0"}},' \
+    '"node_modules/tool":{"version":"1.0.0","bin":{"tool":"cli.sh"}}}}' > "$tmp/nt-src/package-lock.json"
+  cat > "$tmp/npmbin/npm" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && d="$2"; shift; done
+mkdir -p "$d/node_modules/tool" "$d/node_modules/.bin"
+printf '{"name":"tool","version":"1.0.0"}\n' > "$d/node_modules/tool/package.json"
+printf '#!/bin/sh\necho tool 1.0.0\n' > "$d/node_modules/tool/cli.sh"
+chmod +x "$d/node_modules/tool/cli.sh"
+ln -s ../tool/cli.sh "$d/node_modules/.bin/tool"
+EOF
+  chmod +x "$tmp/npmbin/npm"
+  nt_env=(env PATH="$tmp/npmbin:$PATH" NODE_TOOLS_SOURCE="$tmp/nt-src"
+    NODE_TOOLS_NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')")
+  out="$("${nt_env[@]}" "$run_bash" "$root/install.sh" --with node-tools --dry-run 2>&1)"; rc=$?
+  equal "a node-tools dry run succeeds" 0 "$rc"
+  check "...naming where it would install" "would install the pinned Node tools into ~/.npm-global" "$out"
+  equal "...writing nothing" "absent" "$([[ -e "$HOME/.npm-global" ]] && echo present || echo absent)"
+  out="$("${nt_env[@]}" "$run_bash" "$root/install.sh" --with node-tools 2>&1)"; rc=$?
+  equal "a node-tools install succeeds" 0 "$rc"
+  equal "...and publishes the tools in ~/.npm-global/bin" "tool 1.0.0" "$("$HOME/.npm-global/bin/tool" 2>&1)"
+  check "...recording the change" "Done: 1 change(s)." "$out"
+  out="$("${nt_env[@]}" "$run_bash" "$root/install.sh" --with node-tools 2>&1)"; rc=$?
+  check "...and a rerun changes nothing" "Everything was already in place." "$out"
+else
+  ok "# SKIP node not installed"
+fi
+
+echo "the config files"
+missing=""
+while IFS= read -r cmd; do
+  script="${cmd#bash ~/.dotfiles/}"; script="${script%% *}"
+  [[ -f "$root/$script" ]] || missing="$missing $script"
+done < <(jq -r '.hooks[][].hooks[].command' "$root/codex/hooks.json")
+equal "every Codex hook runs a script this checkout has" "" "$missing"
+# JSONC, as VS Code reads it: comments and trailing commas allowed.
+vscode_json="$(python3 - "$root/vscode/settings.jsonc" <<'EOF' 2>&1
+import json, re, sys
+text = open(sys.argv[1]).read()
+text = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*', lambda m: m.group(0) if m.group(0)[0] == '"' else "", text)
+print(json.dumps(json.loads(re.sub(r",(\s*[}\]])", r"\1", text))))
+EOF
+)"
+equal "the VS Code settings parse as JSONC" "object" "$(jq -r 'type' <<<"$vscode_json" 2>&1)"
+equal "...with Prettier off" "false" "$(jq '.["prettier.enable"]' <<<"$vscode_json" 2>&1)"
+equal "...and no setting that names it as a formatter" "0" \
+  "$(jq '[.. | strings | select(test("prettier"; "i"))] | length' <<<"$vscode_json" 2>&1)"
+equal "the extension list recommends no Prettier" "" "$(jq -r '.recommendations[] | select(test("prettier"; "i"))' "$root/vscode/extensions.json")"
+equal "every Brewfile entry is a tap, brew or cask of a quoted name" "" \
+  "$(grep -v -E '^[[:space:]]*(#|$)' "$root/Brewfile" | grep -v -E '^(tap|brew|cask) "[A-Za-z0-9@._/+-]+"( +#.*)?$')"
 
 echo "music-video"
 out="$(inst --with music-video)"; rc=$?

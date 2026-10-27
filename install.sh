@@ -5,7 +5,7 @@
 #
 #   ./install.sh --list                       the components, and what each installs
 #   ./install.sh --all --dry-run              every change it would make, making none
-#   ./install.sh --all                        every component except schedules, github-kit and manager
+#   ./install.sh --all                        every component except schedules, music-video, node-tools, github-kit and manager
 #   ./install.sh --with shell,git,claude      just these
 #   ./install.sh --with schedules             the background jobs (cc-park, dream, tmux autosave)
 #   ./install.sh --with github-kit --target ~/code/repo   the GitHub repo kit into that repo's .github/
@@ -26,8 +26,8 @@
 set -euo pipefail
 
 DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review toolbox music-video schedules github-kit manager"
-DEFAULT_ALL="shell git tmux claude codex session worktrees memory review toolbox"
+ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review toolbox ghostty vscode brew music-video node-tools schedules github-kit manager"
+DEFAULT_ALL="shell git tmux claude codex session worktrees memory review toolbox ghostty vscode brew"
 
 describe() {
     case "$1" in
@@ -35,13 +35,17 @@ describe() {
         git)       echo "global git config with identity routing, the global ignore file, gitleaks pre-commit and pre-push hooks" ;;
         tmux)      echo "tmux.conf and its status helpers, Claude/Codex resume after tmux-resurrect, tmux-archive and tmux-organize" ;;
         claude)    echo "Claude Code: generated settings.json (hooks, statusline), a CLAUDE.md rules stub, MCP servers" ;;
-        codex)     echo "the codex-subagents and codex-transcripts skills" ;;
+        codex)     echo "Codex: AGENTS.md rules and hooks.json, a config.toml seeded once, the codex-subagents and codex-transcripts skills" ;;
         session)   echo "cc-park and cc-handoff, with their skills" ;;
         worktrees) echo "wt-helper, pw, stack-branches and stack-claude, with their skills" ;;
         memory)    echo "reflections, dream, session-analyzer and claude-consolidate, with their skills" ;;
         review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
         toolbox)   echo "the disk-reclaim and shipped-but-open skills" ;;
+        ghostty)   echo "the Ghostty config, and the xterm-ghostty terminfo where it is missing" ;;
+        vscode)    echo "VS Code user settings (Prettier off), and how to install the recommended extensions" ;;
+        brew)      echo "~/.Brewfile, for brew bundle --global (installs nothing itself)" ;;
         music-video) echo "the music-video skill (song and video pipeline; paid API keys; not in --all)" ;;
+        node-tools) echo "the pinned global Node CLIs (codex, pnpm, tsx, ...) from node-tools/'s lock, via npm ci (Node 24; not in --all)" ;;
         schedules) echo "launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, nightly dream, tmux autosave (not in --all)" ;;
         github-kit) echo "issue forms, a PR template, labels and workflows, copied into the .github/ of the repo --target names (not in --all)" ;;
         manager)   echo "a Drover setting naming identities/<id>/openclaw-manager as its fleet manager's overlay (not in --all)" ;;
@@ -78,7 +82,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$LIST" -eq 1 ]; then
-    for c in $ALL_COMPONENTS; do printf '  %-10s %s\n' "$c" "$(describe "$c")"; done
+    for c in $ALL_COMPONENTS; do printf '  %-11s %s\n' "$c" "$(describe "$c")"; done
     exit 0
 fi
 
@@ -93,7 +97,7 @@ done
 if [ -z "$SELECTED" ]; then
     usage
     printf '\nPick components with --with a,b or --all:\n'
-    for c in $ALL_COMPONENTS; do printf '  %-10s %s\n' "$c" "$(describe "$c")"; done
+    for c in $ALL_COMPONENTS; do printf '  %-11s %s\n' "$c" "$(describe "$c")"; done
     exit 2
 fi
 selected() { case " $SELECTED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
@@ -208,6 +212,31 @@ generate() {
     mv "$tmp" "$dest"
     say "  wrote $(tilde "$dest")"
     record generate "$dest"
+}
+
+# seed SRC DEST: copy SRC to DEST once, for a tool that writes to its own config file (a link
+# would make it write into this checkout). A DEST that exists, edited or not, is left alone.
+seed() {
+    local src="$1" dest="$2"
+    [ -e "$src" ] || die "missing in this checkout: $src"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        cmp -s "$src" "$dest" \
+            || say "  note: kept your $(tilde "$dest"); $(tilde "$src") holds this repo's defaults, to merge by hand"
+        return 0
+    fi
+    if into_checkout "$dest"; then
+        warn "$(tilde "$dest") is inside this checkout (a linked parent directory); leaving it alone"
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        say "  [dry-run] would create $(tilde "$dest") (a copy of $(tilde "$src"))"
+        CHANGES=$((CHANGES + 1))
+        return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    cp "$src" "$dest"
+    say "  wrote $(tilde "$dest") (a copy, not a link: the tool writes to it)"
+    record seed "$dest" "$src"
 }
 
 link_bins() {  # link_bins FILE...: each into ~/.local/bin under its own name
@@ -396,7 +425,15 @@ register_mcp() {
 }
 
 c_codex() {
+    local home="${CODEX_HOME:-$HOME/.codex}"
     link_skills codex
+    # Codex keeps its sign-in in this directory: one created here is private to you.
+    if [ ! -e "$home" ] && [ "$DRY_RUN" -eq 0 ]; then
+        mkdir -p "$home" && chmod 700 "$home"
+    fi
+    link "$DOTFILES_DIR/codex/AGENTS.md" "$home/AGENTS.md"
+    link "$DOTFILES_DIR/codex/hooks.json" "$home/hooks.json"
+    seed "$DOTFILES_DIR/codex/config.toml" "$home/config.toml"
 }
 
 c_session() {
@@ -438,6 +475,73 @@ c_music_video() {
     link_skills music-video
     need ffmpeg "music-video mixes, masters and encodes with ffmpeg"
     need node "music-video renders frames in headless Chrome through Node"
+}
+
+c_ghostty() {
+    link "$DOTFILES_DIR/ghostty/config" "$HOME/.config/ghostty/config"
+    # SSH sessions from Ghostty arrive with TERM=xterm-ghostty, and where no terminfo entry has
+    # that name ncurses apps garble keys. Compile it for this user (no sudo), once.
+    if ! command -v tic >/dev/null 2>&1 || ! command -v infocmp >/dev/null 2>&1; then
+        say "  note: tic or infocmp not found: install ncurses to add the xterm-ghostty terminfo"
+    elif ! infocmp -x xterm-ghostty >/dev/null 2>&1; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            say "  [dry-run] would compile the xterm-ghostty terminfo into ~/.terminfo"
+            CHANGES=$((CHANGES + 1))
+        elif tic -x -o "$HOME/.terminfo" "$DOTFILES_DIR/ghostty/ghostty.terminfo" 2>/dev/null; then
+            say "  compiled the xterm-ghostty terminfo into ~/.terminfo"
+            record terminfo "$HOME/.terminfo" xterm-ghostty
+        else
+            warn "could not compile the xterm-ghostty terminfo (tic -x ghostty/ghostty.terminfo)"
+        fi
+    fi
+}
+
+c_vscode() {
+    local dir
+    case "$(uname -s)" in
+        Darwin) dir="$HOME/Library/Application Support/Code/User" ;;
+        *)      dir="${XDG_CONFIG_HOME:-$HOME/.config}/Code/User" ;;
+    esac
+    # VS Code writes through the link, so a setting changed in its UI lands in this checkout.
+    link "$DOTFILES_DIR/vscode/settings.jsonc" "$dir/settings.json"
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        say "  note: on WSL, VS Code reads its user settings on the Windows side: copy vscode/settings.jsonc there"
+    fi
+    if command -v code >/dev/null 2>&1; then
+        say "  note: install the recommended extensions with: jq -r '.recommendations[]' ~/.dotfiles/vscode/extensions.json | xargs -n 1 code --install-extension"
+    else
+        say "  note: VS Code's code command is not on PATH; the settings are in place for when it is"
+    fi
+}
+
+c_brew() {
+    link "$DOTFILES_DIR/Brewfile" "$HOME/.Brewfile"
+    if command -v brew >/dev/null 2>&1; then
+        say "  note: brew bundle --global installs what it lists; brew bundle check --global shows what is missing"
+    else
+        say "  note: Homebrew is not installed (https://brew.sh); afterwards brew bundle --global installs ~/.Brewfile"
+    fi
+}
+
+# npm ci from the committed lock into ~/.npm-global (NODE_TOOLS_PREFIX), which zshenv puts on
+# PATH. Without the Node major it needs, it says so and installs nothing.
+c_node_tools() {
+    local script="$DOTFILES_DIR/scripts/install-node-tools.sh" want="${NODE_TOOLS_NODE_MAJOR:-24}"
+    local prefix="${NODE_TOOLS_PREFIX:-$HOME/.npm-global}" have
+    have="$(node -p 'process.versions.node' 2>/dev/null || true)"
+    if [ "${have%%.*}" != "$want" ] || ! command -v npm >/dev/null 2>&1; then
+        say "  note: the pinned Node tools need Node $want and npm (found ${have:-no node}): fnm install $want, then rerun"
+        return 0
+    fi
+    bash "$script" --check >/dev/null 2>&1 && return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        say "  [dry-run] would install the pinned Node tools into $(tilde "$prefix") (npm ci from node-tools/package-lock.json)"
+        CHANGES=$((CHANGES + 1))
+    elif bash "$script"; then
+        record node-tools "$prefix/node-tools-current"
+    else
+        warn "the pinned Node tools did not install (scripts/install-node-tools.sh says why above)"
+    fi
 }
 
 # The schedule templates name their binaries under __HOME__/.dotfiles (launchd) or
