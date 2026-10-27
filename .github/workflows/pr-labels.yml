@@ -1,0 +1,79 @@
+name: PR Labels
+
+# Keeps two label families current on every same-repository pull request,
+# whatever its base branch (a fork PR's read-only token cannot write labels;
+# its run warns instead):
+#
+#   size/*    lines changed, not counting lockfiles, generated output or
+#             binary assets (XS <20, S <100, M <500, L <1000, XL 1000+)
+#   proof: *  whether the PR carries real-behavior evidence: screenshots or a
+#             recording for UI changes, and for behavior changes a command
+#             plus its output, a recording or a link in the body's
+#             `## Evidence` section (or a comment that starts with "Evidence").
+#             Unit tests, mocks, typecheck and CI alone are not evidence.
+#
+# `proof: 🙋 override` freezes the proof labels for a PR whose proof a
+# maintainer judged by hand. `merge-risk: *` and every other label are never
+# touched here. Rules and examples: .github/docs/pull-requests.md.
+#
+# Needs no secrets. Optional repository variables say where UI lives, so a UI
+# change asks for screenshots (both are regular expressions over file paths):
+#   PR_LABELS_UI_PATHS  e.g. ^(web|app/views)/ (unset: a UI file anywhere counts)
+#   PR_LABELS_NOT_UI    e.g. ^web/src/api/ (paths under it that are not UI)
+#
+# Labels written with GITHUB_TOKEN do not trigger other workflows, so this
+# cannot start ci-full-label.yml or a review round. Nothing needs to require
+# its check.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+
+permissions: {}
+
+jobs:
+  pr-labels:
+    # Comments on issues are not PRs, and bot comments (deploy cards, review
+    # bots) are never evidence, so neither needs a run.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.type != 'Bot') ||
+      (github.event_name == 'pull_request_review' && github.event.review.user.type != 'Bot')
+    # One run per PR; a newer event (a push, an edit, a new comment) supersedes
+    # it. This sits on the job, not the workflow: workflow-level concurrency is
+    # applied before `if`, so a bot review that the `if` skips would still
+    # cancel the run in flight and leave the PR with a cancelled check.
+    concurrency:
+      group: pr-labels-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Labels on a PR need pull-requests: write (issues: write alone gets a 403);
+    # issues: write covers creating a missing label definition.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout the labeling script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts/pr-labels.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Update size and proof labels
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_LABELS_UI_PATHS: ${{ vars.PR_LABELS_UI_PATHS }}
+          PR_LABELS_NOT_UI: ${{ vars.PR_LABELS_NOT_UI }}
+        run: node .github/scripts/pr-labels.mjs

@@ -1,0 +1,68 @@
+name: Feature request
+description: A new capability, a portability fix, or a change to how something works.
+title: "feat: "
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. This is one person's working setup, so changes that make it more general (a new machine type, a tool that works without another, a portability fix) are the most likely to land; see [CONTRIBUTING.md](https://github.com/coletebou/dx/blob/master/CONTRIBUTING.md). Please search the open and closed issues first.
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part
+      options:
+        - install.sh
+        - shell (zsh, aliases, starship)
+        - git (config, hooks)
+        - tmux
+        - Claude Code setup (rules, settings, hooks, statusline)
+        - session plugin (cc-park, cc-handoff, fresh-session-handoff)
+        - worktrees plugin (wt-helper, pw, stack-branches)
+        - tmux plugin (tmux-archive, tmux-organize)
+        - memory plugin (reflections, dream, session-analyzer)
+        - codex plugin
+        - review plugin
+        - schedules (launchd, systemd)
+        - github-kit
+        - something new
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way today. A concrete example helps more than a solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: How it could work. The commands, configuration or output you would expect to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Workarounds you use now, or other ways it could be solved (a fork, a local override, another tool).
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you open a pull request for it?
+      options:
+        - "Yes"
+        - Maybe, with some guidance
+        - "No"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues and this is not one of them.
+          required: true
+        - label: I removed secrets, tokens, hostnames, IP addresses, personal paths and transcript text from everything above.
+          required: true

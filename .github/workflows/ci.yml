@@ -37,6 +37,24 @@ jobs:
       - name: Lint (ShellCheck, zsh -n, ruff, jq)
         run: bash scripts/tests/lint.sh
 
+  # This repository's workflows, and the GitHub repo kit's with the kit's own actionlint config.
+  # The image digest pins actionlint 1.7.12 and the ShellCheck it runs on every run: block.
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint (.github/workflows)
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+      - name: actionlint (github-kit/workflows)
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color \
+            -config-file github-kit/actionlint.yaml github-kit/workflows/*.yml
+
   secrets:
     runs-on: ubuntu-latest
     steps:

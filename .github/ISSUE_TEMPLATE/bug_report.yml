@@ -1,0 +1,95 @@
+name: Bug report
+description: A script, hook, skill or installer step that does not work the way its docs say.
+title: "bug: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please search the open and closed issues first.
+
+        **A security problem** (a leaked secret, a hook that sends data somewhere, an installer step that destroys files)? Don't open an issue: report it privately, as [SECURITY.md](https://github.com/coletebou/dx/blob/master/SECURITY.md) describes.
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part
+      options:
+        - install.sh
+        - shell (zsh, aliases, starship)
+        - git (config, hooks)
+        - tmux
+        - Claude Code setup (rules, settings, hooks, statusline)
+        - session plugin (cc-park, cc-handoff, fresh-session-handoff)
+        - worktrees plugin (wt-helper, pw, stack-branches)
+        - tmux plugin (tmux-archive, tmux-organize)
+        - memory plugin (reflections, dream, session-analyzer)
+        - codex plugin
+        - review plugin
+        - schedules (launchd, systemd)
+        - github-kit
+        - something else
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, and what went wrong. Paste error messages exactly.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence of steps that shows the problem, from a fresh checkout if you can.
+      placeholder: |
+        1. ./install.sh --with ... --dry-run
+        2.
+        3.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The commit of your checkout (git -C ~/.dotfiles rev-parse --short HEAD).
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - WSL
+        - something else
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Whatever is involved, of bash, zsh, tmux, git, jq, Python, Node, Claude Code or Codex.
+      placeholder: e.g. bash 3.2, tmux 3.5a, Claude Code 2.x
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: What the command printed, or the relevant part of a log. It is formatted as code, so no backticks are needed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues and this is not one of them.
+          required: true
+        - label: I removed secrets, tokens, hostnames, IP addresses, personal paths and transcript text from everything above.
+          required: true
