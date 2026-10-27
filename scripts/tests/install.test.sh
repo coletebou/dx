@@ -101,7 +101,7 @@ equal "git resolves the hooks path under ~/.dotfiles" "$HOME/.dotfiles/base/git/
 # The way git reads it for a commit: all config files, includes followed (--global alone skips them).
 equal "the old git identity was kept" "sam@example.com" "$(cd "$tmp" && git config --get user.email 2>&1)"
 for b in pw pw-append stack-branches stack-claude wt-helper cc-park cc-handoff reflections dream memory-canary \
-    codex-memory-bridge tmux-archive autoreview-pair; do
+    codex-memory-bridge tmux-archive autoreview-pair dotsync dotsync-doctor dotsync-commit-message; do
   [[ -L "$HOME/.local/bin/$b" && -x "$HOME/.local/bin/$b" ]] || bad "~/.local/bin/$b is a working link" "a link" "$(ls -l "$HOME/.local/bin/$b" 2>&1)"
 done
 ok "the CLIs are linked into ~/.local/bin"
@@ -132,12 +132,18 @@ equal "...and its hooks.json" "$root/codex/hooks.json" "$(readlink "$HOME/.codex
 equal "...its config.toml is a copy, not a link" "copy" \
   "$([[ -f "$HOME/.codex/config.toml" && ! -L "$HOME/.codex/config.toml" ]] && cmp -s "$root/codex/config.toml" "$HOME/.codex/config.toml" && echo copy)"
 equal "...in a ~/.codex only you can read" "700" "$(perms "$HOME/.codex")"
+equal "the installed components are recorded" "shell git tmux claude codex session worktrees memory review sync toolbox ghostty vscode brew" \
+  "$(cat "$HOME/.local/state/dx/components" 2>&1)"
 
 echo "idempotent"
 out="$(inst --all)"; rc=$?
 equal "a second run succeeds" 0 "$rc"
 check "...and changes nothing" "Everything was already in place." "$out"
 equal "...nor makes another backup" "1" "$(ls -d "$HOME"/.dotfiles-backup/*/ | wc -l | tr -d ' ')"
+out="$(inst --installed)"; rc=$?
+equal "--installed reruns what this machine installed" 0 "$rc"
+check "...every recorded component" "review sync" "$out"
+check "...changing nothing" "Everything was already in place." "$out"
 
 echo "the shell it sets up"
 if command -v zsh >/dev/null 2>&1; then
@@ -257,6 +263,23 @@ case "$(uname -s)" in
   *)      ok "# SKIP no launchd or systemd" ;;
 esac
 equal "...writing nothing" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
+job=dotsync.timer
+[[ "$(uname -s)" != Darwin ]] || job=com.dotsync
+lacks "...and without sync, no dotsync job" "$job" "$out"
+out="$(inst --with sync,schedules --dry-run)"; rc=$?
+case "$(uname -s)" in
+  Linux)  check "with sync, the dotsync timer is scheduled too" "dotsync.timer" "$out" ;;
+  Darwin) check "with sync, the dotsync agent is loaded too" "would load com.dotsync" "$out" ;;
+  *)      ok "# SKIP no launchd or systemd" ;;
+esac
+
+echo "--installed on a new machine"
+newhome 14
+out="$(inst --installed)"; rc=$?
+equal "with nothing recorded, --installed is refused" 1 "$rc"
+check "...saying how to start" "no components recorded" "$out"
+out="$(inst --with sync --dry-run)"; rc=$?
+equal "a dry run records nothing" "absent" "$([[ -e "$HOME/.local/state/dx/components" ]] && echo present || echo absent)"
 
 echo "the manager overlay"
 newhome 10
