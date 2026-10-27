@@ -31,6 +31,15 @@ name: CI Full On Approval
 # A pull_request run of this PR's head branch that has not created its jobs
 # yet counts as in flight: it waits in the PR's concurrency group while the
 # previous head's run cancels, and an approval often lands in that window.
+#
+# Whose run a run is: GitHub records no triggering PR on a run. Its
+# `pull_requests` are the open PRs whose head matches the run, so a run counts
+# as this PR's only when it is a pull_request run from this repository whose
+# list is exactly this PR. One head branch with open PRs into two bases gives
+# runs that list both PRs: any of them may be the other PR's, so none is
+# rerun and none counts as a pass, and the summary says why. A fork's head
+# gives an empty list (and another head repository), so a fork's run of the
+# same commit, even from a branch of the same name, is never this PR's.
 
 on:
   pull_request_review:
@@ -73,29 +82,42 @@ jobs:
             echo "Branch tip ${tip:0:7} moved past the approved ${HEAD_SHA:0:7}; nothing to rerun." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          # Each run of the head, newest first, is one of:
+          # Each run of the head, newest first, is first placed: "mine" (a
+          # pull_request run from this repository listing exactly this PR),
+          # "shared #A #B" (it lists this PR and others, so it may be any of
+          # theirs) or "other" (a fork's, another PR's, a dispatch, a run GitHub
+          # ties to no open PR). Then it is one of:
           #   inflight  not finished, with FULL_JOB running or still to come
-          #   passed    a run of this PR whose FULL_JOB and whole run passed
-          #   rerun     a finished run of this PR whose full lane failed or was
-          #             cancelled (or that was cancelled before its jobs existed)
-          #   draft     a finished run of this PR with FULL_JOB skipped
-          #   none      anything else: another PR's run of the same commit, or a
-          #             finished dispatched run (never one of the PR's checks)
-          rerun="" draft=0
+          #   passed    this PR's, with FULL_JOB and the whole run passed
+          #   rerun     this PR's and finished, its full lane failed or cancelled
+          #             (or the run cancelled before its jobs existed)
+          #   draft     this PR's and finished, with FULL_JOB skipped
+          #   shared    finished, and possibly another open PR's
+          #   none      anything else, a finished dispatched run among them
+          #             (never one of the PR's checks)
+          rerun="" draft=0 shared=""
           for run_id in $(gh run list --workflow "$WORKFLOW" --commit "$HEAD_SHA" \
             --json databaseId --jq '.[].databaseId'); do
-            # shellcheck disable=SC2016 # $run, $status, $job and $mine are jq variables
-            state="$(gh run view "$run_id" --json status,conclusion,jobs,event,headBranch --jq '
+            # shellcheck disable=SC2016 # $pr and $prs are jq variables
+            owner="$(gh api "repos/${GH_REPO}/actions/runs/${run_id}" --jq '
+              (env.PR_NUMBER | tonumber) as $pr
+              | ([.pull_requests[]?.number] | sort) as $prs
+              | if .event != "pull_request" or (.head_repository.full_name | ascii_downcase) != (env.GH_REPO | ascii_downcase) then "other"
+                elif $prs == [$pr] then "mine"
+                elif ($prs | any(. == $pr)) then "shared " + ($prs | map("#\(.)") | join(" "))
+                else "other" end')"
+            # shellcheck disable=SC2016 # $run, $status and $job are jq variables
+            state="$(OWNER="${owner%% *}" gh run view "$run_id" --json status,conclusion,jobs,event --jq '
               .conclusion as $run
               | .status as $status
-              | (.event == "pull_request" and .headBranch == env.HEAD_REF) as $mine
               | ([.jobs[] | select(.name == env.FULL_JOB)] | first) as $job
               | if $status != "completed" then
                   if $job == null then
-                    if $mine or .event == "workflow_dispatch" or .event == "merge_group" then "inflight" else "none" end
+                    if env.OWNER != "other" or .event == "workflow_dispatch" or .event == "merge_group" then "inflight" else "none" end
                   elif $job.conclusion == "skipped" then "none"
                   else "inflight" end
-                elif ($mine | not) then "none"
+                elif env.OWNER == "shared" then "shared"
+                elif env.OWNER != "mine" then "none"
                 elif $job == null then "rerun"
                 elif $job.conclusion == "skipped" then "draft"
                 elif $job.conclusion == "success" and $run == "success" then "passed"
@@ -106,10 +128,13 @@ jobs:
                 exit 0 ;;
               rerun) [[ -n "$rerun" ]] || rerun="$run_id" ;;
               draft) draft=1 ;;
+              shared) shared="${owner#shared }" ;;
             esac
           done
           if [[ -z "$rerun" ]]; then
-            if [[ "$draft" == 1 ]]; then
+            if [[ -n "$shared" ]]; then
+              echo "\`${HEAD_REF}\` at ${HEAD_SHA:0:7} is the head of more than one open PR (${shared}), and GitHub does not record which PR started a run, so none is rerun. Push a commit, or rerun the right run from the Actions tab." >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$draft" == 1 ]]; then
               echo "PR #${PR_NUMBER}'s only ${WORKFLOW} run of ${HEAD_SHA:0:7} is a draft's fast lane, which a rerun would repeat. Convert the PR to draft and mark it ready for review again to run the full lane." >> "$GITHUB_STEP_SUMMARY"
             else
               echo "PR #${PR_NUMBER} has no ${WORKFLOW} run of ${HEAD_SHA:0:7} to rerun." >> "$GITHUB_STEP_SUMMARY"

@@ -557,7 +557,9 @@ mkdir -p "$tmp/wfbin"
 cat > "$tmp/wfbin/gh" <<'PY'
 #!/usr/bin/env python3
 """A fake gh for workflow steps. $FAKE_RUNS holds {"tip": SHA, "runs": [...]}, newest first, each
-run {databaseId, headSha, status, conclusion, event, headBranch, jobs}. `api .../pulls/N`, `run
+run {databaseId, headSha, status, conclusion, event, headBranch, headRepository, pullRequests,
+jobs}. `api .../pulls/N`, `api .../actions/runs/ID` (the REST run: as on GitHub, its
+pull_requests are the open PRs whose head matches the run, not the PR that started it), `run
 list` and `run view` answer from it (--jq through the real jq); `run rerun` and `workflow run`
 only succeed. Every call's argv goes to $FAKE_GH_LOG as a JSON line."""
 import json
@@ -586,6 +588,12 @@ def answer(value):
     sys.exit(done.returncode)
 
 
+if argv[:1] == ["api"] and "/actions/runs/" in argv[1]:
+    run = next(r for r in data["runs"] if argv[1].endswith("/actions/runs/%s" % r["databaseId"]))
+    answer({"id": run["databaseId"], "event": run["event"], "status": run["status"],
+            "conclusion": run["conclusion"] or None, "head_branch": run["headBranch"], "head_sha": run["headSha"],
+            "head_repository": {"full_name": run["headRepository"]},
+            "pull_requests": [{"number": n} for n in run["pullRequests"]]})
 if argv[:1] == ["api"] and "/pulls/" in argv[1]:
     answer({"head": {"sha": data["tip"]}})
 if argv[:2] == ["run", "list"]:
@@ -621,12 +629,13 @@ runs() {  # runs TIP RUN_JSON...: the fixture, newest run first
   printf '{"tip": "%s", "runs": [%s]}\n' "$tip" "$(IFS=,; printf '%s' "$*")" > "$tmp/runs.json"
 }
 prun() {  # prun ID EVENT BRANCH STATUS CONCLUSION [FULL_STATUS FULL_CONCLUSION]: one run
-  local jobs='[{"name": "fast", "status": "completed", "conclusion": "success"}'
+  # PRS: the numbers GitHub lists in the run's pull_requests (default 7); HREPO: its head repository.
+  local jobs='[{"name": "fast", "status": "completed", "conclusion": "success"}' prs="${PRS-7}"
   if [[ $# -ge 7 ]]; then jobs="$jobs"', {"name": "full", "status": "'"$6"'", "conclusion": "'"$7"'"}]'
   elif [[ "$4" == completed && "$5" == cancelled ]]; then jobs='[]'
   else jobs="$jobs]"; fi
-  printf '{"databaseId": %s, "headSha": "%s", "event": "%s", "headBranch": "%s", "status": "%s", "conclusion": "%s", "jobs": %s}' \
-    "$1" "$head_sha" "$2" "$3" "$4" "$5" "$jobs"
+  printf '{"databaseId": %s, "headSha": "%s", "event": "%s", "headBranch": "%s", "status": "%s", "conclusion": "%s", "headRepository": "%s", "pullRequests": [%s], "jobs": %s}' \
+    "$1" "$head_sha" "$2" "$3" "$4" "$5" "${HREPO:-example/widgets}" "$prs" "$jobs"
 }
 approval="$kit/workflows/ci-full-on-approval.yml"
 approve() { run_step "$approval" "Rerun the PR's full CI lane for the approved head" FULL_JOB=full; }
@@ -650,9 +659,29 @@ if command -v jq >/dev/null 2>&1; then
   approve; rc=$?
   equal "approval: a draft's fast-lane run is not rerun (a rerun keeps its draft payload)" "0 " "$rc $(acts)"
   check "...and the summary says how to get a full run" "mark it ready for review again" "$(cat "$tmp/summary")"
-  runs "$head_sha" "$(prun 25 pull_request other completed failure completed failure)"
+  runs "$head_sha" "$(PRS=9 prun 25 pull_request other completed failure completed failure)"
   approve; rc=$?
   equal "approval: another PR's run of the same commit is not rerun" "0 " "$rc $(acts)"
+  # One head branch with open PRs into two bases (#7 and #8): their runs share the head commit and
+  # branch, and GitHub lists both PRs on each, so no run can be told to be #7's.
+  runs "$head_sha" "$(PRS=7,8 prun 31 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: with two open PRs on one head, a failed run that may be the other's is not rerun" "0 " "$rc $(acts)"
+  check "...and the summary names both PRs" "#7 #8" "$(cat "$tmp/summary")"
+  runs "$head_sha" "$(PRS=7,8 prun 33 pull_request feature completed success completed success)" \
+    "$(PRS=7,8 prun 32 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "...nor does a passing run that may be the other's count as this PR's" "0 " "$rc $(acts)"
+  lacks "...(the summary does not call the head covered)" "already" "$(cat "$tmp/summary")"
+  runs "$head_sha" "$(PRS='' HREPO=someone/widgets prun 34 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: a fork PR's run of the same commit, from a branch of the same name, is not rerun" "0 " "$rc $(acts)"
+  runs "$head_sha" "$(PRS='' prun 35 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: a run GitHub ties to no open PR is not rerun" "0 " "$rc $(acts)"
+  runs "$head_sha" "$(HREPO=Example/Widgets prun 36 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: the head repository's name matches in any case, as GitHub's names do" "0 run rerun 36" "$rc $(acts)"
   runs 2222222222222222222222222222222222222222 "$(prun 26 pull_request feature completed failure completed failure)"
   approve; rc=$?
   equal "approval: nothing is rerun once the tip has moved past the approved head" "0 " "$rc $(acts)"

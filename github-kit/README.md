@@ -145,7 +145,9 @@ show in the Actions tab, but never among the PR's checks, which are its pull_req
 what its required checks are judged on. So a dispatch is a signal (for a draft, or a retargeted
 PR), and a failed or cancelled full lane on a ready PR is repaired by rerunning the PR's own run,
 which keeps that run's commit and event: a run started while the PR was a draft stays a fast
-lane. That workflow keeps this contract:
+lane. GitHub does not record which PR started a run (a run lists every open PR whose head matches
+it), so when one head branch has open PRs into two bases, the approval reruns nothing and says
+why. That workflow keeps this contract:
 
 - it accepts `workflow_dispatch` with the string inputs `pr` (the PR number) and `base` (the PR's
   base branch, the new one after a retarget), which the dispatching workflows set, and does not
