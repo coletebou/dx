@@ -20,7 +20,10 @@
 #   --replace-dotfiles  move an existing ~/.dotfiles that is not this checkout into the backup
 #   --target DIR    github-kit: the git repository whose .github/ gets the kit (github-kit/README.md)
 #   --installed     add the components earlier runs installed on this machine (each real run
-#                   records them in ~/.local/state/dx/components); dotsync reruns this after a pull
+#                   records them in ~/.local/state/dx/components) that are safe to rerun
+#                   unattended; dotsync reruns this after a pull. node-tools (npm ci over the
+#                   network), schedules (loads and enables jobs), github-kit (needs --target) and
+#                   manager (a one-time choice) stay recorded but are left for a run by hand.
 #
 # The shell, hooks and schedules find everything through ~/.dotfiles, so a checkout anywhere
 # else gets ~/.dotfiles linked to it. Re-running is safe: what is already in place is left
@@ -33,8 +36,10 @@ DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review sync toolbox ghostty vscode brew music-video node-tools schedules github-kit manager"
 DEFAULT_ALL="shell git tmux claude codex session worktrees memory review sync toolbox ghostty vscode brew"
 # Which components this machine installed, so `--installed` (what dotsync runs after a pull)
-# reinstalls exactly those.
+# reinstalls those of them that only link and generate files from this checkout: no network,
+# no prompt, no argument, no job loaded.
 RECORD_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/dx/components"
+RERUN_COMPONENTS="shell git tmux claude codex session worktrees memory review sync toolbox ghostty vscode brew music-video"
 
 describe() {
     case "$1" in
@@ -96,10 +101,23 @@ if [ "$LIST" -eq 1 ]; then
 fi
 
 if [ "$INSTALLED" -eq 1 ]; then
-    recorded="$( [ -r "$RECORD_FILE" ] && tr -cs 'a-z-' ',' < "$RECORD_FILE" || true)"
-    [ -n "$(printf '%s' "$recorded" | tr -d ',')" ] \
+    recorded=" $( [ -r "$RECORD_FILE" ] && tr -cs 'a-z-' ' ' < "$RECORD_FILE" || true) "
+    [ -n "$(printf '%s' "$recorded" | tr -d ' ')" ] \
         || die "--installed: no components recorded on this machine yet; run ./install.sh --with <components> once"
-    WITH="$WITH,$recorded"
+    rerun="" left=""
+    for c in $ALL_COMPONENTS; do
+        case "$recorded" in *" $c "*) ;; *) continue ;; esac
+        case " $RERUN_COMPONENTS " in
+            *" $c "*) rerun="$rerun,$c" ;;
+            *) left="$left $c" ;;
+        esac
+    done
+    [ -z "$left" ] || say "  note: not rerun unattended:$left (./install.sh --with <name> reruns one by hand)"
+    if [ -z "$rerun" ] && [ -z "$(printf '%s' "$WITH" | tr -d ',')" ]; then
+        say "--installed: nothing recorded here is rerun unattended"
+        exit 0
+    fi
+    WITH="$WITH$rerun"
 fi
 
 # The components asked for, deduplicated, in the canonical order.

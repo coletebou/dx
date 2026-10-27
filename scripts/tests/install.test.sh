@@ -282,6 +282,25 @@ check "...saying how to start" "no components recorded" "$out"
 out="$(inst --with sync --dry-run)"; rc=$?
 equal "a dry run records nothing" "absent" "$([[ -e "$HOME/.local/state/dx/components" ]] && echo present || echo absent)"
 
+echo "--installed reruns only what is safe unattended"
+newhome 15
+target="$tmp/kit-target"
+git init -q "$target"
+out="$(inst --with github-kit --target "$target")"; rc=$?
+equal "a one-off github-kit install succeeds" 0 "$rc"
+out="$(inst --with node-tools,sync,schedules)"; rc=$?
+equal "...and so do node-tools, sync and schedules" 0 "$rc"
+calls_before="$(wc -l < "$tmp/calls" 2>/dev/null | tr -d ' ')"
+out="$(inst --installed)"; rc=$?
+equal "--installed then succeeds (github-kit would need --target)" 0 "$rc"
+check "...rerunning sync" "[sync]" "$out"
+lacks "...but not github-kit" "[github-kit]" "$out"
+lacks "...nor node-tools (npm ci over the network)" "[node-tools]" "$out"
+lacks "...nor schedules (it loads and enables jobs)" "[schedules]" "$out"
+check "...and saying which it left for a run by hand" "not rerun unattended: node-tools schedules github-kit" "$out"
+equal "...touching no scheduler" "$calls_before" "$(wc -l < "$tmp/calls" 2>/dev/null | tr -d ' ')"
+check "every component stays recorded" "node-tools schedules github-kit" "$(cat "$HOME/.local/state/dx/components")"
+
 echo "the manager overlay"
 newhome 10
 out="$(inst --with manager --dry-run)"; rc=$?

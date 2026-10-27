@@ -291,8 +291,14 @@ Settings come from the environment, else `~/.config/dotsync/config` (literal `KE
 | `DOTSYNC_COMMIT_MESSAGE_*` | provider off | see [Commit messages](#commit-messages) |
 
 `install.sh --installed` reruns the components this machine installed (each real install run
-records them in `~/.local/state/dx/components`). In your own dotfiles repository without that
-installer, set `DOTSYNC_INSTALL_CMD` to whatever applies your config, or `DOTSYNC_NO_INSTALL=1`.
+records them in `~/.local/state/dx/components`) that are safe to rerun unattended, the ones that
+only link and generate files from the checkout: shell, git, tmux, claude, codex, session,
+worktrees, memory, review, sync, toolbox, ghostty, vscode, brew and music-video. It never reruns
+node-tools (npm ci over the network), schedules (it loads and enables jobs), github-kit (it needs
+`--target` and writes into another repository) or manager (a one-time choice): they stay
+recorded, the run names them, and `./install.sh --with <name>` reruns one by hand. In your own
+dotfiles repository without that installer, set `DOTSYNC_INSTALL_CMD` to whatever applies your
+config, or `DOTSYNC_NO_INSTALL=1`.
 
 Logs, in the state directory: `dotsync-timing.log` (each run's phases and durations),
 `last-run.log` (the latest peer or one-line run), `peer-<host>.log`, `install.log`, `fanout.log`,

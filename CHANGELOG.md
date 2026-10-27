@@ -13,7 +13,9 @@
   you or an agent are editing. Hooks (`pre-commit.d`, `post-pull.d`, `post-sync.d`), and
   described commit messages through a command, the Anthropic API or Amazon Bedrock, off by
   default. An hourly timer comes with `--with schedules`.
-- `install.sh --installed` reruns the components a machine installed (each real run records them).
+- `install.sh --installed` reruns the components a machine installed that are safe to rerun
+  unattended (each real run records them; node-tools, schedules, github-kit and manager are left
+  for a run by hand).
 - **codesync** (also in `sync`): every repository under `~/code` committed as WIP, pulled and
   pushed with a guarded force-with-lease, then the same on your other machines; it runs only
   when you run it.
