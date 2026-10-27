@@ -100,9 +100,13 @@ equal "STACK_BRANCHES_BASE picks another base" 0 "$?"
 check "...which the log names" "base: origin/wip-a" "$out"
 G -C "$repo" switch -q master
 G -C "$repo" remote set-head origin -d
+# git 2.48+ fetch re-creates a missing origin/HEAD (followRemoteHEAD defaults to "create");
+# "never" keeps it absent, as on older git. Older git ignores the key.
+G -C "$repo" config remote.origin.followRemoteHEAD never
 out="$(in_repo "$sb" -p pair -n new5 2>&1)"
 equal "without origin/HEAD the run fails" 1 "$?"
 check "...saying how to set it" "git remote set-head origin --auto" "$out"
+G -C "$repo" config --unset remote.origin.followRemoteHEAD
 G -C "$repo" remote set-head origin master
 out="$(in_repo "$sb" -p nope -n new6 2>&1)"
 equal "an unknown profile fails" 1 "$?"

@@ -31,7 +31,9 @@ run() {  # run NAME COMMAND...
     printf 'FAIL  %3ss\n' "$((SECONDS - start))"; failed=$((failed + 1)); failures="$failures $name"
     # Every failing check with its want/got lines (the suites' formats: FAIL, not ok, unittest),
     # then the end of the output.
-    grep -E -A3 '^[[:space:]]*FAIL|^not ok|^(FAIL|ERROR):|^Traceback' "$log" | head -n 80 | sed 's/^/  ! /'
+    grep -E -A3 '^[[:space:]]*FAIL|^not ok|^(FAIL|ERROR):' "$log" | head -n 80 | sed 's/^/  ! /'
+    # Python tracebacks whole, through the exception line.
+    awk '/^Traceback/ { t = 1 } t { print } t && /^[^ \t]/ && !/^Traceback/ { t = 0 }' "$log" | head -n 60 | sed 's/^/  ! /'
     tail -n 25 "$log" | sed 's/^/    /'
   fi
 }
