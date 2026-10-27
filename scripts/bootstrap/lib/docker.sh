@@ -43,19 +43,20 @@ step_nvme_apply() {
     if [ "${BOOTSTRAP_NVME:-0}" != 1 ]; then step_skip off "no --nvme"; return 0; fi
     if [ "${NVME_PRESENT:-0}" != 1 ]; then step_skip none "no instance-store disk here"; return 0; fi
     binds="$NVME_BINDS"
-    [ "${BOOTSTRAP_NVME_CACHE:-1}" != 1 ] || [ "$TARGET_USER" = root ] || binds="$binds $TARGET_HOME/.cache"
+    # The user's cache, as theirs: nvme.sh creates it and its place on the disk owned by them.
+    [ "${BOOTSTRAP_NVME_CACHE:-1}" != 1 ] || [ "$TARGET_USER" = root ] || binds="$binds $TARGET_HOME/.cache:$TARGET_USER"
     out="$(as_root env NVME_MODELS="$NVME_MODELS" NVME_LABEL="$NVME_LABEL" NVME_MOUNT="$NVME_MOUNT" \
         NVME_BINDS="$binds" NVME_SWAP_GB="$NVME_SWAP_GB" bash "$BOOTSTRAP_LIB/nvme.sh" apply --provisioning)"
     bound="$(printf '%s\n' "$out" | sed -n 's/^binds://p' | tail -n 1)"
     bound="${bound# }"
     log "  on the instance store: ${bound:-nothing}"
-    as_root install -m 0755 "$BOOTSTRAP_LIB/nvme.sh" /usr/local/sbin/dx-nvme-setup
-    root_write /etc/default/dx-nvme "$(printf '# Written by dx provision; read by /usr/local/sbin/dx-nvme-setup at boot.\nNVME_MODELS=%q\nNVME_LABEL=%q\nNVME_MOUNT=%q\nNVME_BINDS=%q\nNVME_SWAP_GB=%q\n' \
+    as_root install -D -m 0755 "$BOOTSTRAP_LIB/nvme.sh" "$(sysf /usr/local/sbin/dx-nvme-setup)"
+    root_write "$(sysf /etc/default/dx-nvme)" "$(printf '# Written by dx provision; read by /usr/local/sbin/dx-nvme-setup at boot.\nNVME_MODELS=%q\nNVME_LABEL=%q\nNVME_MOUNT=%q\nNVME_BINDS=%q\nNVME_SWAP_GB=%q\n' \
         "$NVME_MODELS" "$NVME_LABEL" "$NVME_MOUNT" "$bound" "$NVME_SWAP_GB")"
     if has_systemd; then
-        root_write /etc/systemd/system/dx-nvme-setup.service "$(_nvme_unit)"
+        root_write "$(sysf /etc/systemd/system/dx-nvme-setup.service)" "$(_nvme_unit)"
         for unit in docker containerd; do
-            root_write "/etc/systemd/system/$unit.service.d/dx-nvme.conf" "# Written by dx provision: never start on the root disk when the instance store failed.
+            root_write "$(sysf "/etc/systemd/system/$unit.service.d/dx-nvme.conf")" "# Written by dx provision: never start on the root disk when the instance store failed.
 [Unit]
 Requires=dx-nvme-setup.service
 After=dx-nvme-setup.service"

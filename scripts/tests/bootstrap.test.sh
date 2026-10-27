@@ -321,10 +321,11 @@ rm -f "$tmp/stub-calls"
 
 fi
 
-if section nvme "nvme: instance-store detection against a fake /sys, /dev, lsblk and nvme"; then
-fake_nvme_tools() {  # fake lsblk, nvme, blkid, wipefs, mkfs.ext4, mount, swapon, logger in $1/bin
+if section nvme "nvme: instance-store detection against a fake /sys, /dev, mountinfo, lsblk and nvme"; then
+fake_nvme_tools() {  # fake lsblk, nvme, blkid, wipefs, mkfs.ext4, mount, chown, swapon in $1/bin
     local d="$1"
     mkdir -p "$d/bin" "$d/lsblk" "$d/idctrl"
+    : > "$d/mountinfo"
     cat > "$d/bin/lsblk" <<EOF
 #!/bin/sh
 for a in "\$@"; do last="\$a"; done
@@ -341,29 +342,45 @@ EOF
     done
     printf '#!/bin/sh\necho "blkid $*" >> "%s/calls"\nexit "${FAKE_BLKID_RC:-2}"\n' "$d" > "$d/bin/blkid"
     printf '#!/bin/sh\necho "wipefs $*" >> "%s/calls"\nprintf "%%s" "${FAKE_WIPEFS_OUT:-}"\n' "$d" > "$d/bin/wipefs"
+    # mount records what the kernel would: a line of mountinfo, the disk's own mount with root "/",
+    # a bind mount with the directory it came from as its root.
     cat > "$d/bin/mount" <<EOF
 #!/bin/sh
 echo "mount \$*" >> "$d/calls"
 for a in "\$@"; do last="\$a"; done
-echo "\$last" >> "$d/root/mounts"
+if [ "\$1" = --bind ]; then
+    base="$d/root/srv/nvme"
+    devno="\$(awk -v m="\$base" '\$5 == m { print \$3; exit }' "$d/mountinfo")"
+    echo "90 1 \${devno:-0:0} \${2#\$base} \$last rw - ext4 bind rw" >> "$d/mountinfo"
+else
+    devno="\$(cat "$d/sys/block/\$(basename "\$3")/dev")"
+    echo "80 1 \$devno / \$last rw,noatime - ext4 \$3 rw" >> "$d/mountinfo"
+fi
 EOF
     chmod +x "$d"/bin/*
 }
+dn=0
 disk() {  # disk ROOT NAME MODEL SERIAL [LSBLK-JSON]: a fake NVMe disk (MODEL - for no sysfs model)
     local json="${5:-}"
     [ -n "$json" ] || json='{"blockdevices":[{"name":"/dev/'"$2"'","type":"disk","fstype":null,"label":null,"mountpoint":null}]}'
     mkdir -p "$1/sys/block/$2/device" "$1/dev"
     : > "$1/dev/$2"
+    dn=$((dn + 1))
+    printf '259:%s\n' "$dn" > "$1/sys/block/$2/dev"
     if [ "$3" != - ]; then printf '%-40s\n' "$3" > "$1/sys/block/$2/device/model"; fi
     printf '%-20s\n' "$4" > "$1/sys/block/$2/device/serial"
     printf '%s\n' "$json" > "$1/lsblk/$2.json"
+}
+mounted_at() {  # mounted_at ROOT NAME FSROOT WHERE: a mountinfo line for disk NAME
+    printf '70 1 %s %s %s rw - ext4 /dev/%s rw\n' "$(cat "$1/sys/block/$2/dev")" "$3" "$4" "$2" >> "$1/mountinfo"
 }
 IS="Amazon EC2 NVMe Instance Storage" EBS="Amazon Elastic Block Store"
 ebs_root='{"blockdevices":[{"name":"/dev/nvme0n1","type":"disk","fstype":null,"label":null,"mountpoint":null,"children":[{"name":"/dev/nvme0n1p1","type":"part","fstype":"ext4","label":"root","mountpoint":"/"}]}]}'
 nv() {  # nv ROOT CMD: dx-nvme-setup CMD against the fakes under ROOT
     PATH="$1/bin:$PATH" NVME_SYSFS="$1/sys" NVME_DEV="$1/dev" NVME_ROOT="$1/root" NVME_TEST_MODE=1 \
-        NVME_SWAP_GB="${SWAP:-0}" bash "$lib/nvme.sh" "${@:2}" 2>&1
+        NVME_MOUNTINFO="$1/mountinfo" NVME_SWAP_GB="${SWAP:-0}" bash "$lib/nvme.sh" "${@:2}" 2>&1
 }
+sel() { bash -c '. "$1/nvme.sh"; nvme_select' bash "$lib"; }
 newroot() { r="$tmp/nv-$1"; mkdir -p "$r/root"; fake_nvme_tools "$r"; }
 
 newroot none
@@ -390,6 +407,13 @@ check "...probes it directly first" "blkid -p $r/dev/nvme1n1" "$calls"
 check "...mounts it" "mount -o defaults,noatime $r/dev/nvme1n1 $r/root/srv/nvme" "$calls"
 check "...binds Docker's and containerd's data onto it" "mount --bind $r/root/srv/nvme/binds/var_lib_docker $r/root/var/lib/docker" "$calls"
 check "...and reports what it bound" "binds: /var/lib/docker /var/lib/containerd" "$out"
+check "afterwards it is the disk mounted where it belongs, its bind mounts and all" \
+    "$r/dev/nvme1n1	AWSB1	mounted:/srv/nvme" "$(nv "$r" detect)"
+rm -f "$r/calls"
+out="$(nv "$r" apply --provisioning)"; rc=$?
+equal "so a second apply (another provision run, a restarted unit) succeeds" 0 "$rc"
+lacks "...formatting nothing" "mkfs" "$(cat "$r/calls" 2>/dev/null)"
+check "...and finding the binds in place" "/var/lib/docker is already a mount point" "$out"
 
 newroot several
 disk "$r" nvme0n1 "$EBS" vol0aaa "$ebs_root"
@@ -406,24 +430,33 @@ check "...the model read from nvme id-ctrl when sysfs has none" "$r/dev/nvme4n1	
 check "...another filesystem is in use" "$r/dev/nvme3n1	AWSC	in-use:xfs" "$out"
 check "...a partitioned disk is too" "$r/dev/nvme5n1	AWSE	partitioned" "$out"
 lacks "...and a hidden multipath path is not a disk" "nvme1c1n1" "$out"
-equal "...the lowest serial of the blank ones is chosen" "$r/dev/nvme2n1 format" "$(printf '%s\n' "$out" | bash -c '. "$1/nvme.sh"; nvme_select' bash "$lib")"
+equal "...the lowest serial of the blank ones is chosen" "$r/dev/nvme2n1 format" "$(printf '%s\n' "$out" | sel)"
 check "...and the rest are left alone" "nvme1n1 serial=AWSB state=blank (left alone)" "$(nv "$r" report)"
 
 newroot mounted
-disk "$r" nvme1n1 "$IS" AWSA '{"blockdevices":[{"name":"/dev/nvme1n1","type":"disk","fstype":"ext4","label":"data","mountpoint":"/data"}]}'
-disk "$r" nvme2n1 "$IS" AWSB '{"blockdevices":[{"name":"/dev/nvme2n1","type":"disk","fstype":"ext4","label":"dx-nvme","mountpoint":"/srv/nvme"}]}'
+disk "$r" nvme1n1 "$IS" AWSA
+disk "$r" nvme2n1 "$IS" AWSB
 disk "$r" nvme3n1 "$IS" AWSC '{"blockdevices":[{"name":"/dev/nvme3n1","type":"disk","fstype":"ext4","label":"dx-nvme","mountpoint":null}]}'
 disk "$r" nvme4n1 "$IS" AWSD
+mounted_at "$r" nvme1n1 / /data
+# nvme2n1 is this tool's disk after a provision: mounted at /srv/nvme, with bind mounts made from
+# it after that. lsblk's one MOUNTPOINT names a bind target there, as the real lsblk does.
+mounted_at "$r" nvme2n1 / "$r/root/srv/nvme"
+mounted_at "$r" nvme2n1 /binds/var_lib_docker "$r/root/var/lib/docker"
+mounted_at "$r" nvme2n1 /binds/var_lib_containerd "$r/root/var/lib/containerd"
+printf '%s\n' '{"blockdevices":[{"name":"/dev/nvme2n1","type":"disk","fstype":"ext4","label":"dx-nvme","mountpoint":"'"$r"'/root/var/lib/containerd"}]}' > "$r/lsblk/nvme2n1.json"
 out="$(nv "$r" detect)"
 check "already mounted elsewhere: in use there" "$r/dev/nvme1n1	AWSA	mounted:/data" "$out"
-check "already mounted where it belongs" "$r/dev/nvme2n1	AWSB	mounted:/srv/nvme" "$out"
-equal "...is the one used, as it is (no format)" "$r/dev/nvme2n1 use" "$(printf '%s\n' "$out" | bash -c '. "$1/nvme.sh"; nvme_select' bash "$lib")"
+check "mounted where it belongs, with bind mounts made from it" "$r/dev/nvme2n1	AWSB	mounted:/srv/nvme" "$out"
+equal "...is the one used, as it is (no format)" "$r/dev/nvme2n1 use" "$(printf '%s\n' "$out" | sel)"
 equal "without it, this tool's own filesystem comes before a blank disk" "$r/dev/nvme3n1 mount" \
-    "$(printf '%s\n' "$out" | grep -v nvme2n1 | bash -c '. "$1/nvme.sh"; nvme_select' bash "$lib")"
-equal "a disk mounted elsewhere is never chosen" "" \
-    "$(printf '%s\n' "$out" | grep nvme1n1 | bash -c '. "$1/nvme.sh"; nvme_select' bash "$lib")"
-out="$(nv "$r" apply --provisioning)"
-lacks "using a mounted disk formats nothing" "mkfs" "$(cat "$r/calls" 2>/dev/null)"
+    "$(printf '%s\n' "$out" | grep -v nvme2n1 | sel)"
+equal "a disk mounted elsewhere is never chosen" "" "$(printf '%s\n' "$out" | grep nvme1n1 | sel)"
+out="$(nv "$r" apply --provisioning)"; rc=$?
+equal "apply on the provisioned disk succeeds" 0 "$rc"
+lacks "...and formats nothing" "mkfs" "$(cat "$r/calls" 2>/dev/null)"
+: > "$r/mountinfo"; mounted_at "$r" nvme1n1 /binds/x "$r/root/var/lib/docker"
+check "a disk only bind-mounted somewhere is in use there" "$r/dev/nvme1n1	AWSA	mounted:$r/root/var/lib/docker" "$(nv "$r" detect)"
 
 newroot signature
 disk "$r" nvme1n1 "$IS" AWSA
@@ -440,10 +473,41 @@ mkdir -p "$r/root/var/lib/docker" && echo old > "$r/root/var/lib/docker/state"
 out="$(nv "$r" apply --provisioning)"
 check "while provisioning, a target that holds data is left where it is" "binds: /var/lib/containerd" "$out"
 check "...saying so" "already has data on the root disk" "$out"
-rm -f "$r/calls" "$r/root/mounts"
+rm -f "$r/calls" && : > "$r/mountinfo"            # a reboot: nothing mounted
 out="$(nv "$r" apply)"
 check "at boot it is bound anyway (hidden, not deleted)" "binds: /var/lib/docker /var/lib/containerd" "$out"
 equal "...and its data is still on the root disk" old "$(cat "$r/root/var/lib/docker/state")"
+
+newroot cache
+disk "$r" nvme1n1 "$IS" AWSA
+mkdir -p "$r/root/home/sam"
+out="$(NVME_BINDS="/var/lib/docker /home/sam/.cache:sam" nv "$r" apply --provisioning)"; rc=$?
+calls="$(cat "$r/calls" 2>/dev/null)"
+equal "a per-user cache binds" 0 "$rc"
+check "...a missing cache is created as the user's" "chown sam: $r/root/home/sam/.cache" "$calls"
+check "...and so is its place on the disk, which the bind shows in their home" \
+    "chown sam: $r/root/srv/nvme/binds/home_sam_.cache" "$calls"
+check "...and the owner stays on record for the boot unit" "binds: /var/lib/docker /home/sam/.cache:sam" "$out"
+rm -rf "$r/calls" "$r/root/srv/nvme/binds/home_sam_.cache" && : > "$r/mountinfo"   # a stop and start
+out="$(NVME_BINDS="/var/lib/docker /home/sam/.cache:sam" nv "$r" apply)"
+check "after a stop and start the new place on the disk is the user's again" \
+    "chown sam: $r/root/srv/nvme/binds/home_sam_.cache" "$(cat "$r/calls" 2>/dev/null)"
+lacks "...and a system directory's place is never given to a user" "chown sam: $r/root/srv/nvme/binds/var_lib_docker" "$(cat "$r/calls" 2>/dev/null)"
+
+# step_nvme_apply as provision runs it, as a root that writes under a scratch root.
+newroot provision
+disk "$r" nvme1n1 "$IS" AWSA
+mkdir -p "$r/root/home/sam" "$r/sys-root"
+out="$(cd "$tmp/harness" && PATH="$r/bin:$PATH" NVME_SYSFS="$r/sys" NVME_DEV="$r/dev" NVME_ROOT="$r/root" \
+    NVME_TEST_MODE=1 NVME_MOUNTINFO="$r/mountinfo" NVME_SWAP_GB=0 bash -c '
+    set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"; . "$1/nvme.sh"; . "$1/docker.sh"
+    as_root() { "$@"; }; has_systemd() { return 1; }
+    BOOTSTRAP_SYSROOT="$2" BOOTSTRAP_LIB="$1" BOOTSTRAP_NVME=1 NVME_PRESENT=1 TARGET_USER=sam TARGET_HOME=/home/sam
+    run_step nvme.apply step_nvme_apply' bash "$lib" "$r/sys-root" 2>&1)"; rc=$?
+equal "--nvme as provision runs it succeeds" 0 "$rc"
+check "...giving the user's cache to the user" "chown sam: $r/root/home/sam/.cache" "$(cat "$r/calls" 2>/dev/null)"
+check "...and recording it, with its owner, for the boot unit" '/home/sam/.cache:sam' "$(cat "$r/sys-root/etc/default/dx-nvme" 2>&1)"
+equal "...which it installs" yes "$( [ -x "$r/sys-root/usr/local/sbin/dx-nvme-setup" ] && echo yes)"
 
 newroot unusable
 disk "$r" nvme1n1 "$IS" AWSA '{"blockdevices":[{"name":"/dev/nvme1n1","type":"disk","fstype":"xfs","label":null,"mountpoint":null}]}'
@@ -460,6 +524,65 @@ disk "$r" nvme1n1 "Local NVMe SSD" S1
 equal "another cloud's model string counts only when NVME_MODELS names it" "" "$(nv "$r" detect)"
 check "...and then it does" "$r/dev/nvme1n1	S1	blank" "$(NVME_MODELS="Other|Local NVMe SSD" nv "$r" detect)"
 
+fi
+
+if section aptkey "apt signing keys: only the pinned key, and nothing but it, is installed"; then
+if command -v gpg >/dev/null 2>&1; then
+    g="$tmp/gpg"
+    mkdir -p "$g/home" "$g/served" "$g/bin"
+    chmod 700 "$g/home"
+    genkey() {  # genkey UID: a throwaway signing key; prints its fingerprint
+        GNUPGHOME="$g/home" gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key "$1" ed25519 sign never 2>/dev/null
+        GNUPGHOME="$g/home" gpg --batch --with-colons --list-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }'
+    }
+    A="$(genkey 'dx test signer <signer@example.invalid>')"
+    B="$(genkey 'dx test intruder <intruder@example.invalid>')"
+    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" > "$g/served/genuine.asc"
+    GNUPGHOME="$g/home" gpg --batch --export "$A" > "$g/served/genuine.gpg"
+    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" "$B" > "$g/served/bundle.asc"
+    GNUPGHOME="$g/home" gpg --batch --export "$B" "$A" > "$g/served/bundle.gpg"
+    GNUPGHOME="$g/home" gpg --batch --armor --export "$B" > "$g/served/other.asc"
+    gpgconf --homedir "$g/home" --kill all 2>/dev/null || true
+    # curl, faked: serves $g/served/<the URL's file name> to -o.
+    cat > "$g/bin/curl" <<EOF
+#!/bin/sh
+out="" last=""
+while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; *) last="\$1"; shift ;; esac; done
+cp "$g/served/\$(basename "\$last")" "\$out"
+EOF
+    chmod +x "$g/bin/curl"
+    keyrun() {  # keyrun FILE FPR: apt_repo_key for a served FILE, root writing under a scratch root
+        (cd "$tmp/harness" && PATH="$g/bin:$PATH" bash -c 'set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"
+            as_root() { "$@"; }; BOOTSTRAP_SYSROOT="$2"; trap cleanup_run EXIT
+            apt_repo_key test "https://example.invalid/keys/$3" "$4"' bash "$lib" "$g/root-$1" "$1" "$2" 2>&1)
+    }
+    fprs_in() {  # the primary fingerprints in a key file, space-separated
+        local h
+        h="$(mktemp -d)"
+        GNUPGHOME="$h" gpg --batch --with-colons --show-keys "$1" 2>/dev/null \
+            | awk -F: '$1 == "pub" { p = 1; next } $1 == "fpr" && p { print $10; p = 0 }' | tr '\n' ' ' | sed 's/ $//'
+        rm -rf "$h"
+    }
+    equal "two different throwaway keys were made" yes "$( [ -n "$A" ] && [ -n "$B" ] && [ "$A" != "$B" ] && echo yes)"
+    out="$(keyrun genuine.asc "$A")"; rc=$?
+    equal "the pinned key alone is accepted" 0 "$rc"
+    equal "...and its keyring path printed for signed-by" /etc/apt/keyrings/test.gpg "$(printf '%s\n' "$out" | tail -n 1)"
+    equal "...holding exactly the pinned key" "$A" "$(fprs_in "$g/root-genuine.asc/etc/apt/keyrings/test.gpg")"
+    out="$(keyrun genuine.gpg "$A")"; rc=$?
+    equal "...armored or binary" "0 $A" "$rc $(fprs_in "$g/root-genuine.gpg/etc/apt/keyrings/test.gpg")"
+    for bundle in bundle.asc bundle.gpg; do
+        out="$(keyrun "$bundle" "$A")"; rc=$?
+        equal "a download holding the pinned key and another one ($bundle) is refused" 1 "$rc"
+        check "...as not exactly the pinned key" "is not exactly the pinned key $A" "$out"
+        equal "...and no keyring is installed" "" "$(ls "$g/root-$bundle/etc/apt/keyrings" 2>/dev/null)"
+    done
+    out="$(keyrun other.asc "$A")"; rc=$?
+    equal "a different key alone is refused" 1 "$rc"
+    equal "...and installs nothing" "" "$(ls "$g/root-other.asc/etc/apt/keyrings" 2>/dev/null)"
+else
+    ok "# SKIP no gpg here"
+fi
 fi
 
 if section aptkey "apt signing keys: only the pinned key, and nothing but it, is installed"; then
