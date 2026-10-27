@@ -81,7 +81,7 @@ An index that outgrows that loses its newest entries without a word. `memory-can
 | Check | A problem (exit 1) when |
 |---|---|
 | capacity | the index is over 200 lines or 25,000 characters, counted as Claude Code counts them (trimmed); from 90% it warns |
-| index links | a `](file.md)` link in the index names a file that is not there |
+| index links | a `](file.md)` link in the index names a file of the memory dir that is not there (URLs, anchors and paths leaving the dir are not checked) |
 | case | two file names differ only in case (one file on macOS, two on Linux), or a `memory.md` / `dreams.md` variant exists |
 | conflict markers | a file holds `<<<<<<<` and `>>>>>>>` lines, as a sync whose autostash conflicted leaves them (git exits 0 there) |
 | wiki-links | a `[[name]]` names no file and no `name:` field (both `-` and `_` spellings count): a warning, a problem only above the home's baseline |

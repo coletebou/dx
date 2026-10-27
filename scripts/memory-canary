@@ -21,9 +21,10 @@
 #      the way the CLI computes them (strip, then split on "\n"), NOT with `wc -l`.
 #      `wc -l` counts newline-terminated lines and disagrees by one, which matters
 #      at a hard boundary.
-#   2. DANGLING LINKS — every `](target.md)` in the index must resolve on disk.
-#      A promotion writer that appends an index line for a file it did not write
-#      introduces one, and Claude Code says nothing.
+#   2. DANGLING LINKS — every `](target.md)` in the index that names a file in the
+#      memory dir must resolve on disk (URLs, anchors and paths leaving the dir are
+#      not checked). A promotion writer that appends an index line for a file it
+#      did not write introduces one, and Claude Code says nothing.
 #   3. CASE COLLISIONS — Linux filesystems are usually case-SENSITIVE and macOS's
 #      default APFS volume is case-INSENSITIVE. `MEMORY.md` and `memory.md` are two
 #      files on one and the same file on the other, so a case-variant name that
@@ -88,7 +89,7 @@ while [ $# -gt 0 ]; do
       fi
       EXPLICIT_DIR="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,65p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "memory-canary: unknown option $1" >&2; exit 2 ;;
   esac
@@ -193,7 +194,7 @@ fi
 # every bash.
 check_memory_dir() {
   python3 - <<'PY'
-import os, re, sys, json, collections, io, itertools
+import os, re, sys, json, collections, io, itertools, urllib.parse
 
 d          = os.environ['CANARY_DIR']
 CAP_LINES  = int(os.environ['CAP_LINES'])
@@ -231,13 +232,28 @@ else:
     elif idx_bytes >= WARN_BYTES:
         warnings.append(f'MEMORY.md approaching byte cap: {idx_bytes}/{CAP_BYTES} ({CAP_BYTES-idx_bytes} left)')
 
-    # 2. DANGLING LINKS. Every link target in the index must exist. Strip a leading
-    # './' because merge tools and promotion writers may emit that form.
-    targets = [t.lstrip('./') for t in re.findall(r'\]\(([^)]+\.md)\)', raw)]
-    dangling = sorted({t for t in targets if not os.path.exists(os.path.join(d, t))})
+    # 2. DANGLING LINKS. Every link in the index to a file in the memory dir must
+    # exist. A URL (any `scheme:`, or `//host`), a mail link or an anchor names no file
+    # here; nor does a path that leaves the dir (`../x.md`, `/abs/x.md`), which a copy
+    # of the dir (pre-push-memory checks one) cannot resolve either. Those are not
+    # checked: reporting them dangling would block every push of the home. A leading
+    # './' is dropped (merge tools and promotion writers emit it), and a
+    # percent-encoded name (`my%20note.md`) counts in either spelling.
+    local, outside = [], 0
+    for t in re.findall(r'\]\(([^)]+\.md)\)', raw):
+        while t.startswith('./'):
+            t = t[2:]
+        if re.match(r'(?:[A-Za-z][A-Za-z0-9+.-]*:|//|#)', t) or os.path.isabs(t) \
+                or os.path.normpath(t).split(os.sep)[0] == '..':
+            outside += 1
+        else:
+            local.append(t)
+    dangling = sorted({t for t in local
+                       if not any(os.path.exists(os.path.join(d, s)) for s in (t, urllib.parse.unquote(t)))})
     if dangling:
         problems.append(f'{len(dangling)} DANGLING link(s): ' + ', '.join(dangling[:6]) + ('…' if len(dangling) > 6 else ''))
-    info.append(f'{len(targets)} link(s), {len(set(targets))} unique, {len(dangling)} dangling')
+    info.append(f'{len(local)} link(s), {len(set(local))} unique, {len(dangling)} dangling'
+                + (f', {outside} not checked (URLs, anchors, outside this dir)' if outside else ''))
 
     # 4. CONFLICT MARKERS in the index (see header: an autostash conflict exits 0).
     if re.search(r'^<<<<<<< ', raw, re.M) and re.search(r'^>>>>>>> ', raw, re.M):

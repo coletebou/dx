@@ -131,6 +131,18 @@ class MemoryGateTest(unittest.TestCase):
         self.write('memory/test/MEMORY.md', '# Healthy')
         self.assertNotEqual(self.check(tip), 0)
 
+    def test_external_links_in_a_committed_index_do_not_block(self):
+        # URLs, anchors and links that leave the home name no file of the committed home.
+        self.write('memory/test/local.md', 'here')
+        tip = self.setup_memory('- [guide](https://example.com/guide.md)\n- [mail](mailto:team@example.invalid?subject=notes.md)\n'
+                                '- [up](../outside.md)\n- [local](local.md)\n')
+        result = self.gate(tip)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.write('memory/test/MEMORY.md', '- [guide](https://example.com/guide.md)\n- [gone](gone.md)\n')
+        result = self.gate(self.commit(), tip)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('1 DANGLING link(s): gone.md', result.stdout)
+
     def test_unrelated_change_ignores_existing_failure(self):
         old = self.setup_memory('[broken](absent.md)')
         self.write('README.md', 'unrelated')

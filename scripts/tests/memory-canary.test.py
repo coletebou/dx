@@ -94,6 +94,37 @@ class CanaryTest(unittest.TestCase):
         (d / 'gone.md').write_text('back')
         self.assertEqual(self.check(d, '--strict').returncode, 0)
 
+    def test_external_links_are_not_local_files(self):
+        # A URL, a mail link or an anchor names no file in the memory dir: never a dangling link
+        # (pre-push-memory runs --strict, so one would block every push of that home).
+        index = ('- [guide](https://example.com/guide.md)\n- [mirror](HTTP://example.com/a/b.md)\n'
+                 '- [cdn](//cdn.example.com/c.md)\n- [mail](mailto:team@example.invalid?subject=notes.md)\n'
+                 '- [file](file:///srv/d.md)\n- [anchor](#notes.md)\n- [local](local.md)\n')
+        d = self.memory(index=index, files={'local.md': 'here', 'topic.md': 'see [[https://example.com/x.md]]\n'})
+        r = self.check(d, '--strict')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('1 link(s), 1 unique, 0 dangling', r.stdout)
+        self.assertNotIn('wiki-link', r.stdout)  # a URL is never a wiki-link target either
+        (d / 'local.md').unlink()
+        r = self.check(d)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('1 DANGLING link(s): local.md', r.stdout)
+
+    def test_relative_links_resolve_inside_the_memory_dir(self):
+        index = ('- [here](./././a.md)\n- [nested](topics/b.md)\n- [spaced](my%20note.md)\n'
+                 '- [up](../shared.md)\n- [elsewhere](/srv/elsewhere.md)\n- [back](topics/../../out.md)\n')
+        d = self.memory(index=index, files={'a.md': 'a', 'my note.md': 'spaced'})
+        (d / 'topics').mkdir()
+        (d / 'topics/b.md').write_text('b')
+        r = self.check(d, '--strict')
+        # Links that leave the dir cannot be checked from a copy of it (the pre-push gate's).
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('3 link(s), 3 unique, 0 dangling, 3 not checked', r.stdout)
+        (d / 'topics/b.md').unlink()
+        r = self.check(d)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('1 DANGLING link(s): topics/b.md', r.stdout)
+
     def test_case_variants(self):
         d = self.memory(files={'Dreams.md': 'diary'})
         r = self.check(d)
@@ -294,6 +325,7 @@ class CanaryTest(unittest.TestCase):
         self.assertIn('first 200 lines', r.stdout)
         self.assertIn('25,000 characters', r.stdout)
         self.assertIn('memory-canary --dir <path>', r.stdout)
+        self.assertIn('memory-canary --json', r.stdout)  # the whole header, through its last line
 
     def test_every_bash_here_parses_it(self):
         # macOS /bin/bash is 3.2, which once could not parse this script at all.
