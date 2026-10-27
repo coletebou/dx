@@ -220,6 +220,17 @@ equal "...and no setting that names it as a formatter" "0" \
 equal "the extension list recommends no Prettier" "" "$(jq -r '.recommendations[] | select(test("prettier"; "i"))' "$root/vscode/extensions.json")"
 equal "every Brewfile entry is a tap, brew or cask of a quoted name" "" \
   "$(grep -v -E '^[[:space:]]*(#|$)' "$root/Brewfile" | grep -v -E '^(tap|brew|cask) "[A-Za-z0-9@._/+-]+"( +#.*)?$')"
+# Ghostty's selection-word-chars lists the characters that END a word (its config reference), so a
+# path, URL or branch name selects whole only if none of its characters is listed.
+word_ends="$(python3 - "$root/ghostty/config" <<'EOF' 2>&1
+import re, sys
+m = re.search(r'^selection-word-chars\s*=\s*"((?:\\.|[^"\\])*)"\s*$', open(sys.argv[1]).read(), re.M)
+print(m and re.sub(r"\\(.)", lambda e: "\t" if e[1] == "t" else e[1], m[1]))
+EOF
+)"
+equal "Ghostty's word boundaries keep path and URL characters inside a word" "" \
+  "$(printf '%s' "$word_ends" | tr -dc '/._~@:?&=%+#-')"
+check "...and still end a word at a space" " " "$word_ends"
 
 echo "music-video"
 out="$(inst --with music-video)"; rc=$?

@@ -24,10 +24,12 @@ macos-option-as-alt = left
 # the way `tail -f` keeps scrolling. Off here: uncomment to enable.
 #scroll-to-bottom = output
 
-# (1.3.0) Extend double-click word selection to path and URL characters, so
-# clicking "feat/my-branch-name" grabs the whole identifier. The default stops
-# at -, _, /, ., and so on. Tune to taste.
-selection-word-chars = "-_./:@~?&=%+#"
+# (1.3.0) The characters that END a double-click word selection. The default,
+# "\t '\"│`|:;,()[]{}<>$", already keeps / - _ . inside a word, so a path or
+# "feat/my-branch-name" selects whole; this drops ":" from it as well, so a
+# URL or host:port does too. Tune to taste: every character listed is a
+# boundary.
+selection-word-chars = "\t '\"│`|;,()[]{}<>$"
 
 # --- Splits & windows ---
 
