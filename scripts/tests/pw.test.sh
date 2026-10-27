@@ -141,8 +141,10 @@ check "teardown with the same lever finds it" "Removing worktree $prepo/.claude/
 echo "PW_BOOTSTRAP_HOOK runs in each new worktree"
 setting "$tmp/ext"
 manifest hook iota
+# The hook prints its physical cwd: $PWD keeps the path pw entered by, and a temp dir's path
+# can run through a symlink (/var is /private/var on macOS).
 # shellcheck disable=SC2016  # expanded by the hook's own shell, not here
-out="$(in_repo PW_BOOTSTRAP_HOOK='printf "%s|%s|%s\n" "$PW_TAG" "$PWD" "$PW_SOURCE_REPO" > hook-ran' \
+out="$(in_repo PW_BOOTSTRAP_HOOK='printf "%s|%s|%s\n" "$PW_TAG" "$(pwd -P)" "$PW_SOURCE_REPO" > hook-ran' \
   "$pw" launch "$tmp/hook.tsv" 2>&1)"
 equal "a bootstrapped launch succeeds" 0 "$?"
 equal "the hook ran in the worktree, with its tag and the source repo" \
@@ -255,7 +257,11 @@ import time
 print("\u2500" * 40 + "\n\u276f \n" + "\u2500" * 40 + "\n  bypass permissions on (shift+tab to cycle)", flush=True)
 time.sleep(600)
 EOF
-fake_tui="exec bash -c 'exec -a claude python3 $tmp/fake_claude_tui.py'"
+# shellcheck source=lib/stand-in.sh
+. "$root/scripts/tests/lib/stand-in.sh"
+# A stand-in named claude, so tmux reports "claude" on Linux and macOS alike.
+stand_in_build "$tmp/standin" claude || { echo "could not build the claude stand-in" >&2; exit 1; }
+fake_tui="exec $tmp/standin/claude python3 $tmp/fake_claude_tui.py"
 tmux new-session -d -s bcast -n agents "$fake_tui"
 tmux split-window -t "=bcast:agents" "$fake_tui"
 for p in $(tmux list-panes -t "=bcast:agents" -F '#{pane_id}'); do until_banner "$p" "bypass permissions on"; done
