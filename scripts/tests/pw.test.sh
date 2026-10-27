@@ -64,10 +64,11 @@ printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexit 0\n' "'$calls'" > "$tmp/bin/
 chmod +x "$tmp/bin/claude"
 export PATH="$tmp/bin:$PATH" PW_ENGINE=claude PW_CLAUDE_CMD="$tmp/bin/claude"
 unset PW_CODEX_MODEL PW_CODEX_EFFORT PW_CODEX_SANDBOX
-# stub_runs N: how many times the fake claude has run, after waiting (10 s at most) for N.
+# stub_runs N: how many times the fake claude has run, after waiting (30 s at most: a loaded
+# CI runner, macOS's above all, can take that long to start a window's login shell) for N.
 stub_runs() {
   local i n=0
-  for ((i = 0; i < 50; i++)); do
+  for ((i = 0; i < 150; i++)); do
     n="$(cat "$calls" 2>/dev/null | wc -l | tr -d ' ')"
     [[ "$n" -ge "$1" ]] && break
     sleep 0.2
@@ -110,6 +111,7 @@ equal "the agent window opens there" "$(cd "$tmp/ext/proj-alpha" && pwd -P)" \
   "$(cd "$(tmux display-message -p -t "=proj-parallel:alpha" '#{pane_current_path}')" && pwd -P)"
 equal "nothing lands inside the repo" "absent" "$([[ -e "$repo/.claude/worktrees" ]] && echo present || echo absent)"
 equal "the agent window runs the fake claude" 1 "$(stub_runs 1)"
+[[ -s "$calls" ]] || tmux capture-pane -p -t "=proj-parallel:alpha" 2>&1 | sed '/^[[:space:]]*$/d; s/^/         | /' | tail -n 12
 check "...with the session id launch recorded" "--session-id $(awk '/^#   session_id=/ { sub(/^#   session_id=/, ""); print; exit }' "$(cat "$tmp/one.tsv.log-path")")" "$(cat "$calls")"
 
 out="$(in_repo "$pw" teardown "$tmp/one.tsv" 2>&1)"

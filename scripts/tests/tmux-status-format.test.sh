@@ -65,7 +65,10 @@ tmux -L outer -f /dev/null new-session -d -x 156 -y 38 'env -u TMUX TERM=xterm-2
 for i in $(seq 1 50); do [[ -n "$(tmux list-clients)" ]] && break; sleep 0.1; done
 tmux choose-tree -w -t "$pane" -F '#{E:@tree-fmt}' \; send-keys -t "$pane" Up
 for i in $(seq 1 50); do  # the client draws the mode on its next redraw
-  row=$(tmux -L outer capture-pane -p -e | grep -m1 '0: ')
+  # The row by its text, then the same line with its escapes: tmux 3.8 puts SGR codes inside
+  # "0: ", so the escaped capture cannot be searched for it.
+  n=$(tmux -L outer capture-pane -p | grep -n -m1 '0: sleep' | cut -d: -f1)
+  row=""; [[ -n "$n" ]] && row=$(tmux -L outer capture-pane -p -e | sed -n "${n}p")
   grep -q $'\e\[38;5;178msleep' <<<"$row" && break
   sleep 0.1
 done
