@@ -146,8 +146,8 @@ const MEDIA_PATTERNS = [
   /(https?:\/\/(?:www\.)?loom\.com\/share\/[^\s)<>"']+)/gi,
 ];
 const URL_PATTERN = /https?:\/\/[^\s)<>"'`]+/g;
-const FENCED_BLOCK = /```[^\n]*\n([\s\S]*?)```/g;
-const EVIDENCE_HEADING = /^(#{2,4})\s*(evidence|proof)\b.*$/im;
+const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const EVIDENCE_HEADING = /^(#{2,4})\s*(evidence|proof)\b/i;
 
 export function stripComments(text) {
   return (text ?? '').replace(/<!--[\s\S]*?-->/g, '');
@@ -166,23 +166,55 @@ export function findMedia(text) {
   return [...found];
 }
 
-/** The body of a `## Evidence` or `## Proof` section, up to the next heading of the same or higher level. */
+/**
+ * The lines of a Markdown text, each marked as a code block fence (``` or ~~~),
+ * code inside a fenced block, or neither. A `#` line in a code block (a shell
+ * comment, a root prompt) is code, never a heading. An unclosed fence runs to
+ * the end, as in CommonMark.
+ */
+function markdownLines(text) {
+  const lines = [];
+  let open = null;
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(FENCE);
+    if (open) {
+      // A closing fence: the opening one's character, at least as long, nothing after it.
+      const closes = Boolean(match) && match[1][0] === open[0] && match[1].length >= open.length && !match[2].trim();
+      lines.push({ line, fence: closes, code: !closes });
+      if (closes) open = null;
+    } else if (match && !(match[1][0] === '`' && match[2].includes('`'))) {
+      open = match[1];
+      lines.push({ line, fence: true, code: false });
+    } else {
+      lines.push({ line, fence: false, code: false });
+    }
+  }
+  return lines;
+}
+
+/**
+ * The body of a `## Evidence` or `## Proof` section, up to the next heading of
+ * the same or higher level. Headings are looked for outside code blocks only.
+ */
 export function evidenceSection(text) {
-  const clean = stripComments(text);
-  const heading = clean.match(EVIDENCE_HEADING);
-  if (!heading) return '';
-  const level = heading[1].length;
-  const rest = clean.slice(heading.index + heading[0].length);
-  const next = rest.search(new RegExp(`^#{1,${level}}\\s`, 'm'));
-  return next === -1 ? rest : rest.slice(0, next);
+  const lines = markdownLines(stripComments(text));
+  const prose = (l) => !l.fence && !l.code;
+  const start = lines.findIndex((l) => prose(l) && EVIDENCE_HEADING.test(l.line));
+  if (start === -1) return '';
+  const level = lines[start].line.match(EVIDENCE_HEADING)[1].length;
+  const next = new RegExp(`^#{1,${level}}(\\s|$)`);
+  const body = [];
+  for (const l of lines.slice(start + 1)) {
+    if (prose(l) && next.test(l.line)) break;
+    body.push(l.line);
+  }
+  return body.join('\n');
 }
 
 /** Evidence of a real run: output in a code block, a recording or screenshot, or a link. Prose alone is not. */
 export function hasRunEvidence(section) {
   if (!section.trim()) return false;
-  for (const match of section.matchAll(FENCED_BLOCK)) {
-    if (match[1].trim()) return true;
-  }
+  if (markdownLines(section).some((l) => l.code && l.line.trim())) return true;
   if (findMedia(section).length > 0) return true;
   return [...section.matchAll(URL_PATTERN)].some((match) => !SERVICE_MEDIA.test(match[0]));
 }

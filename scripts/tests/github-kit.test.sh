@@ -492,6 +492,17 @@ eq('...and one it replaces is removed under the name the PR has', { add: [m.PROO
   m.planLabels(['SIZE/S', 'Proof: 🧪 Needs E2E'], { size: 'size/S', proof: [m.PROOF.sufficient] }));
 eq('...and an override in another case still freezes the proof labels', null,
   decide(['a.tsx'], true, 0, false, ['PROOF: 🙋 OVERRIDE']));
+eq('a # line in the Evidence code block (a comment, a root prompt) does not end the section', [true, true], [
+  m.collectEvidence({ pr: pr('## Evidence\n```console\n# id -u\n0\n```\n## Risk\nnone\n') }).run,
+  m.collectEvidence({ pr: pr('## Evidence\n~~~\n# make install\ninstalled\n~~~\n') }).run,
+]);
+eq('an Evidence heading inside a code block is not the section', false,
+  m.collectEvidence({ pr: pr('## Summary\n```md\n## Evidence\nsee below\n```\nhttps://example.com/x\n') }).run);
+eq('...in a body with CRLF line ends too, as the web editor saves them', true,
+  m.collectEvidence({ pr: pr('## Summary\r\nx\r\n## Evidence\r\n```console\r\n# id -u\r\n0\r\n```\r\n## Risk\r\nnone\r\n') }).run);
+eq('a code block with only a # line in it is still run output, and an empty one is not', [true, false], [
+  m.hasRunEvidence('\n```\n# ok\n```\n'), m.hasRunEvidence('\n```\n\n```\nsee above\n'),
+]);
 JS
   n=0
   while IFS=$'\t' read -r verdict name want got; do
@@ -502,7 +513,7 @@ JS
       *) bad "the pr-labels.mjs checks run" "ok or FAIL lines" "$verdict $name $want $got" ;;
     esac
   done < <(node "$tmp/pr-labels-check.mjs" "$pr_labels" "$tmp/kit-labels.json" 2>&1)
-  [[ "$n" -ge 17 ]] || bad "every pr-labels.mjs check ran" "17 or more" "$n"
+  [[ "$n" -ge 21 ]] || bad "every pr-labels.mjs check ran" "21 or more" "$n"
 else
   ok "# SKIP no Node 18 or newer: pr-labels.mjs not checked"
 fi
