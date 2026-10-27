@@ -5,15 +5,17 @@
 #
 #   ./install.sh --list                       the components, and what each installs
 #   ./install.sh --all --dry-run              every change it would make, making none
-#   ./install.sh --all                        every component except schedules
+#   ./install.sh --all                        every component except schedules and github-kit
 #   ./install.sh --with shell,git,claude      just these
 #   ./install.sh --with schedules             the background jobs (cc-park, dream, tmux autosave)
+#   ./install.sh --with github-kit --target ~/code/repo   the GitHub repo kit into that repo's .github/
 #
 # Options:
 #   --identity ID   identities/<ID>/ supplies your git identity, host labels, Claude rules and
 #                   shell settings (default: the one ~/.df-profile names, else "example")
 #   --role ROLE     local (a workstation) or server (default: ~/.df-profile's, else local)
 #   --replace-dotfiles  move an existing ~/.dotfiles that is not this checkout into the backup
+#   --target DIR    github-kit: the git repository whose .github/ gets the kit (github-kit/README.md)
 #
 # The shell, hooks and schedules find everything through ~/.dotfiles, so a checkout anywhere
 # else gets ~/.dotfiles linked to it. Re-running is safe: what is already in place is left
@@ -23,7 +25,7 @@
 set -euo pipefail
 
 DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review schedules"
+ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review schedules github-kit"
 DEFAULT_ALL="shell git tmux claude codex session worktrees memory review"
 
 describe() {
@@ -38,6 +40,7 @@ describe() {
         memory)    echo "reflections, dream, session-analyzer and claude-consolidate, with their skills" ;;
         review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
         schedules) echo "launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, nightly dream, tmux autosave (not in --all)" ;;
+        github-kit) echo "issue forms, a PR template, labels and workflows, copied into the .github/ of the repo --target names (not in --all)" ;;
     esac
 }
 
@@ -50,7 +53,7 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 say()  { printf '%s\n' "$*"; }
 
 # ── arguments ────────────────────────────────────────────────────────────
-WITH="" DRY_RUN=0 LIST=0 IDENTITY="" ROLE="" REPLACE_DOTFILES=0
+WITH="" DRY_RUN=0 LIST=0 IDENTITY="" ROLE="" REPLACE_DOTFILES=0 TARGET=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --with)       [ $# -ge 2 ] || die "--with needs a list"; WITH="$WITH,$2"; shift 2 ;;
@@ -63,6 +66,8 @@ while [ $# -gt 0 ]; do
         --dry-run|-n) DRY_RUN=1; shift ;;
         --list)       LIST=1; shift ;;
         --replace-dotfiles) REPLACE_DOTFILES=1; shift ;;
+        --target)     [ $# -ge 2 ] || die "--target needs a directory"; TARGET="$2"; shift 2 ;;
+        --target=*)   TARGET="${1#--target=}"; shift ;;
         -h|--help)    usage; exit 0 ;;
         *)            die "unknown argument: $1 (see --help)" ;;
     esac
@@ -463,13 +468,61 @@ c_schedules() {
     esac
 }
 
+# OWNER/NAME of a git repository's github.com origin, or nothing.
+github_slug() {  # github_slug REPO_DIR
+    local url
+    url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 0
+    case "$url" in
+        https://github.com/*)   url="${url#https://github.com/}" ;;
+        git@github.com:*)       url="${url#git@github.com:}" ;;
+        ssh://git@github.com/*) url="${url#ssh://git@github.com/}" ;;
+        *) return 0 ;;
+    esac
+    url="${url%/}"
+    url="${url%.git}"
+    case "$url" in
+        */*/*|/*|*/|*[!A-Za-z0-9_./-]*) return 0 ;;
+        */*) printf '%s' "$url" ;;
+    esac
+}
+
+# The kit is copied, not linked: a repository commits its .github/ files. Each is installed like a
+# generated file (replaced ones go to the backup), with OWNER/REPO in links filled from the origin.
+c_github_kit() {
+    local kit="$DOTFILES_DIR/github-kit" top slug f tmp
+    [ -n "$TARGET" ] || die "github-kit needs --target DIR: the git repository whose .github/ gets the kit"
+    top="$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)" \
+        || die "--target $TARGET is not inside a git repository"
+    top="$(cd "$top" && pwd -P)"
+    case "$top/" in
+        "$DOTFILES_DIR"/*) warn "$(tilde "$top") is this checkout (or inside it); leaving it alone"; return 0 ;;
+    esac
+    slug="$(github_slug "$top")"
+    while IFS= read -r f; do
+        tmp="$(mktemp)"
+        if [ -n "$slug" ]; then
+            sed "s|github\.com/OWNER/REPO/|github.com/$slug/|g" "$kit/$f" > "$tmp"
+        else
+            cp "$kit/$f" "$tmp"
+        fi
+        chmod 644 "$tmp"
+        generate "$top/.github/$f" "$tmp"
+    done < <(cd "$kit" && find . -type f ! -name README.md ! -name sync-labels.sh | sed 's|^\./||' | LC_ALL=C sort)
+    [ -n "$slug" ] || say "  note: $(tilde "$top") has no github.com origin: replace OWNER/REPO in .github/ISSUE_TEMPLATE/config.yml"
+    say "  next: commit the files, then sync the labels: $(tilde "$kit")/sync-labels.sh --repo ${slug:-OWNER/NAME} --dry-run"
+}
+
 # ── run ──────────────────────────────────────────────────────────────────
 [ "$DRY_RUN" -eq 1 ] && say "Dry run: nothing will change."
 say "Installing from $DOTFILES_DIR (identity $IDENTITY, role $ROLE):$SELECTED"
-ensure_dotfiles_link
+[ -z "$TARGET" ] || selected github-kit || warn "--target is for github-kit, which is not selected; ignoring it"
+# Everything but github-kit (which writes only into its target) finds this checkout through ~/.dotfiles.
+for c in $SELECTED; do
+    [ "$c" = github-kit ] || { ensure_dotfiles_link; break; }
+done
 for c in $SELECTED; do
     say "[$c] $(describe "$c")"
-    "c_$c"
+    "c_$(printf '%s' "$c" | tr - _)"
 done
 
 if [ "$CHANGES" -eq 0 ]; then

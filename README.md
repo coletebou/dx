@@ -61,6 +61,7 @@ installer stops and tells you your options.
 | `codex` | the Codex skills |
 | `session`, `worktrees`, `memory`, `review` | each plugin's CLIs in `~/.local/bin` and its skills in `~/.claude/skills` |
 | `schedules` | launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, the nightly dream sweep, tmux autosave. Not part of `--all`. |
+| `github-kit` | the [GitHub repo kit](github-kit/README.md) (issue forms, a PR template and its rules, a label set with a sync script, PR-labeling, secret-scan, Claude Code and CI-lane workflows), copied into the `.github/` of the repository `--target` names. Not part of `--all`. |
 
 The Claude Code setup in `base/claude/` is the part most people come for:
 

@@ -155,6 +155,64 @@ equal "...leaves the checkout's own script a file" "file" \
   "$([[ -f "$copy/scripts/wt-helper" && ! -L "$copy/scripts/wt-helper" ]] && echo file || ls -l "$copy/scripts/wt-helper" 2>&1)"
 equal "...and links nothing into it" "" "$(find "$copy/scripts" -maxdepth 1 -type l | head -3)"
 
+echo "github-kit"
+newhome 7
+target="$tmp/widgets"
+git init -q "$target"
+git -C "$target" remote add origin git@github.com:example/widgets.git
+kit_files="$(cd "$root/github-kit" && find . -type f ! -name README.md ! -name sync-labels.sh | sed 's|^\./||' | LC_ALL=C sort)"
+out="$(inst --with github-kit)"; rc=$?
+equal "github-kit without --target is refused" 1 "$rc"
+check "...saying what it needs" "github-kit needs --target DIR" "$out"
+mkdir -p "$tmp/not-a-repo"
+out="$(inst --with github-kit --target "$tmp/not-a-repo")"; rc=$?
+equal "a --target outside a git repository is refused" 1 "$rc"
+out="$(inst --with github-kit --target "$target" --dry-run)"; rc=$?
+equal "a github-kit dry run succeeds" 0 "$rc"
+check "...naming the files it would create" "would create $target/.github/workflows/pr-labels.yml" "$out"
+equal "...one per kit file" "$(printf '%s\n' "$kit_files" | wc -l | tr -d ' ')" "$(printf '%s\n' "$out" | grep -c 'would create')"
+equal "...writing nothing into the target" "" "$(cd "$target" && find . -mindepth 1 -not -path './.git' -not -path './.git/*' | head -3)"
+equal "...nor into HOME (no ~/.dotfiles link for github-kit alone)" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
+mkdir -p "$target/.github"
+printf 'mine\n' > "$target/.github/pull_request_template.md"
+out="$(inst --with github-kit --target "$target/.github")"; rc=$?
+equal "the kit installs, from a --target inside the repository" 0 "$rc"
+missing="" differ=""
+for f in $kit_files; do
+  [ -f "$target/.github/$f" ] || { missing="$missing $f"; continue; }
+  [ "$f" = ISSUE_TEMPLATE/config.yml ] || cmp -s "$root/github-kit/$f" "$target/.github/$f" || differ="$differ $f"
+done
+equal "...every kit file at its path under the repository's .github/" "" "$missing"
+equal "...as an exact copy" "" "$differ"
+equal "...but not the README or the label sync" "no no" \
+  "$([ -e "$target/.github/README.md" ] && echo yes || echo no) $([ -e "$target/.github/sync-labels.sh" ] && echo yes || echo no)"
+check "...with the security link filled from the origin" "url: https://github.com/example/widgets/security/policy" \
+  "$(cat "$target/.github/ISSUE_TEMPLATE/config.yml" 2>&1)"
+lacks "...and no placeholder left" "github.com/OWNER/REPO" "$(cat "$target/.github/ISSUE_TEMPLATE/config.yml" 2>&1)"
+check "...saying how to sync the labels" "sync-labels.sh --repo example/widgets --dry-run" "$out"
+backup="$(ls -d "$HOME"/.dotfiles-backup/*/ 2>/dev/null | head -n 1)"
+equal "the replaced PR template is in the backup" "mine" "$(cat "${backup}abs$target/.github/pull_request_template.md" 2>&1)"
+equal "~/.dotfiles is not linked for github-kit alone" "no" "$([ -e "$HOME/.dotfiles" ] || [ -L "$HOME/.dotfiles" ] && echo yes || echo no)"
+out="$(inst --with github-kit --target "$target")"; rc=$?
+equal "a second github-kit run succeeds" 0 "$rc"
+check "...and changes nothing" "Everything was already in place." "$out"
+plain="$tmp/plain"
+git init -q "$plain"
+out="$(inst --with github-kit --target "$plain")"; rc=$?
+equal "a repository with no github.com origin gets the kit" 0 "$rc"
+check "...told to fill the security link by hand" "replace OWNER/REPO in .github/ISSUE_TEMPLATE/config.yml" "$out"
+out="$(inst --with shell --target "$target" --dry-run)"; rc=$?
+check "--target without github-kit is ignored, said so" "--target is for github-kit" "$out"
+
+echo "github-kit into this checkout"
+# From a copy that is a git repository of its own, so a regression cannot write into the real one.
+git init -q "$copy"
+before="$(cd "$copy" && find .github -type f | LC_ALL=C sort | xargs cksum 2>&1)"
+out="$("$run_bash" "$copy/install.sh" --with github-kit --target "$copy" 2>&1)"; rc=$?
+equal "a --target that is the checkout itself succeeds" 0 "$rc"
+check "...leaving it alone, said so" "is this checkout (or inside it); leaving it alone" "$out"
+equal "...its .github/ unchanged" "$before" "$(cd "$copy" && find .github -type f | LC_ALL=C sort | xargs cksum 2>&1)"
+
 echo "the checkout"
 equal "nothing was written into the repo" "$before_status" "$(git -C "$root" status --porcelain)"
 
