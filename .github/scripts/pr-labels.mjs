@@ -208,9 +208,14 @@ export function collectEvidence({ pr, comments = [], reviews = [] }) {
   return { media: media.size, run: sections.some(hasRunEvidence) };
 }
 
+// GitHub resolves label names case-insensitively (a PR's `size/s` is the
+// repository's `size/S` label, under the name it was created with), so every
+// comparison of label names goes through this.
+const key = (name) => name.toLowerCase();
+
 /** The proof labels a PR should carry, or null when a maintainer override is on. */
 export function decideProof({ classification, evidence, labels }) {
-  if (labels.includes(PROOF.override)) return null;
+  if (labels.some((label) => key(label) === key(PROOF.override))) return null;
   const { ui, behavior } = classification;
   if (ui.length === 0 && !behavior) return [PROOF.notNeeded];
   const needs = [];
@@ -219,21 +224,28 @@ export function decideProof({ classification, evidence, labels }) {
   return needs.length > 0 ? needs : [PROOF.sufficient];
 }
 
-const OWNED_PROOF = new Set([PROOF.sufficient, PROOF.screenshots, PROOF.e2e, PROOF.notNeeded]);
+const OWNED_PROOF = new Set([PROOF.sufficient, PROOF.screenshots, PROOF.e2e, PROOF.notNeeded].map(key));
 
-/** Label changes, limited to the families this script owns. `proof` null leaves proof labels alone. */
+/**
+ * Label changes, limited to the families this script owns. `proof` null leaves
+ * proof labels alone. Names match in any case: a label already on the PR in
+ * another case is neither added again nor removed, and one to remove is
+ * removed under the name the PR has.
+ */
 export function planLabels(current, { size, proof }) {
   const add = new Set();
   const remove = new Set();
+  const have = new Set(current.map(key));
   for (const label of current) {
-    if (label.startsWith('size/') && label !== size) remove.add(label);
+    if (key(label).startsWith('size/') && key(label) !== key(size)) remove.add(label);
   }
-  if (!current.includes(size)) add.add(size);
+  if (!have.has(key(size))) add.add(size);
   if (proof) {
+    const wanted = new Set(proof.map(key));
     for (const label of current) {
-      if (OWNED_PROOF.has(label) && !proof.includes(label)) remove.add(label);
+      if (OWNED_PROOF.has(key(label)) && !wanted.has(key(label))) remove.add(label);
     }
-    for (const label of proof) if (!current.includes(label)) add.add(label);
+    for (const label of proof) if (!have.has(key(label))) add.add(label);
   }
   return { add: [...add].sort(), remove: [...remove].sort() };
 }
@@ -331,9 +343,9 @@ async function main() {
   if (args.dryRun || (add.length === 0 && remove.length === 0)) return;
 
   try {
-    const existing = new Set((await gh.paginate(`/repos/${repo}/labels?per_page=100`)).map((label) => label.name.toLowerCase()));
+    const existing = new Set((await gh.paginate(`/repos/${repo}/labels?per_page=100`)).map((label) => key(label.name)));
     for (const definition of LABEL_DEFINITIONS) {
-      if (add.includes(definition.name) && !existing.has(definition.name.toLowerCase())) {
+      if (add.includes(definition.name) && !existing.has(key(definition.name))) {
         await gh.request('POST', `/repos/${repo}/labels`, definition);
       }
     }

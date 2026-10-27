@@ -485,6 +485,13 @@ eq('proof for docs only, UI without screenshots, behavior without a run, both co
 eq('planLabels swaps size and proof labels and leaves every other label alone',
   { add: [m.PROOF.sufficient, 'size/M'], remove: [m.PROOF.e2e, 'size/S'] },
   m.planLabels(['size/S', m.PROOF.e2e, 'merge-risk: 🚨 data', 'bug'], { size: 'size/M', proof: [m.PROOF.sufficient] }));
+// GitHub resolves label names case-insensitively, so size/s on a PR is the size/S label.
+eq('planLabels: a label already on the PR in another case is that label, neither added nor removed',
+  { add: [], remove: [] }, m.planLabels(['size/s', 'PROOF: ✅ SUFFICIENT'], { size: 'size/S', proof: [m.PROOF.sufficient] }));
+eq('...and one it replaces is removed under the name the PR has', { add: [m.PROOF.sufficient], remove: ['Proof: 🧪 Needs E2E'] },
+  m.planLabels(['SIZE/S', 'Proof: 🧪 Needs E2E'], { size: 'size/S', proof: [m.PROOF.sufficient] }));
+eq('...and an override in another case still freezes the proof labels', null,
+  decide(['a.tsx'], true, 0, false, ['PROOF: 🙋 OVERRIDE']));
 JS
   n=0
   while IFS=$'\t' read -r verdict name want got; do
@@ -495,7 +502,7 @@ JS
       *) bad "the pr-labels.mjs checks run" "ok or FAIL lines" "$verdict $name $want $got" ;;
     esac
   done < <(node "$tmp/pr-labels-check.mjs" "$pr_labels" "$tmp/kit-labels.json" 2>&1)
-  [[ "$n" -ge 14 ]] || bad "every pr-labels.mjs check ran" "14 or more" "$n"
+  [[ "$n" -ge 17 ]] || bad "every pr-labels.mjs check ran" "17 or more" "$n"
 else
   ok "# SKIP no Node 18 or newer: pr-labels.mjs not checked"
 fi
