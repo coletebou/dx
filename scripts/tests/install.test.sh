@@ -107,7 +107,7 @@ for b in pw pw-append stack-branches stack-claude wt-helper cc-park cc-handoff r
 done
 ok "the CLIs are linked into ~/.local/bin"
 for s in cc-park fresh-session-handoff parallel-worktrees tmux-archive reflect codex-subagents mcp-agent-safety \
-  disk-reclaim shipped-but-open; do
+  disk-reclaim shipped-but-open autoreview; do
   [[ -f "$HOME/.claude/skills/$s/SKILL.md" ]] || bad "skill $s is linked" "SKILL.md" "$(ls -l "$HOME/.claude/skills/$s" 2>&1)"
 done
 ok "the skills are linked into ~/.claude/skills"

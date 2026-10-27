@@ -126,7 +126,7 @@ parent then picks between.
 - Run `code-simplifier` after writing/modifying code.
 - After non-trivial changes and before commit or ship, run two independent
   reviews in parallel over the same frozen scope, on two different engines (for
-  example the `autoreview` skill from openclaw/agent-skills, once with Codex and
+  example the review plugin's `autoreview` skill, once with Codex and
   once with Claude). Gate on a stated severity (for example "nothing at P2 or
   above"), honor explicit model, effort, auth and engine overrides, and keep the
   run history. **Verify every finding against the real code before fixing it**

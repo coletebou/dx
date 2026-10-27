@@ -51,7 +51,7 @@ describe() {
         session)   echo "cc-park and cc-handoff, with their skills" ;;
         worktrees) echo "wt-helper, pw, stack-branches and stack-claude, with their skills" ;;
         memory)    echo "reflections, dream, session-analyzer, claude-consolidate, memory-canary and codex-memory-bridge, with their skills" ;;
-        review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
+        review)    echo "autoreview-pair and the autoreview, adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
         sync)      echo "dotsync, dotsync-doctor, dotsync-commit-message and codesync: this checkout and every repository under ~/code in sync across your machines" ;;
         toolbox)   echo "the disk-reclaim and shipped-but-open skills" ;;
         ghostty)   echo "the Ghostty config, and the xterm-ghostty terminfo where it is missing" ;;

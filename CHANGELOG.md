@@ -43,6 +43,12 @@
 - **Docs:** playbooks for a fleet over Tailscale, Cloudflare in front of self-hosted services,
   and a production VPS (`docs/infra/`); how this setup runs fleets of agents
   (`docs/workflow/`).
+- **`autoreview`** joins the `review` plugin (now 1.1.0): structured code review of a diff,
+  branch, commit or pull request by Codex, Claude and other engines through one helper, with a
+  pre-send secret scan, isolated reviewer sandboxes, a JSON status contract and its own test
+  suites (`scripts/tests/autoreview.test.sh`). It derives from an MIT-licensed autoreview skill
+  (see NOTICE.md), whose https gateway base URLs for command-auth Codex routes it includes.
+- `autoreview-pair` runs the installed skill from `~/.claude/skills` before `~/.agents/skills`.
 - **Fixes:** pw starts each agent through one short typed line (macOS dropped the end of long
   typed input, so an agent could fail to start); every CI action is pinned to a release commit,
   and a failing suite's whole output is kept as an artifact.

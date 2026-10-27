@@ -19,9 +19,11 @@ Everything in this repository is MIT-licensed (see [LICENSE](LICENSE)) unless a 
 ## Derived from
 
 - The `autoreview` skill (`plugins/review/skills/autoreview`) is derived from the autoreview skill
-  in [openclaw/agent-skills](https://github.com/openclaw/agent-skills) (MIT). The original
-  copyright notice stays in [its LICENSE](plugins/review/skills/autoreview/LICENSE); the changes
-  made here are under this repository's LICENSE.
+  in [openclaw/agent-skills](https://github.com/openclaw/agent-skills) (MIT). It was imported,
+  without history, at revision `c6f58bd`: upstream `0d6205f` plus this repository's author's own
+  changes; upstream's `2882b90` was applied after the import. The original copyright notice stays
+  in [its LICENSE](plugins/review/skills/autoreview/LICENSE); the changes made here are under this
+  repository's LICENSE.
 
 ## Used, not included
 

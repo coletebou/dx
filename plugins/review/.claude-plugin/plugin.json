@@ -1,7 +1,7 @@
 {
   "name": "review",
-  "description": "Review that has to survive refutation: a multi-lens review where every finding faces three independent refuters before it counts (adversarial-review), a real-LLM canary harness proving an MCP server or tool surface cannot leak its secrets (mcp-agent-safety), and a fresh-context advisor in its own tmux window that can relay advice back to the primary agent (fable-second-opinion)",
-  "version": "1.0.0",
+  "description": "Code review by Codex, Claude and other engines through one helper with a pre-send secret scan, run twice in parallel by autoreview-pair (autoreview), and review that has to survive refutation: a multi-lens review where every finding faces three independent refuters before it counts (adversarial-review), a real-LLM canary harness proving an MCP server or tool surface cannot leak its secrets (mcp-agent-safety), and a fresh-context advisor in its own tmux window that can relay advice back to the primary agent (fable-second-opinion)",
+  "version": "1.1.0",
   "author": {
     "name": "Cole Tebou"
   },
