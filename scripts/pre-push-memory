@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""Validate committed memory homes affected by one outgoing ref; never live memory.
+
+    pre-push-memory <local sha> <remote sha> <remote name>
+
+base/git/hooks/pre-push runs this once per outgoing ref, in the repository being pushed,
+when it exists next to the hook's checkout. A repository is a memory repository when its
+history holds a committed claude/memory-homes.conf (rows `<shortname> <path>`, the paths
+inside the repository). For each memory home the push changes, the committed Markdown is
+copied out of Git into a temporary directory and checked with `memory-canary --strict`;
+the working tree and the live memory directories are never read. Any other repository,
+this one included, passes at once and prints nothing.
+
+Exit 0 lets the push proceed; 1 blocks it, with the reason on stderr. Clean verdicts are
+cached by content in ${XDG_CACHE_HOME:-~/.cache}/pre-push-memory (PRE_PUSH_MEMORY_CACHE
+names another directory; 0 turns the cache off).
+"""
+import concurrent.futures
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import unicodedata
+
+CONFIG = 'claude/memory-homes.conf'
+# What makes a repository a memory repository: a committed configuration, at the tip or
+# anywhere in the history the push reaches. The checker is not a marker: this repository
+# ships it with only a template (claude/memory-homes.conf.example), and so does every fork
+# that commits no memory. A repository that ever committed a configuration cannot hide its
+# homes by deleting it: every home still in the tree is checked as a former home.
+MARKERS = (CONFIG,)
+CHECKER = pathlib.Path(__file__).resolve().with_name('memory-canary')
+OBJECT_ID = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+# Each git process costs ~70-90 ms to start on macOS. Independent reads and the
+# per-home checks overlap here; every result is still consumed in program order,
+# so the first error raised is the one the sequential gate would have raised.
+POOL = concurrent.futures.ThreadPoolExecutor()
+
+
+def git(*args):
+    return subprocess.check_output(['git', *args], stderr=subprocess.PIPE)
+
+
+def git_lines(*args):
+    return git(*args).decode().splitlines()
+
+
+def git_stdin(args, lines):
+    """One git process fed one argument per stdin line (--batch / --stdin modes)."""
+    # A name holding a line break would shift every later answer onto the wrong query.
+    if any('\n' in line or '\r' in line for line in lines):
+        raise ValueError('git batch query contains a line break')
+    return subprocess.run(['git', *args], input=''.join(f'{line}\n' for line in lines).encode(),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+
+
+def objects(names):
+    """(object id, type, contents) of many objects from a single `git cat-file --batch`,
+    in input order; None where git answers `<name> missing`.
+
+    One git process per file made the gate spawn ~1,700 processes for a push that
+    touched the large memory homes (~70-90 ms each on macOS, minutes per push).
+    """
+    if not names:
+        return []
+    data, offset, found = git_stdin(['cat-file', '--batch'], names), 0, []
+    for name in names:
+        end = data.find(b'\n', offset)
+        header = data[offset:end].split() if end >= 0 else []
+        if header == [name.encode(), b'missing']:
+            found.append(None)
+            offset = end + 1
+            continue
+        oid = header[0].decode(errors='replace') if header else ''
+        # A full object id must come back unchanged; `<rev>:<path>` names its object.
+        if len(header) != 3 or header[1] not in (b'blob', b'tree', b'commit', b'tag') or (
+                not OBJECT_ID.fullmatch(oid)) or (OBJECT_ID.fullmatch(name) and oid != name):
+            raise ValueError(f'unreadable memory object: {name}')
+        start = end + 1
+        size = int(header[2])
+        if data[start + size:start + size + 1] != b'\n':
+            raise ValueError(f'truncated memory object: {name}')
+        found.append((oid, header[1].decode(), data[start:start + size]))
+        offset = start + size + 1
+    if offset != len(data):
+        raise ValueError('unexpected git object batch output')
+    return found
+
+
+def blobs(oids):
+    """Contents of many blobs, in input order."""
+    contents = []
+    for oid, found in zip(oids, objects(oids)):
+        if found is None or found[1] != 'blob':
+            raise ValueError(f'unreadable memory blob: {oid}')
+        contents.append(found[2])
+    return contents
+
+
+_present = {}
+
+
+def present(names):
+    """Answer many `git cat-file -e` queries with one `git cat-file --batch-check`.
+
+    It prints one line per query, in order: `<name> missing` (or `ambiguous`)
+    where -e fails, `<oid> <type> <size>` where it succeeds. One process per
+    query cost ~30 git processes per push.
+    """
+    pending = [name for name in dict.fromkeys(names) if name not in _present]
+    if pending:
+        answers = git_stdin(['cat-file', '--batch-check'], pending).split(b'\n')
+        if len(answers) != len(pending) + 1 or answers[-1]:
+            raise ValueError('truncated git object existence check')
+        for name, answer in zip(pending, answers):
+            fields = answer.split(b' ')
+            if fields in ([name.encode(), b'missing'], [name.encode(), b'ambiguous']):
+                _present[name] = False
+            elif (len(fields) == 3 and OBJECT_ID.fullmatch(fields[0].decode(errors='replace'))
+                  and fields[1] in (b'blob', b'tree', b'commit', b'tag') and fields[2].isdigit()):
+                _present[name] = True
+            else:
+                raise ValueError(f'unexpected git object existence answer: {name}')
+    return [_present[name] for name in names]
+
+
+def tree_entries(tree, name, rawsz):
+    """(raw mode, object id) of every entry called `name` in a raw tree object."""
+    found, offset = [], 0
+    while offset < len(tree):
+        space, nul = tree.find(b' ', offset), tree.find(b'\0', offset)
+        mode = tree[offset:space]
+        # Git's own decoder rejects these (non-octal mode, empty name, short tree).
+        if not offset <= space < nul - 1 or nul + 1 + rawsz > len(tree) or mode.strip(b'01234567'):
+            raise ValueError('malformed Git tree')
+        if tree[space + 1:nul] == name:
+            found.append((int(mode or b'0', 8), tree[nul + 1:nul + 1 + rawsz].hex()))
+        offset = nul + 1 + rawsz
+    return found
+
+
+_configurations = {}
+
+
+def configurations(revisions):
+    """Prefetch each revision's memory configuration: bytes, or None unless one regular file.
+
+    ls-tree plus show cost two git processes per historical revision (~50 per
+    push). One batch reads every revision's root tree and each object along the
+    path, and the raw tree entries are walked: ls-tree prints any S_ISREG raw
+    mode as `100644 blob` or `100755 blob`, so S_ISREG is its regular-file test,
+    and a duplicated file entry, which ls-tree would list twice, is not one
+    regular file. A duplicated directory has no single meaning (first-match
+    lookup and ls-tree disagree), so that malformed tree fails, as does a path
+    lookup that does not land on the one entry the walk found.
+    """
+    pending = [rev for rev in dict.fromkeys(revisions) if rev not in _configurations]
+    parts = CONFIG.split('/')
+    lookups = ['^{tree}'] + [':' + '/'.join(parts[:depth + 1]) for depth in range(len(parts))]
+    found = objects([rev + lookup for rev in pending for lookup in lookups])
+    for index, rev in enumerate(pending):
+        levels = found[index * len(lookups):(index + 1) * len(lookups)]
+        if levels[0] is None or levels[0][1] != 'tree':
+            raise ValueError(f'unreadable memory tree: {rev}')
+        configuration = None
+        for depth, part in enumerate(parts):
+            last = depth == len(parts) - 1
+            oid, _, tree = levels[depth]
+            entries = tree_entries(tree, part.encode(), len(oid) // 2)
+            if len(entries) > 1 and not last:
+                raise ValueError(f'malformed Git tree: duplicate {part} in {rev}')
+            if len(entries) != 1 or not (stat.S_ISREG if last else stat.S_ISDIR)(entries[0][0]):
+                break
+            following = levels[depth + 1]
+            if following is None or following[0] != entries[0][1] or following[1] != ('blob' if last else 'tree'):
+                raise ValueError(f'unreadable memory configuration path in {rev}')
+            if last:
+                configuration = following[2]
+        _configurations[rev] = configuration
+
+
+_toplevel = []
+
+
+def toplevel():
+    """The work tree root. Started early, but its error surfaces where it is used."""
+    if not _toplevel:
+        _toplevel.append(POOL.submit(
+            lambda: pathlib.Path(git('rev-parse', '--show-toplevel').decode().strip()).resolve()))
+    return _toplevel[0]
+
+
+def canonical_key(path):
+    # Case folding can introduce decomposed sequences. Normalize both before
+    # and after folding so every canonical caseless spelling shares one key.
+    return unicodedata.normalize('NFD', unicodedata.normalize('NFD', path).casefold())
+
+
+def exists(rev, path):
+    return present([f'{rev}:{path}'])[0]
+
+
+def homes(rev, strict=True):
+    configurations([rev])
+    configuration = _configurations[rev]
+    if configuration is None:
+        if strict:
+            raise ValueError('memory configuration must be a regular Git file')
+        return []  # Nonregular historical entries are not trusted configuration.
+    result = []
+    external = False
+    root = toplevel().result()
+    for line in configuration.decode(errors='strict' if strict else 'replace').splitlines():
+        parts = line.split()
+        if not parts or parts[0].startswith('#'):
+            continue
+        try:
+            if len(parts) < 2:
+                raise ValueError('malformed memory home configuration')
+            path = parts[1]
+            if '\0' in path:
+                raise ValueError('memory home path contains NUL')
+            for prefix in ('~/.dotfiles/', '$HOME/.dotfiles/', str(pathlib.Path.home() / '.dotfiles') + '/'):
+                if path.startswith(prefix):
+                    path = path[len(prefix):]
+                    break
+            if path.startswith(('~/', '$HOME/', '/')) and '..' not in pathlib.PurePosixPath(path).parts:
+                # A home spelled from $HOME or the root: one that resolves into this
+                # repository is checked as that repo-relative home; one outside it is
+                # live memory (a memory tree kept in another repository, or nowhere), so
+                # nothing committed exists to check. Former homes are still found below.
+                spelled = str(pathlib.Path.home()) + path[len('$HOME'):] if path.startswith('$HOME/') else path
+                try:
+                    path = str(pathlib.Path(spelled).expanduser().resolve().relative_to(root))
+                except ValueError:
+                    external = True
+                    continue
+            item = pathlib.PurePosixPath(path)
+            if item.is_absolute() or '..' in item.parts or path.startswith(('~', '$')):
+                raise ValueError(f'memory home must reside in the repository: {path}')
+            if not item.parts or str(item) == '.':
+                raise ValueError('memory home cannot be repository root')
+            result.append(str(item))
+        except ValueError:
+            if strict:
+                raise
+            # History is discovery only: a repaired configuration must be
+            # publishable, and malformed/unsafe old rows must never be trusted.
+    if not result and strict and not external:
+        raise ValueError('no configured memory homes')
+    return result
+
+
+# Clean canary verdicts, one empty marker per exact input. Most pushes change
+# only a home's reflections/*.jsonl, which the canary never sees, so the same
+# committed Markdown was checked by the previous push. A failure is never kept.
+VERDICT_VERSION = b'pre-push-memory verdict 1'
+VERDICTS_KEPT = 200
+
+
+def verdict_cache():
+    """The verdict directory, or None when PRE_PUSH_MEMORY_CACHE=0 or it is unsafe."""
+    setting = os.environ.get('PRE_PUSH_MEMORY_CACHE', '')
+    if setting == '0':
+        return None
+    cache_home = os.environ.get('XDG_CACHE_HOME') or str(pathlib.Path.home() / '.cache')
+    base = pathlib.Path(setting) if setting else pathlib.Path(cache_home) / 'pre-push-memory'
+    try:
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = os.lstat(base)
+    except OSError:
+        return None
+    # A directory anyone else can write could hold a forged clean verdict.
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        return None
+    return base
+
+
+def verdict_key(home, markdown):
+    """Everything the canary reads: its code, its baseline, the home's name and Markdown."""
+    digest = hashlib.sha256(VERDICT_VERSION)
+    baseline = CHECKER.with_name('wiki-dangle-baseline')
+    parts = [CHECKER.read_bytes(), baseline.read_bytes() if baseline.is_file() else b'',
+             pathlib.PurePosixPath(home).name.encode('utf-8', 'surrogateescape')]
+    parts += [str(relative).encode('utf-8', 'surrogateescape') + b'\0' + oid.encode() for relative, oid in markdown]
+    for part in parts:
+        digest.update(b'%d:' % len(part) + part)
+    return digest.hexdigest()
+
+
+VERDICT_NAME = re.compile(r'[0-9a-f]{64}')
+
+
+def remember_verdict(cache, key):
+    try:
+        (cache / key).touch()
+        # Prune only markers: PRE_PUSH_MEMORY_CACHE may name a directory with other files.
+        markers = sorted((path for path in cache.iterdir() if VERDICT_NAME.fullmatch(path.name)),
+                         key=lambda path: path.stat().st_mtime)
+        for stale in markers[:max(0, len(markers) - VERDICTS_KEPT)]:
+            stale.unlink()
+    except OSError:
+        pass  # Only a cache: the next push checks again.
+
+
+def check_home(tip, home):
+    """Run the checker on a temporary copy of one committed home.
+
+    Returns the checker's CompletedProcess, or the OSError that kept it from
+    starting: the gate prints the home's header before reporting either. A
+    copy whose exact inputs already passed returns that clean verdict.
+    """
+    materialized_names = {}
+    markdown = []
+    for record in git('ls-tree', '-r', '-z', tip, '--', home + '/').split(b'\0'):
+        if not record:
+            continue
+        metadata, name = record.split(b'\t', 1)
+        mode, kind, oid = metadata.decode().split()
+        raw_name = name.decode()
+        if raw_name.startswith('/') or any(part in ('', '.', '..') for part in raw_name.split('/')):
+            raise ValueError(f'unsafe memory tree path: {raw_name}')
+        relative = pathlib.PurePosixPath(raw_name).relative_to(home)
+        # Validate ALL tree paths before filtering or writing. An ignored
+        # file can collide with a Markdown path or directory on APFS.
+        for length in range(1, len(relative.parts) + 1):
+            spelling = '/'.join(relative.parts[:length])
+            key = canonical_key(spelling)
+            entry = (spelling, length == len(relative.parts))
+            if key in materialized_names and (materialized_names[key] != entry or entry[1]):
+                raise ValueError(f'case/Unicode or file/directory collision: {raw_name}')
+            materialized_names[key] = entry
+        # Avoid copying unrelated analysis artifacts or attachments.
+        if name.endswith(b'.md'):
+            if kind != 'blob' or mode not in ('100644', '100755'):
+                raise ValueError(f'unsupported memory tree entry: {raw_name}')
+            markdown.append((relative, oid))
+    cache = verdict_cache()
+    try:
+        verdict = verdict_key(home, markdown) if cache else None
+    except OSError:
+        verdict = None  # An unreadable checker fails below, as it always did.
+    # A checker that can no longer run fails below rather than passing from the cache.
+    if verdict and os.access(CHECKER, os.X_OK) and (cache / verdict).is_file():
+        try:
+            os.utime(cache / verdict)
+        except OSError:
+            pass
+        return subprocess.CompletedProcess(
+            [str(CHECKER), '--strict', '--dir', home], 0,
+            f'✓ memory-canary {home}: same committed Markdown as an earlier clean check\n'.encode(), b'')
+    with tempfile.TemporaryDirectory(prefix='pre-push-memory-') as temporary:
+        directory = pathlib.Path(temporary) / pathlib.PurePosixPath(home).name
+        directory.mkdir()
+        created = set()  # mkdir once per directory, not once per file
+        for (relative, _), content in zip(markdown, blobs([oid for _, oid in markdown])):
+            target = directory.joinpath(*relative.parts)
+            if target.parent not in created:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                created.add(target.parent)
+            target.write_bytes(content)
+        try:
+            result = subprocess.run([str(CHECKER), '--strict', '--dir', str(directory)], capture_output=True)
+        except OSError as error:
+            return error
+    if verdict and result.returncode == 0:
+        remember_verdict(cache, verdict)
+    return result
+
+
+def main():
+    tip, old, remote = sys.argv[1:]
+    # Unlike cat-file -e, rev-list --missing never fetches an old tip a partial
+    # clone lacks from its promisor remote; an absent old tip checks all of tip.
+    old_available = set(old) != {'0'} and bool(subprocess.run(
+        ['git', 'rev-list', '--no-walk', '--ignore-missing', '--missing=allow-any', old, '--'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.strip())
+    revisions = [f'{old}..{tip}'] if old_available else (
+        [tip, '--not', f'--remotes={remote}'] if set(old) == {'0'} else [tip])
+    history_roots = [tip] + ([old] if old_available else [])
+    # Every repository on the global hook pays for these reads, so overlap them.
+    commits, marked, boundary, configuration_history = [read.result() for read in (
+        POOL.submit(git_lines, 'rev-list', *revisions),
+        POOL.submit(git_lines, 'rev-list', '--full-history', *revisions, '--', *MARKERS),
+        POOL.submit(git_lines, 'rev-list', '--boundary', *revisions),
+        POOL.submit(git_lines, 'rev-list', '--full-history', *history_roots, '--', CONFIG))]
+    # Ordinary repositories contain no marker. Do not inspect ~/.dotfiles.
+    candidates = [tip] + ([old] if old_available else [])
+    candidates += marked
+    # Parents excluded by remote reachability still establish repository identity
+    # and the memory homes that an outgoing deletion must not silently hide.
+    candidates += [line[1:] for line in boundary if line.startswith('-')]
+    candidates += configuration_history
+    if configuration_history:
+        # An index may arrive after its config row. The actual parents of later
+        # row changes capture that formerly-valid home before it disappears.
+        for record in git_lines('rev-list', '--no-walk', '--parents', *configuration_history):
+            candidates += record.split()[1:]
+    candidates = list(dict.fromkeys(candidates))
+    def has_marker(revisions):
+        return any(present([f'{rev}:{marker}' for rev in revisions for marker in MARKERS]))
+
+    if not has_marker(candidates):
+        # A remote-known new-ref tip can have an empty outgoing range and no
+        # boundaries, including after the configuration was deleted previously.
+        history = git('rev-list', '--full-history', tip, '--', *MARKERS).decode().splitlines()
+        if not has_marker(history):
+            return
+        candidates = list(dict.fromkeys(candidates + history))
+    # Only a memory repository gets here. Start its remaining independent reads;
+    # each result is collected where the sequential gate used to run it.
+    tree_listing = POOL.submit(git, 'ls-tree', '-r', '-t', '-z', tip)
+    endpoint_changes = POOL.submit(git, 'diff', '--no-renames', '--name-only', '-z', old, tip) if old_available else None
+    commit_changes = POOL.submit(git_stdin, ['diff-tree', '--stdin', '--no-renames', '--root', '-m', '--no-commit-id',
+                                             '--name-only', '-r', '-z'], commits) if commits else None
+    toplevel()
+    # has_marker already answered whether each candidate holds a configuration.
+    configurations([revision for revision in candidates if exists(revision, CONFIG)])
+    # Two repo keys may share one home (a renamed repo that kept its old key, say);
+    # check each home once. A tip without a configuration has retired it: no home is
+    # configured, and every former home still in the tree is checked below, so a
+    # repository can stop committing memory without hiding what it still commits.
+    configured = list(dict.fromkeys(homes(tip))) if exists(tip, CONFIG) else []
+    tree_paths = [record.split(b'\t', 1)[1].decode('utf-8', errors='surrogateescape')
+                  for record in tree_listing.result().split(b'\0') if record]
+    tree_keys = {canonical_key(path) for path in tree_paths}
+    configured_keys = {canonical_key(home) for home in configured}
+    historical_rows = {}
+
+    def historical_homes(revision):
+        if revision not in historical_rows:
+            historical_rows[revision] = set(homes(revision, strict=False)) if exists(revision, CONFIG) else set()
+        return historical_rows[revision]
+
+    previous = {home for revision in candidates for home in historical_homes(revision)}
+    former = [home for home in sorted(previous - set(configured))
+              if canonical_key(home) not in configured_keys and canonical_key(home) in tree_keys]
+    present([f'{revision}:{home}/MEMORY.md' for home in former for revision in candidates
+             if home in historical_homes(revision)])
+    # A row and its index must have coexisted. Either configuration creation or
+    # index creation can establish that witness; sampling config parents alone
+    # misses an index created and deleted between two configuration changes.
+    for home in sorted(previous - set(configured)):
+        home_key = canonical_key(home)
+        if home_key in configured_keys:
+            continue  # An explicitly registered canonical rename is checked below.
+        if home_key not in tree_keys:
+            continue  # Complete retirement has no surviving spelling or alias.
+        witnesses = [revision for revision in candidates if home in historical_homes(revision)]
+        valid = any(exists(revision, home + '/MEMORY.md') for revision in witnesses)
+        if not valid:
+            roots = [tip] + ([old] if old_available else [])
+            index_history = git('rev-list', '--full-history', *roots, '--', home + '/MEMORY.md').decode().splitlines()
+            # Batch this history's lookups instead of three git processes per revision.
+            present([f'{revision}:{CONFIG}' for revision in index_history])
+            configurations([revision for revision in index_history if exists(revision, CONFIG)])
+            present([f'{revision}:{home}/MEMORY.md' for revision in index_history
+                     if home in historical_homes(revision)])
+            valid = any(home in historical_homes(revision) and exists(revision, home + '/MEMORY.md')
+                        for revision in index_history)
+        if valid:
+            configured.append(home)
+    home_names = {}
+    for home in configured:
+        parts = pathlib.PurePosixPath(home).parts
+        for length in range(1, len(parts) + 1):
+            spelling = '/'.join(parts[:length])
+            key = canonical_key(spelling)
+            if key in home_names and home_names[key] != spelling:
+                raise ValueError(f'case/Unicode-colliding memory homes: {home}')
+            home_names[key] = spelling
+    # Scope boundaries must also match the actual tree, not just config rows.
+    # -t includes ancestor directories, so an unconfigured case/Unicode alias
+    # cannot disappear from an exact-prefix subtree listing or changed-home test.
+    for spelling in tree_paths:
+        key = canonical_key(spelling)
+        if key in home_names and home_names[key] != spelling:
+            raise ValueError(f'tree path aliases a memory home boundary: {spelling}')
+    changed = set()
+    if old_available:
+        # A rewind can have no outgoing commits but still publish an older,
+        # broken snapshot. Include endpoint changes as well as commit history.
+        changed.update(p.decode() for p in endpoint_changes.result().split(b'\0') if p)
+    if commits:
+        changed.update(p.decode() for p in commit_changes.result().split(b'\0') if p)
+    # A new ref publishes a snapshot even when its tip is already remote-known.
+    # Without a readable prior tip there is no safe affected-home comparison.
+    check_all = not old_available or CONFIG in changed or 'scripts/wiki-dangle-baseline' in changed
+    affected = [home for home in configured if check_all or any(
+        path == home or path.startswith(home + '/') for path in changed)]
+    indexes = POOL.submit(present, [f'{tip}:{home}/MEMORY.md' for home in affected])
+    # Homes are independent: check them all at once, even before their indexes
+    # are confirmed, then report in order and stop at the first failure (a
+    # missing index included) exactly as the sequential loop did.
+    checks = [POOL.submit(check_home, tip, home) for home in affected]
+    try:
+        found = indexes.result()
+        indexed = affected[:found.index(False)] if False in found else affected
+        for home, check in zip(indexed, checks):
+            result = check.result()
+            print(f'pre-push: checking committed memory {tip[:12]}:{home}', flush=True)
+            if isinstance(result, OSError):
+                raise result
+            sys.stdout.buffer.write(result.stdout)
+            sys.stdout.buffer.flush()
+            sys.stderr.buffer.write(result.stderr)
+            sys.stderr.buffer.flush()
+            if result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, result.args)
+    finally:
+        for check in checks:
+            check.cancel()  # Homes not yet started cannot change the outcome.
+    if indexed != affected:
+        raise ValueError(f'committed memory index missing: {affected[len(indexed)]}/MEMORY.md')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 4:
+        print('usage: pre-push-memory <local sha> <remote sha> <remote name>', file=sys.stderr)
+        sys.exit(2)
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f'pre-push: committed memory check failed: {error}', file=sys.stderr)
+        sys.exit(1)
