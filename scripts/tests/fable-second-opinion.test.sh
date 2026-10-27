@@ -50,6 +50,21 @@ while True:
         f.write(line + "\n")
 EOF
 tui() { printf "bash -c 'exec -a claude python3 %s %s'" "$tmp/fake_tui.py" "$1"; }
+# The same TUI stopped at a permission prompt: Enter here would answer it.
+cat > "$tmp/fake_dialog.py" <<'EOF'
+import sys
+log = sys.argv[1]
+print("Claude Code v0.0.0 (fake)\n\nBash command\n  rm -rf build\n\nDo you want to proceed?\n"
+      "\u276f 1. Yes\n  2. No, and tell Claude what to do differently (esc)\n\nEsc to cancel", flush=True)
+while True:
+    try:
+        line = input()
+    except EOFError:
+        break
+    with open(log, "a") as f:
+        f.write(line + "\n")
+EOF
+dialog_tui() { printf "bash -c 'exec -a claude python3 %s %s'" "$tmp/fake_dialog.py" "$1"; }
 
 tsb new-session -d -s work -n primary -c "$tmp" "$(tui "$tmp/primary.log")"
 # New windows (the advisor's) start /bin/sh: no user rc file slows or changes them.
@@ -94,6 +109,27 @@ out="$(printf '%s\n' 'rm -rf /' | "$skill/send-to-primary" --pane "$plain" 2>&1)
 equal "a shell pane is refused" 1 "$?"
 check "...saying why" "Refusing relay: pane $plain is at a sh shell" "$out"
 equal "...and nothing was typed there" "" "$(tsb capture-pane -p -t "$plain" | grep -F 'Fable advisor')"
+# exec: windows made after default-shell /bin/sh run their command under `sh -c`, and the
+# pane would read as sh, not claude.
+tsb new-window -t work -n asking -c "$tmp" "exec $(dialog_tui "$tmp/asking.log")"
+asking="$(tsb display-message -p -t work:asking '#{pane_id}')"
+until_true 10 grep -q 'Esc to cancel' <(tsb capture-pane -p -t "$asking")
+equal "the dialog pane reads as claude" "claude" "$(tsb display-message -p -t "$asking" '#{pane_current_command}')"
+out="$(printf '%s\n' 'looks fine' | "$skill/send-to-primary" --pane "$asking" --client claude 2>&1)"
+equal "a Claude pane at a permission prompt is refused" 1 "$?"
+check "...saying why" "shows a dialog or permission prompt waiting for a human" "$out"
+sleep 1
+equal "...and the prompt got no keys" "" "$(cat "$tmp/asking.log" 2>/dev/null)"
+tsb new-window -t work -n synced -c "$tmp" "exec $(tui "$tmp/synced-a.log")"
+tsb split-window -t work:synced -c "$tmp" "exec $(tui "$tmp/synced-b.log")"
+synced="$(tsb list-panes -t work:synced -F '#{pane_id}' | head -n 1)"
+until_true 10 grep -q 'Claude Code v' <(tsb capture-pane -p -t "$synced")
+tsb set-window-option -t work:synced synchronize-panes on
+out="$(printf '%s\n' 'only for one pane' | "$skill/send-to-primary" --pane "$synced" --client claude 2>&1)"
+equal "a pane in a synchronized window is refused" 1 "$?"
+check "...saying why" "synchronize-panes on" "$out"
+sleep 1
+equal "...and neither pane got the text" "" "$(cat "$tmp/synced-a.log" "$tmp/synced-b.log" 2>/dev/null)"
 
 echo "ask-fable stop"
 out="$("$skill/ask-fable" stop 2>&1)"
@@ -102,6 +138,24 @@ equal "stop succeeds" 0 "$?"
 equal "...closing the advisor's window" "gone" "$(tsb list-panes -t "$advisor" >/dev/null 2>&1 && echo present || echo gone)"
 equal "...and clearing the state" "gone" "$([[ -e "$XDG_CACHE_HOME/fable-second-opinion/current" ]] && echo present || echo gone)"
 equal "the primary pane is untouched" "claude" "$(tsb display-message -p -t "$primary" '#{pane_current_command}')"
+
+echo "ask-fable stop after the advisor's window moved"
+out="$(printf '%s\n' 'third advisor' | FABLE_LAUNCH_CMD="$(tui "$tmp/advisor3.log")" \
+  "$skill/ask-fable" start --long-running --session work --source-pane "$primary" --source-client claude \
+  --cwd "$tmp" --window fable-three 2>&1)"
+equal "a third advisor starts" 0 "$?"
+advisor3="$(sed -n 's/^advisor_pane=//p' <<<"$out")"
+old_target="$(sed -n 's/^advisor_target=//p' <<<"$out")"
+# What renumber-windows or a move-window does: the advisor leaves its index and another
+# agent's window takes it, so the recorded session:index now names that window.
+tsb move-window -s "$advisor3" -t work:90
+tsb new-window -t "$old_target" -n victim -c "$tmp" "exec $(tui "$tmp/victim.log")"
+victim="$(tsb display-message -p -t work:victim '#{pane_id}')"
+out="$("$skill/ask-fable" stop 2>&1)"
+equal "stop succeeds" 0 "$?"
+equal "...closing the advisor where it is now" "gone" "$(tsb list-panes -t "$advisor3" >/dev/null 2>&1 && echo present || echo gone)"
+equal "...and leaving the window at its old index alone" "present" \
+  "$(tsb list-panes -t "$victim" >/dev/null 2>&1 && echo present || echo gone)"
 
 echo "an advisor that died behind the helper's back"
 out="$(printf '%s\n' 'second advisor' | FABLE_LAUNCH_CMD="$(tui "$tmp/advisor2.log")" \

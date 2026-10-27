@@ -7,7 +7,8 @@ Usage: send-to-primary --pane TARGET [--tmux-host HOST]
                        [--client claude|codex]
 
 Read a message from stdin and relay it to an active Claude/Codex tmux pane.
-Refuses targets that look like ordinary shell panes.
+Refuses targets that look like ordinary shell panes, a pane showing a dialog or
+permission prompt, and a window with synchronize-panes on.
 EOF
 }
 
@@ -73,6 +74,37 @@ tmux_run() {
   fi
 }
 
+# A dialog on screen (a permission prompt, a y/n question, a numbered choice) is waiting
+# for a human, and the relay's Enter would answer it. These are cc-park's patterns (ported
+# from Drover's screen classifier), so the tools agree on what a dialog is. $1: the screen.
+dialog_on_screen() {
+  local tail options=0
+  tail="$(sed '/^[[:space:]]*$/d' <<<"$1" | tail -n 40)"
+  if grep -Eq '^[[:space:]│]*(❯|>|›)?[[:space:]]*[0-9]\.[[:space:]]+[^[:space:]]' <<<"$tail" \
+    && grep -Eiq '❯|Esc to cancel|Enter to (select|confirm)' <<<"$tail"; then
+    options=1
+  fi
+  grep -Eiq '\(y/n\)|\[y/n\]|Held message from another session|Another Claude session sent a message' <<<"$tail" \
+    && return 0
+  if (( options )) && grep -Eiq 'Do you want to (proceed|allow|run|make this edit|create|continue)|Run a dynamic workflow\?|Allow .{1,80} to (run|read|write|edit)|Enter to confirm|Select an option|Press Enter to continue|Would you like to|Esc to cancel' <<<"$tail"; then
+    return 0
+  fi
+  return 1
+}
+
+# The checks every target must pass, whatever runs in it: synchronize-panes would mirror the
+# keys into every pane of the window, and a dialog would take the Enter as its answer.
+guard_screen() {
+  if [[ "$(tmux_run display-message -p -t "$pane" '#{pane_synchronized}' 2>/dev/null || true)" == "1" ]]; then
+    echo "Refusing relay: pane $pane's window has synchronize-panes on, so the keys would reach every pane in it" >&2
+    return 1
+  fi
+  if dialog_on_screen "$(tmux_run capture-pane -p -t "$pane" 2>/dev/null || true)"; then
+    echo "Refusing relay: pane $pane shows a dialog or permission prompt waiting for a human; Enter would answer it" >&2
+    return 1
+  fi
+}
+
 target_kind=""
 guard_agent_target() {
   local command_name
@@ -95,7 +127,8 @@ guard_agent_target() {
         return 1
       fi
       target_kind="claude"
-      return 0
+      guard_screen
+      return
       ;;
     codex)
       if [[ -n "$requested_client" && "$requested_client" != "codex" ]]; then
@@ -103,7 +136,8 @@ guard_agent_target() {
         return 1
       fi
       target_kind="codex"
-      return 0
+      guard_screen
+      return
       ;;
   esac
 
@@ -118,11 +152,13 @@ guard_agent_target() {
   if [[ "$target_kind" == "claude" ]]; then
     if grep -Eq '^[[:space:]│]*❯|Ebbing|esc to interrupt' <<<"$visible" \
       && grep -Eq '⏸ plan mode|shift\+tab to cycle|· /effort' <<<"$last_nonblank"; then
-      return 0
+      guard_screen
+      return
     fi
   elif grep -Eq '^[[:space:]]*›|Working \(' <<<"$visible" \
     && grep -Eq '^[[:space:]]*gpt-[^[:space:]]+ .* · .* · gpt-' <<<"$last_nonblank"; then
-      return 0
+      guard_screen
+      return
   fi
 
   echo "Refusing relay: pane $pane runs $command_name but its current live composer/status does not match --client=$target_kind" >&2

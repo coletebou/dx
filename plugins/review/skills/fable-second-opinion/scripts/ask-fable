@@ -263,12 +263,10 @@ case "$action" in
     ;;
   stop)
     load_advisor
-    advisor_target="$(state_value advisor_target || true)"
-    if [[ -n "$advisor_target" ]]; then
-      tmux_run kill-window -t "$advisor_target"
-    else
-      tmux_run kill-pane -t "$advisor_pane"
-    fi
+    # By the pane id load_advisor just verified, never the recorded session:index: window
+    # indexes move (renumber-windows, move-window), and that index may now name another
+    # agent's window. The advisor's window closes with its only pane.
+    tmux_run kill-pane -t "$advisor_pane"
     rm -f "$state_file"
     echo "Stopped Fable advisor"
     exit 0
