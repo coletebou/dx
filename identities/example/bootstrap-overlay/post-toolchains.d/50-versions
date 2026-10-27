@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# An executable hook: run as its own process, with the BOOTSTRAP_* environment. hook-env.sh gives
+# a bash hook the same helpers a sourced hook has. This one prints the pinned tools' versions as
+# the target user sees them, and changes nothing.
+set -euo pipefail
+# shellcheck source=scripts/bootstrap/lib/hook-env.sh
+. "$BOOTSTRAP_LIB/hook-env.sh"
+
+for tool in tmux gitleaks lazygit eza delta zoxide; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        case "$tool" in
+            tmux) v="$(tmux -V)" ;;
+            gitleaks) v="gitleaks $(gitleaks version)" ;;
+            *) v="$("$tool" --version 2>/dev/null | head -n 1)" ;;
+        esac
+        log "$v"
+    else
+        log "$tool: not installed"
+    fi
+done
+for tool in node starship claude; do
+    v="$(as_user sh -c "command -v $tool >/dev/null && $tool --version 2>/dev/null | head -n 1" || true)"
+    log "$tool (for $TARGET_USER): ${v:-not installed}"
+done
