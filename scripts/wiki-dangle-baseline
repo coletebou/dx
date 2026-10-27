@@ -1,0 +1,16 @@
+# Baseline count of dangling [[wiki-links]] per memory home, for scripts/memory-canary.
+#
+# Format: <home dir name>=<count>, one line per home; `#` starts a comment. The name is
+# the memory home's last path component (webapp for identities/<you>/claude/memory/webapp).
+#
+# At or below the number = WARN (inherited rot, visible but not blocking).
+# ABOVE it = PROBLEM, which fails --strict and blocks the pre-push hook, so a
+# promotion or a human adding a NEW dangle is caught immediately.
+# A home with no line has no ratchet: its dangles are warnings only.
+#
+# Start a home at its current count (memory-canary --dir <home> prints it), then
+# ratchet DOWN only: fix rot, then lower the number. Never raise it to silence a
+# real regression.
+#
+# webapp=0
+# dotfiles=3

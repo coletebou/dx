@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# memory-canary — integrity and capacity check for Claude Code memory directories
+# (a MEMORY.md index plus one Markdown file per memory).
+#
+# WHY THIS EXISTS
+# ---------------
+# Claude Code loads only the head of MEMORY.md. Its docs say the first 200 lines or
+# the first 25KB, whichever comes first, and nothing past that point. How it counts
+# was observed in the CLI itself (versions 2.1.220 to 2.1.311), not documented: it
+# trims the text, keeps the first 200 lines, then cuts what is left at the last line
+# break before 25,000 characters. What vanishes is the END of the file, which for an
+# index that is appended to holds the NEWEST memories.
+#
+# Claude Code warns Claude when its own write leaves the index near or over a limit.
+# Nothing warns when something else grows it (a nightly promotion by `dream`, a hand
+# edit, a merge pulled in by git), and nothing checks in git. An index that grows a
+# few lines a day reaches the cap in weeks and then drops its newest entries silently.
+#
+# WHAT IT CHECKS (all read-only; never edits a memory file)
+#   1. CAPACITY — trimmed line and character counts against those caps, computed
+#      the way the CLI computes them (strip, then split on "\n"), NOT with `wc -l`.
+#      `wc -l` counts newline-terminated lines and disagrees by one, which matters
+#      at a hard boundary.
+#   2. DANGLING LINKS — every `](target.md)` in the index must resolve on disk.
+#      A promotion writer that appends an index line for a file it did not write
+#      introduces one, and Claude Code says nothing.
+#   3. CASE COLLISIONS — Linux filesystems are usually case-SENSITIVE and macOS's
+#      default APFS volume is case-INSENSITIVE. `MEMORY.md` and `memory.md` are two
+#      files on one and the same file on the other, so a case-variant name that
+#      syncs between them is a silent overwrite on one machine and a duplicate on
+#      the other.
+#   4. CONFLICT MARKERS — `git pull --rebase --autostash` exits 0 when re-applying
+#      the stash conflicts (it prints the conflict and leaves the markers in the
+#      file), so a sync script carries on and commits `<<<<<<< Updated upstream`
+#      into the index. This is the cheapest guard on that path.
+#   5. WIKI-LINKS — every `[[target]]` must name a memory file or a memory's
+#      `name:`. A ratchet (wiki-dangle-baseline, next to this script) keeps old
+#      link rot visible without letting new rot in. See the comments below.
+#
+# WHICH DIRECTORIES
+#   --dir <path>, if given. Otherwise every home in claude/memory-homes.conf
+#   ($MEMORY_HOMES_CONF, default ${DOTFILES_DIR:-~/.dotfiles}/claude/memory-homes.conf)
+#   that holds a MEMORY.md: `~` and `$HOME` expand, and a relative path is relative to
+#   the repository holding the conf. With no such home, the memory directory Claude
+#   Code uses for the current directory: `autoMemoryDirectory` from the local, project
+#   or user settings, else ~/.claude/projects/<encoded main checkout>/memory (the same
+#   lookup as base/claude/load-memory-hook.sh).
+#
+# EXIT CODES
+#   0 = OK (or warnings only, unless --strict)
+#   1 = a hard failure: over a cap, dangling link, case collision, or conflict
+#       markers present. Under --strict, warnings also exit 1.
+#   2 = usage / environment problem (no memory dir found, etc.)
+#
+# Deliberately dependency-light: bash (3.2 is fine) and python3 only. No jq, and no
+# git for the checks themselves, so it runs the same from a git hook, a sync script,
+# cron, or by hand.
+#
+# Usage:
+#   memory-canary                     # check every configured memory home
+#   memory-canary --dir <path>        # check one directory
+#   memory-canary --strict            # warnings are failures (use in CI/hooks)
+#   memory-canary --quiet             # only print problems
+#   memory-canary --json              # one JSON object per directory, for scripts
+set -uo pipefail
+
+# Thresholds. The CAPS are Claude Code's; the WARN levels are ours: 90% of each,
+# so that an index growing a few lines a day gives several days of notice, not hours.
+CAP_LINES=200
+CAP_BYTES=25000
+WARN_LINES=180
+WARN_BYTES=22500
+
+STRICT=0
+QUIET=0
+JSON=0
+EXPLICIT_DIR=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --strict) STRICT=1; shift ;;
+    --quiet)  QUIET=1; shift ;;
+    --json)   JSON=1; QUIET=1; shift ;;
+    --dir)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ] || [[ "$2" == --* ]]; then
+        echo "memory-canary: --dir requires a directory" >&2
+        exit 2
+      fi
+      EXPLICIT_DIR="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "memory-canary: unknown option $1" >&2; exit 2 ;;
+  esac
+done
+
+# The directory this script really lives in: install.sh links it into ~/.local/bin,
+# and the ratchet's baseline file sits next to the real script, not next to the link.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *)  self="$(dirname "$self")/$link" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$self")" && pwd)"
+
+CONF="${MEMORY_HOMES_CONF:-${DOTFILES_DIR:-$HOME/.dotfiles}/claude/memory-homes.conf}"
+
+# The memory dir Claude Code uses for the current directory, as
+# base/claude/load-memory-hook.sh resolves it (python3 reads the settings, so there
+# is no jq dependency). Prints nothing when there is none.
+auto_memory_dir() {
+  local common main="" local_root
+  common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$common" ]; then
+    main="$(cd "$(dirname "$common")" 2>/dev/null && pwd || true)"
+  fi
+  local_root="$main"
+  [ "$local_root" = "$HOME" ] && local_root=""
+  LOCAL_ROOT="$local_root" MAIN_ROOT="$main" python3 - <<'PY'
+import json, os, re
+home = os.path.expanduser('~')
+cwd = os.getcwd()
+root = os.environ['LOCAL_ROOT']
+files = ([os.path.join(root, '.claude/settings.local.json')] if root else []) + [
+    os.path.join(cwd, '.claude/settings.local.json'),
+    os.path.join(cwd, '.claude/settings.json'),
+    os.path.join(home, '.claude/settings.json')]
+found = ''
+for path in files:
+    try:
+        with open(path, encoding='utf-8') as fh:
+            value = json.load(fh).get('autoMemoryDirectory') or ''
+    except (OSError, ValueError, AttributeError):
+        continue  # absent, half-written or not an object: try the next scope
+    if isinstance(value, str) and value:
+        found = home + value[1:] if value.startswith('~/') else value
+        break
+if not found:
+    found = os.path.join(home, '.claude/projects',
+                         re.sub(r'[^A-Za-z0-9]', '-', os.environ['MAIN_ROOT'] or os.environ.get('PWD') or cwd),
+                         'memory')
+print(found)
+PY
+}
+
+# Resolve which directories to check.
+dirs=()
+if [ -n "$EXPLICIT_DIR" ]; then
+  if [ ! -d "$EXPLICIT_DIR" ]; then
+    echo "memory-canary: directory not found: $EXPLICIT_DIR" >&2
+    exit 2
+  fi
+  dirs+=("$EXPLICIT_DIR")
+elif [ -r "$CONF" ]; then
+  # Format is `<shortname> <path>`; comments and blanks skipped. Only take rows whose
+  # resolved dir actually holds a MEMORY.md, so a stale row (a home on another
+  # machine, or one not created yet) does not produce a spurious failure.
+  conf_root="$(cd "$(dirname "$CONF")/.." && pwd)"
+  while read -r _name _path _rest; do
+    case "${_name:-}" in ''|'#'*) continue ;; esac
+    [ -n "${_path:-}" ] || continue
+    # shellcheck disable=SC2088  # literal ~/ and $HOME/ prefixes, matched, not expanded
+    case "$_path" in
+      /*)       cand="$_path" ;;
+      '~/'*)    cand="$HOME/${_path#\~/}" ;;
+      '$HOME/'*) cand="$HOME/${_path#\$HOME/}" ;;
+      *)        cand="$conf_root/$_path" ;;
+    esac
+    [ -f "$cand/MEMORY.md" ] && dirs+=("$cand")
+  done < "$CONF"
+fi
+auto=""
+if [ "${#dirs[@]}" -eq 0 ] && [ -z "$EXPLICIT_DIR" ]; then
+  auto="$(auto_memory_dir)"
+  [ -n "$auto" ] && [ -f "$auto/MEMORY.md" ] && dirs+=("$auto")
+fi
+if [ "${#dirs[@]}" -eq 0 ]; then
+  echo "memory-canary: no memory home with a MEMORY.md found (looked at the homes in $CONF and at ${auto:-the Claude Code memory dir of this directory}); pass --dir <path>" >&2
+  exit 2
+fi
+
+# The Python lives in a function, NOT in a here-doc inside `out=$( … )`. bash 3.2
+# (macOS /bin/bash, which `#!/usr/bin/env bash` runs whenever /bin precedes
+# Homebrew on PATH) finds the end of a $( … ) by lexing its text as shell, here-doc
+# body included. In shell, `strip('"\'')` is a complete '…' plus a stray ', which
+# flipped quote parity for the rest of the body: 3.2 could not even PARSE this
+# script ("unexpected EOF while looking for matching ``'"), and because
+# pre-push-memory runs it on every outgoing memory home, every push of a memory
+# repository was blocked. A here-doc in a function body is read as a here-doc by
+# every bash.
+check_memory_dir() {
+  python3 - <<'PY'
+import os, re, sys, json, collections, io, itertools
+
+d          = os.environ['CANARY_DIR']
+CAP_LINES  = int(os.environ['CAP_LINES'])
+CAP_BYTES  = int(os.environ['CAP_BYTES'])
+WARN_LINES = int(os.environ['WARN_LINES'])
+WARN_BYTES = int(os.environ['WARN_BYTES'])
+STRICT     = os.environ['STRICT'] == '1'
+AS_JSON    = os.environ['JSON'] == '1'
+QUIET      = os.environ['QUIET'] == '1'
+
+problems, warnings, info = [], [], []
+
+def cc_metrics(text):
+    """Count the way Claude Code does: trim, then count. NOT wc -l — that disagrees
+    by one at a trailing newline, which is exactly where a hard cap bites."""
+    t = text.strip()
+    return len(t.split('\n')), len(t)
+
+index_path = os.path.join(d, 'MEMORY.md')
+if not os.path.isfile(index_path):
+    problems.append(f'MEMORY.md missing in {d}')
+    idx_lines = idx_bytes = 0
+    raw = ''
+else:
+    raw = open(index_path, encoding='utf-8', errors='replace').read()
+    idx_lines, idx_bytes = cc_metrics(raw)
+
+    # 1. CAPACITY
+    if idx_lines > CAP_LINES:
+        problems.append(f'MEMORY.md OVER LINE CAP: {idx_lines} > {CAP_LINES} — CC keeps the first {CAP_LINES} and DISCARDS the newest {idx_lines-CAP_LINES}')
+    elif idx_lines >= WARN_LINES:
+        warnings.append(f'MEMORY.md approaching line cap: {idx_lines}/{CAP_LINES} ({CAP_LINES-idx_lines} left)')
+    if idx_bytes > CAP_BYTES:
+        problems.append(f'MEMORY.md OVER BYTE CAP: {idx_bytes} > {CAP_BYTES} — tail silently dropped')
+    elif idx_bytes >= WARN_BYTES:
+        warnings.append(f'MEMORY.md approaching byte cap: {idx_bytes}/{CAP_BYTES} ({CAP_BYTES-idx_bytes} left)')
+
+    # 2. DANGLING LINKS. Every link target in the index must exist. Strip a leading
+    # './' because merge tools and promotion writers may emit that form.
+    targets = [t.lstrip('./') for t in re.findall(r'\]\(([^)]+\.md)\)', raw)]
+    dangling = sorted({t for t in targets if not os.path.exists(os.path.join(d, t))})
+    if dangling:
+        problems.append(f'{len(dangling)} DANGLING link(s): ' + ', '.join(dangling[:6]) + ('…' if len(dangling) > 6 else ''))
+    info.append(f'{len(targets)} link(s), {len(set(targets))} unique, {len(dangling)} dangling')
+
+    # 4. CONFLICT MARKERS in the index (see header: an autostash conflict exits 0).
+    if re.search(r'^<<<<<<< ', raw, re.M) and re.search(r'^>>>>>>> ', raw, re.M):
+        problems.append('CONFLICT MARKERS present in MEMORY.md — a merge was committed unresolved')
+
+# 3. CASE COLLISIONS across the whole memory dir.
+names = [f for f in os.listdir(d) if f.endswith('.md')] if os.path.isdir(d) else []
+
+# Three passes below read every detail file; opening each of several hundred files
+# three times was most of this check's run time. Read each once (None if
+# unreadable, which every pass already skips).
+bodies = {}
+def body_of(n):
+    if n not in bodies:
+        try:
+            with open(os.path.join(d, n), encoding='utf-8', errors='replace') as fh:
+                bodies[n] = fh.read()
+        except OSError:
+            bodies[n] = None
+    return bodies[n]
+by_lower = collections.defaultdict(list)
+for n in names:
+    by_lower[n.lower()].append(n)
+collisions = {k: v for k, v in by_lower.items() if len(v) > 1}
+if collisions:
+    problems.append('CASE COLLISION (a case-sensitive filesystem sees distinct files, a case-insensitive one sees one): '
+                    + '; '.join(f'{k} -> {sorted(v)}' for k, v in sorted(collisions.items())[:4]))
+
+# A reserved-name variant is a latent clobber even without a live collision.
+reserved_variants = sorted(n for n in names if n.lower() in ('memory.md', 'dreams.md') and n not in ('MEMORY.md', 'DREAMS.md'))
+if reserved_variants:
+    problems.append('RESERVED-NAME case variant present: ' + ', '.join(reserved_variants))
+
+# CONFLICT MARKERS anywhere else in the dir (detail files sync through git too).
+# A REAL marker is at COLUMN 0 and comes with its closing sibling. A substring
+# test false-positived on a memory file documenting the autostash bug, which
+# quotes `<<<<<<< Updated upstream` inline in backticks — so require line-start
+# AND a matching >>>>>>> to distinguish documentation from a conflict.
+marked = []
+for n in names:
+    if n == 'MEMORY.md':
+        continue
+    body = body_of(n)
+    if body is not None and re.search(r'^<<<<<<< ', body, re.M) and re.search(r'^>>>>>>> ', body, re.M):
+        marked.append(n)
+if marked:
+    problems.append(f'CONFLICT MARKERS in {len(marked)} detail file(s): ' + ', '.join(marked[:5]))
+
+# 5. WIKI-LINKS. `[[foo]]` resolves against a memory's frontmatter `name:` slug OR
+# its filename, and the two are often NOT kept in sync: a name can be dash-cased
+# (`reference-build-cache`) while its file is underscore-cased
+# (`reference_build_cache.md`), and some files' name: does not match their own
+# filename at all. Checking `[[x]]` against `x.md` alone therefore produces FALSE
+# dangles and MISSES real ones.
+#
+# So build the valid-target set from BOTH sources and try both spellings of each
+# link. A promotion writer that gets a link's type prefix wrong (`feedback_x` when
+# the file is `reference_x`) is exactly what this catches and the markdown-link
+# check above does not.
+#
+# Reported as a WARNING, not a problem: an existing tree may already carry some,
+# and blocking every push on inherited link rot would be a gate nobody can clear.
+# The baseline below turns a NEW dangle into a problem.
+valid_targets = set()
+frontmatter_names = {}
+for n in names:
+    stem = n[:-3]
+    valid_targets.add(stem)
+    valid_targets.add(stem.replace('_', '-'))
+    valid_targets.add(stem.replace('-', '_'))
+    body = body_of(n)
+    if body is None:
+        continue
+    # The first 12 lines exactly as iterating the text-mode file yields them.
+    for line in itertools.islice(io.StringIO(body), 12):
+        m = re.match(r'^name:\s*(.+?)\s*$', line)
+        if m:
+            nm = m.group(1).strip().strip('"\'')
+            frontmatter_names[n] = nm
+            valid_targets.add(nm)
+            valid_targets.add(nm.replace('_', '-'))
+            valid_targets.add(nm.replace('-', '_'))
+            break
+
+# Only SLUG-SHAPED targets are wiki-links. Bash `[[ -f x ]]` test expressions in
+# code blocks match the same brackets (`! -L /var/lib/x`, `-f`, `-n "$x"` would
+# all read as dangling links). Require a leading alphanumeric and no
+# spaces/slashes/dollars, and strip fenced code blocks first, which removes both the
+# test-syntax noise and any example links inside a documented snippet.
+WIKI_SLUG = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+wiki_dangling = {}
+for n in names:
+    body = body_of(n)
+    if body is None:
+        continue
+    body = re.sub(r'^```.*?^```', '', body, flags=re.S | re.M)   # drop fenced blocks
+    body = re.sub(r'`[^`\n]*`', '', body)                        # drop INLINE code spans
+    for link in set(re.findall(r'\[\[([^\]|#]+?)\]\]', body)):
+        t = link.strip()
+        if not t or not WIKI_SLUG.match(t):
+            continue
+        if t in valid_targets or t.replace('_', '-') in valid_targets or t.replace('-', '_') in valid_targets:
+            continue
+        # A target written WITH the .md extension is still resolvable — check the stem.
+        if t.endswith('.md') and (t[:-3] in valid_targets or t[:-3].replace('_', '-') in valid_targets):
+            continue
+        wiki_dangling.setdefault(t, []).append(n)
+# RATCHET, not a wall. A tree that already carries link rot would fail --strict on
+# its raw count and block every push on a backlog nobody can clear in one sitting —
+# a gate that must be bypassed is worse than no gate. Instead compare against a
+# baseline alongside this script (wiki-dangle-baseline, one `<home dir name>=<count>`
+# line per home): at or below it is a WARN, ABOVE it is a PROBLEM. So a promotion
+# (or a human) that adds a NEW dangle is caught, while the backlog is visible
+# without being blocking. Lower the baseline as rot gets fixed; it only ratchets
+# down. A home with no line has no ratchet: its dangles are warnings only.
+wiki_baseline = None
+bl_path = os.path.join(os.environ.get('CANARY_BASELINE_DIR', ''), 'wiki-dangle-baseline')
+if bl_path and os.path.isfile(bl_path):
+    try:
+        for line in open(bl_path):
+            line = line.split('#')[0].strip()
+            if not line:
+                continue
+            key, _, val = line.partition('=')
+            if key.strip() == os.path.basename(d.rstrip('/')):
+                wiki_baseline = int(val.strip())
+                break
+    except (OSError, ValueError):
+        wiki_baseline = None
+
+if wiki_dangling:
+    shown = sorted(wiki_dangling)[:5]
+    msg = (f'{len(wiki_dangling)} dangling [[wiki-link]] target(s): '
+           + ', '.join(f'{t} (in {wiki_dangling[t][0]})' for t in shown)
+           + ('…' if len(wiki_dangling) > 5 else ''))
+    if wiki_baseline is not None and len(wiki_dangling) > wiki_baseline:
+        problems.append(f'{msg}  [NEW: baseline is {wiki_baseline}]')
+    else:
+        if wiki_baseline is not None:
+            msg += f'  (baseline {wiki_baseline}; not increased)'
+        warnings.append(msg)
+info.append(f'{len(valid_targets)} resolvable wiki-target spellings from {len(frontmatter_names)} name: fields + {len(names)} filenames')
+
+# DREAMS.md is uncapped by policy but hits the SAME caps the moment anything links
+# it into the index. Report it so it is never a surprise.
+dreams = os.path.join(d, 'DREAMS.md')
+if os.path.isfile(dreams):
+    dl, db = cc_metrics(open(dreams, encoding='utf-8', errors='replace').read())
+    linked = 'DREAMS.md' in raw
+    note = f'DREAMS.md {dl} lines / {db} bytes' + (' — LINKED from the index, so it IS subject to the caps' if linked else ' (not linked from the index; not loaded today)')
+    # Warn on an over-cap DREAMS.md even when it is NOT linked. The nightly sweep
+    # appends to it every night; unlinked it loses nothing, but it is one
+    # `- [Dream diary](DREAMS.md)` line away from being a capped memory file whose
+    # tail — the newest dreams — is silently discarded. `dream` rotates it
+    # (_dream_rotate_diary), so an over-cap value here means rotation did not run
+    # or its threshold is too high.
+    if dl > CAP_LINES or db > CAP_BYTES:
+        warnings.append(note + f' — OVER a cap ({CAP_LINES}L/{CAP_BYTES}B); rotation should have run')
+    elif linked and (dl > WARN_LINES or db > WARN_BYTES):
+        warnings.append(note)
+    else:
+        info.append(note)
+
+result = {
+    'dir': d,
+    'index_lines': idx_lines,
+    'index_bytes': idx_bytes,
+    'cap_lines': CAP_LINES,
+    'cap_bytes': CAP_BYTES,
+    'md_files': len(names),
+    'problems': problems,
+    'warnings': warnings,
+    'info': info,
+    # --strict promotes warnings to failures, EXCEPT the ratcheted wiki-link line.
+    # Capacity warnings must block: past 90% of a cap the next ordinary session can
+    # breach and silently drop the newest memories. Inherited link rot must NOT
+    # block: the ratchet already fails the moment the count INCREASES, so blocking on
+    # the standing backlog would make every push require --no-verify — and a gate
+    # that must be bypassed routinely is worse than no gate at all.
+    'ok': not problems and not (STRICT and [w for w in warnings if 'wiki-link' not in w]),
+}
+
+if AS_JSON:
+    print(json.dumps(result))
+else:
+    short = d.replace(os.path.expanduser('~'), '~')
+    if problems:
+        print(f'✗ memory-canary {short}')
+    elif warnings:
+        print(f'! memory-canary {short}')
+    elif not QUIET:
+        print(f'✓ memory-canary {short}')
+    if not QUIET or problems or warnings:
+        print(f'    index {idx_lines}/{CAP_LINES} lines, {idx_bytes}/{CAP_BYTES} bytes, {len(names)} files')
+    for p in problems:
+        print(f'    PROBLEM: {p}')
+    for w in warnings:
+        print(f'    WARN:    {w}')
+    if not QUIET:
+        for i in info:
+            print(f'    info:    {i}')
+
+sys.exit(0 if result['ok'] else 1)
+PY
+}
+
+rc=0
+for d in "${dirs[@]}"; do
+  out=$(
+    CANARY_DIR="$d" \
+    CAP_LINES="$CAP_LINES" CAP_BYTES="$CAP_BYTES" \
+    WARN_LINES="$WARN_LINES" WARN_BYTES="$WARN_BYTES" \
+    STRICT="$STRICT" JSON="$JSON" QUIET="$QUIET" \
+    CANARY_BASELINE_DIR="$SCRIPT_DIR" \
+    check_memory_dir
+  )
+  prc=$?
+  [ -n "$out" ] && printf '%s\n' "$out"
+  [ "$prc" -ne 0 ] && rc=1
+done
+
+exit "$rc"
