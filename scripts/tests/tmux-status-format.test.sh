@@ -70,7 +70,10 @@ for i in $(seq 1 50); do  # the client draws the mode on its next redraw
   sleep 0.1
 done
 equal "window row uses the published color" 1 "$(grep -c $'\e\[38;5;178msleep' <<<"$row")"
-grep -q $'\e\[38;5;178msleep' <<<"$row" || printf '       row:  %q\n' "$row"
+if ! grep -q $'\e\[38;5;178msleep' <<<"$row"; then
+  printf '       row:  %q\n       clients: %s\n       outer screen:\n' "$row" "$(tmux list-clients 2>&1 | head -n 3)"
+  tmux -L outer capture-pane -p 2>&1 | sed '/^[[:space:]]*$/d' | head -n 15 | sed 's/^/         | /'
+fi
 tmux send-keys -t "$pane" q
 tmux -L outer kill-server
 
