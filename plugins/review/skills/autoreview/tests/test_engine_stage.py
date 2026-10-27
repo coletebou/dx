@@ -1,6 +1,5 @@
 """Portable synthetic tests for the opt-in local engine-stage observer."""
 import os
-import ast
 import contextlib
 import copy
 import importlib.util
@@ -11,7 +10,6 @@ from pathlib import Path
 import queue
 import runpy
 import shlex
-import signal
 import stat
 import subprocess
 import sys

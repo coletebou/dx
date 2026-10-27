@@ -60,7 +60,7 @@ class GitFixtureIsolationTests(unittest.TestCase):
             "PATH", "PATHEXT", "SYSTEMROOT", "SystemRoot", "COMSPEC", "WINDIR",
             "TEMP", "TMP", "TMPDIR",
         ) if key in os.environ}
-        if developer := os.environ.get("DEVELOPER_DIR"):
+        if os.environ.get("DEVELOPER_DIR"):
             validated = ORACLE_TOOLS["fixture_git_env"](str(self.root), roots)
             self.oracle_env["DEVELOPER_DIR"] = validated["DEVELOPER_DIR"]
         self.oracle_env.update({

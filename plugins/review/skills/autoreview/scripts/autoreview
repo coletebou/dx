@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
-import binascii
-import bisect
 import contextlib
 import copy
 import functools
@@ -5181,7 +5179,7 @@ def codex_telemetry_flags(repo: Path) -> list[str]:
             return []
         flags += ["-c", f"otel.tool_result.max_bytes={tool_result['max_bytes']}"]
     exporters = 0
-    for kind, signal in CODEX_TELEMETRY_SIGNALS.items():
+    for kind, signal_name in CODEX_TELEMETRY_SIGNALS.items():
         if kind not in otel:
             continue
         spec = otel[kind]
@@ -5199,7 +5197,7 @@ def codex_telemetry_flags(repo: Path) -> list[str]:
         if (
             set(http) - {"endpoint", "protocol"}
             or match is None
-            or match.group(2) != signal
+            or match.group(2) != signal_name
             or not 0 < int(match.group(1)) < 65536
             or protocol not in ("binary", "json")
         ):
@@ -6758,7 +6756,8 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         try:
             result = run_claude_once(selected, repo, prompt)
         except EngineInterrupted as exc:
-            record_seat_process_metrics(selected, lambda: claude_process_metrics(selected, exc.stdout))
+            interrupted_stdout = exc.stdout
+            record_seat_process_metrics(selected, lambda: claude_process_metrics(selected, interrupted_stdout))
             raise
         record_seat_process_metrics(selected, lambda: claude_process_metrics(selected, result.stdout))
         return result
