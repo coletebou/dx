@@ -98,9 +98,10 @@ itself, which is the signal to restart the service:
 
 ```ini
 # /etc/systemd/system/cloudflared-update.service (run daily by a matching .timer)
+# "$$" is a literal "$" here: systemd substitutes its own variables in ExecStart first.
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '/usr/bin/cloudflared update; rc=$?; if [ "$rc" -eq 11 ]; then systemctl restart cloudflared; exit 0; fi; exit "$rc"'
+ExecStart=/bin/bash -c '/usr/bin/cloudflared update; rc=$$?; if [ "$$rc" -eq 11 ]; then systemctl restart cloudflared; exit 0; fi; exit "$$rc"'
 ```
 
 ## Access in front of self-hosted services

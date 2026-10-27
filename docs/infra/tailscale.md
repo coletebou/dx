@@ -37,7 +37,8 @@ on the machine:
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
-sudo install -m 600 /dev/null /etc/tailscale-authkey      # paste the key into this file
+sudo install -m 600 /dev/null /etc/tailscale-authkey
+sudoedit /etc/tailscale-authkey                           # paste the key, save
 sudo tailscale up --auth-key=file:/etc/tailscale-authkey --advertise-tags=tag:server \
   --hostname=box-a
 sudo rm /etc/tailscale-authkey
