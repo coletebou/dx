@@ -146,7 +146,7 @@ else
 fi
 
 echo "a Codex config of your own"
-newhome 7
+newhome 12
 mkdir -p "$HOME/.codex"
 chmod 755 "$HOME/.codex"
 printf 'model = "mine"\n' > "$HOME/.codex/config.toml"
@@ -159,7 +159,7 @@ out="$(inst --with codex)"; rc=$?
 check "...and a rerun changes nothing" "Everything was already in place." "$out"
 
 echo "node-tools"
-newhome 8
+newhome 13
 out="$(NODE_TOOLS_NODE_MAJOR=1 inst --with node-tools)"; rc=$?
 equal "without the Node it needs, the install still succeeds" 0 "$rc"
 check "...saying what is missing" "the pinned Node tools need Node 1 and npm" "$out"
