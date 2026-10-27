@@ -228,6 +228,24 @@ out="$(in_repo "$pw" teardown "$tmp/nine.tsv" 2>&1)"
 equal "that manifest's own teardown succeeds" 0 "$?"
 equal "...removing the rest" "gone" "$(gone "$tmp/ext/proj-test-iota")"
 
+echo "a path an older launch recorded, launched into since by another manifest"
+manifest eleven kappa                                              # A: feat/kappa at proj-kappa
+printf 'kappa\tfeat/other\tnothing to do\n' > "$tmp/twelve.tsv"   # B: the same tag, another branch
+out="$(in_repo "$pw" launch "$tmp/eleven.tsv" --no-bootstrap 2>&1)"
+equal "A launches" 0 "$?"
+out="$(in_repo "$pw" teardown "$tmp/eleven.tsv" 2>&1)"
+equal "...and is torn down" "gone" "$(gone "$tmp/ext/proj-kappa")"
+sleep 1   # B's launch log must be newer than A's on a filesystem with 1 s timestamps
+out="$(in_repo "$pw" launch "$tmp/twelve.tsv" --no-bootstrap 2>&1)"
+equal "B launches into the same path" "present" "$(gone "$tmp/ext/proj-kappa")"
+: > "$tmp/ext/proj-kappa/uncommitted.txt"
+out="$(in_repo "$pw" teardown "$tmp/eleven.tsv" 2>&1)"
+equal "A's teardown again (its old log still records the path) leaves B's worktree" "present" \
+  "$(gone "$tmp/ext/proj-kappa/uncommitted.txt")"
+check "...saying why" "Leaving $tmp/ext/proj-kappa" "$out"
+out="$(in_repo "$pw" teardown "$tmp/twelve.tsv" 2>&1)"
+equal "B's own teardown still removes it" "gone" "$(gone "$tmp/ext/proj-kappa")"
+
 echo "launch types each agent's lines into its own window, quoted"
 # base-index 1 (a common setting): a numeric tag read as a window index would be the log.
 tmux new-session -d -s keeper
@@ -236,7 +254,9 @@ printf '1\tfeat/one\tnothing to do\n2\tfix/a'"'"';>PWNED;#\tnothing to do\n' > "
 out="$(in_repo "$pw" launch "$tmp/numeric.tsv" --no-bootstrap 2>&1)"
 equal "a launch with numeric tags and a branch holding quotes succeeds" 0 "$?"
 win_of() { tmux list-windows -t "=proj-parallel" -F '#{window_name} #{window_id}' | awk -v n="$1" '$1 == n { print $2 }'; }
-until_banner() { local i; for ((i = 0; i < 50; i++)); do tmux capture-pane -p -t "$1" | grep -qF "$2" && return 0; sleep 0.2; done; return 1; }
+# Up to 30 s: a zsh pane under load can take seconds to show its first prompt and run what
+# was typed ahead (seen at load ~35); found sooner, it returns at once.
+until_banner() { local i; for ((i = 0; i < 150; i++)); do tmux capture-pane -p -t "$1" | grep -qF "$2" && return 0; sleep 0.2; done; return 1; }
 until_banner "$(win_of 1)" "=== 1 (feat/one) ==="
 check "tag 1's banner is in tag 1's window" "=== 1 (feat/one) ===" "$(tmux capture-pane -p -t "$(win_of 1)")"
 until_banner "$(win_of 2)" "=== 2 ("
@@ -248,6 +268,15 @@ equal "the prompt is not left in the worktree" "" "$(git -C "$tmp/ext/proj-1" st
 out="$(in_repo "$pw" teardown "$tmp/numeric.tsv" 2>&1)"
 tmux set -g base-index 0
 tmux kill-session -t "=keeper"
+# What pw types must also survive zsh, the shell these dotfiles set up: a word that starts
+# with an unquoted = is a command lookup there (EQUALS), which printf %q leaves bare.
+if command -v zsh >/dev/null 2>&1; then
+  banner="$(bash -c "$(grep '^shq()' "$pw"); shq \"=== 2 (fix/a';>PWNED;#) ===\"" 2>/dev/null)"
+  equal "the banner pw types reads back as written in zsh" "=== 2 (fix/a';>PWNED;#) ===" \
+    "$(cd "$tmp" && zsh -fc "echo ${banner:-missing}" 2>&1)"
+else
+  ok "# SKIP zsh not installed"
+fi
 
 echo "broadcast reaches every agent pane of a split window"
 cat > "$tmp/fake_claude_tui.py" <<'EOF'

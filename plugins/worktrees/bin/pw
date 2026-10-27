@@ -100,6 +100,9 @@ mkdir -p "$LOG_DIR"
 die()    { echo "Error: $*" >&2; exit 1; }
 warn()   { echo "Warn:  $*" >&2; }
 info()   { echo "$*"; }
+# shq WORD: WORD single-quoted for any shell. printf %q leaves a leading = bare, and zsh's
+# EQUALS expansion reads `=== x` as a command lookup, so text typed into a pane goes this way.
+shq()    { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
 # ───────── engine selection (claude | codex) ─────────────────────────────
 # Each manifest row may pick its runtime in an optional 4th column. Empty →
@@ -612,7 +615,7 @@ cmd_launch() {
             "export PARALLEL_LOG=$(printf %q "$log_file") PARALLEL_TAG=$(printf %q "$tag") PARALLEL_BRANCH=$(printf %q "$branch") PARALLEL_SESSION_ID=$(printf %q "$sid") PARALLEL_TRANSCRIPT=$(printf %q "$jsonl") PARALLEL_APPEND=$(printf %q "$PW_BIN_DIR/pw-append") COMPOSE_PROJECT_NAME=$(printf %q "$compose_project")" C-m
         # %q, like the exports: a branch name may hold quotes or `;` (git allows both).
         tmux send-keys -t "$win" \
-            "echo $(printf %q "=== $tag ($branch) ===") && pwd && git branch --show-current && echo $(printf %q "transcript: $jsonl")" C-m
+            "echo $(shq "=== $tag ($branch) ===") && pwd && git branch --show-current && echo $(shq "transcript: $jsonl")" C-m
 
         # Write the prompt to a per-session file; pass it to the engine via an
         # xargs-safe path.
@@ -701,6 +704,24 @@ manifest_logs() {
 
 # log_worktrees LOG: "<tag>\t<worktree>" for each agent of the launch header (read up to the
 # blank line that ends it: agents append to the log after it).
+# newer_elsewhere PATH OWN FOREIGN: 0 when a FOREIGN record of PATH (lines "path<TAB>log") is
+# from a launch log newer than every OWN record of it, or when OWN has none: the fleet that
+# launched there last has it now. Launch logs keep their launch-time mtime (teardown only
+# removes the sidecar), and -nt compares them on any bash.
+newer_elsewhere() {
+    local p="$1" own="$2" foreign="$3" fp fl op ol later
+    while IFS=$'\t' read -r fp fl; do
+        [ -n "$fp" ] && [ "$fp" = "$p" ] || continue
+        later=1
+        while IFS=$'\t' read -r op ol; do
+            [ "$op" = "$p" ] || continue
+            [ "$fl" -nt "$ol" ] || { later=0; break; }
+        done <<< "$own"
+        [ "$later" = 1 ] && return 0
+    done <<< "$foreign"
+    return 1
+}
+
 log_worktrees() {
     awk '/^# === agents ===$/ { agents = 1; next } agents && /^$/ { exit }
         agents && sub(/^# tag=/, "") { i = index($0, " worktree="); if (i) print $1 "\t" substr($0, i + 10) }' "$1"
@@ -786,14 +807,25 @@ cmd_teardown() {
     # it goes only when no other manifest's launch log records it and it is on this
     # manifest's branch for that tag. wt_want holds that branch, or nothing for a record.
     local -a wt_paths=() wt_want=()
-    local rec_tag rec_path
+    local rec_tag rec_path test_branch
+    # A path another manifest launched into after this one did is that fleet's now: leave it
+    # (newer_elsewhere). Every path, recorded or from the layout, must also be on the branch
+    # this manifest put there.
+    local foreign_recs="" own_recs=""
+    while IFS= read -r f; do
+        while IFS=$'\t' read -r rec_tag rec_path; do
+            foreign_recs="$foreign_recs$rec_path"$'\t'"$f"$'\n'
+        done < <(log_worktrees "$f")
+    done < <(manifest_logs "$manifest" "$repo" other)
     for f in ${run_logs[@]+"${run_logs[@]}"}; do
         while IFS=$'\t' read -r rec_tag rec_path; do
-            for tag_core in "${TAGS[@]}"; do
-                if [ "$rec_tag" = "$tag_core" ] || [ "$rec_tag" = "test-$tag_core" ]; then
-                    wt_paths+=("$rec_path")
-                    wt_want+=("")
-                    break
+            own_recs="$own_recs$rec_path"$'\t'"$f"$'\n'
+            for i in "${!TAGS[@]}"; do
+                test_branch="test/${BRANCHES[$i]}"   # what launch --test checks out
+                if [ "$rec_tag" = "${TAGS[$i]}" ]; then
+                    wt_paths+=("$rec_path"); wt_want+=("${BRANCHES[$i]#refs/heads/}"); break
+                elif [ "$rec_tag" = "test-${TAGS[$i]}" ]; then
+                    wt_paths+=("$rec_path"); wt_want+=("${test_branch#refs/heads/}"); break
                 fi
             done
         done < <(log_worktrees "$f")
@@ -806,16 +838,10 @@ cmd_teardown() {
         warn "wt-helper could not say where worktrees go for $repo; removing only the worktrees the launch recorded"
         PW_WT_BASE=""
     fi
-    local foreign=$'\n'
     if [ -n "$PW_WT_BASE" ]; then
-        while IFS= read -r f; do
-            while IFS=$'\t' read -r rec_tag rec_path; do
-                foreign="$foreign$rec_path"$'\n'
-            done < <(log_worktrees "$f")
-        done < <(manifest_logs "$manifest" "$repo" other)
         for i in "${!TAGS[@]}"; do
             wt_paths+=("$(pw_wt_path "$repo" "${TAGS[$i]}")" "$(pw_wt_path "$repo" "test-${TAGS[$i]}")")
-            local test_branch="test/${BRANCHES[$i]}"   # what launch --test checks out
+            test_branch="test/${BRANCHES[$i]}"
             wt_want+=("${BRANCHES[$i]#refs/heads/}" "${test_branch#refs/heads/}")
         done
     fi
@@ -838,10 +864,10 @@ cmd_teardown() {
             continue
         fi
         if [ -n "${wt_want[$i]}" ]; then
-            case "$foreign" in *$'\n'"$wt"$'\n'*)
-                warn "Leaving $wt: another manifest's launch log records it"
-                continue ;;
-            esac
+            if newer_elsewhere "$wt" "$own_recs" "$foreign_recs"; then
+                warn "Leaving $wt: another manifest launched into it after this one did"
+                continue
+            fi
             have="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
             if [ "$have" != "${wt_want[$i]}" ]; then
                 warn "Leaving $wt: it is on '$have', not this manifest's '${wt_want[$i]}'"
