@@ -1,0 +1,8 @@
+# Issues go through the forms in this directory; a blank issue is not offered.
+# OWNER/REPO below is filled in by the installer (install.sh --with github-kit) from the target's
+# github.com origin; installing by hand, replace it with the repository's owner and name.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/OWNER/REPO/security/policy
+    about: Please report security problems privately, as SECURITY.md describes. Never in a public issue.

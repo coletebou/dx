@@ -1,0 +1,63 @@
+name: Bug report
+description: Something does not work the way the documentation says it should.
+title: "bug: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please search the open and closed issues first.
+
+        **A security problem?** Don't open an issue: report it privately, as the security policy describes (the link is on the previous page).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, and what went wrong. Paste error messages exactly.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence of steps that shows the problem, from a clean start.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release, or the commit you ran (git rev-parse --short HEAD).
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, and the versions of the tools involved.
+      placeholder: e.g. macOS 15, bash 5.2, Node 24
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Anything relevant the run printed. It is formatted as code, so no backticks are needed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues and this is not one of them.
+          required: true
+        - label: I removed secrets, tokens, hostnames, IP addresses and personal data from everything above.
+          required: true
