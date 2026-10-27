@@ -1,0 +1,10 @@
+{
+  "name": "music-video",
+  "private": true,
+  "type": "module",
+  "description": "Music video rendered frame by frame in headless Chrome (canvas + three.js)",
+  "dependencies": {
+    "puppeteer-core": "^25.12.0",
+    "three": "^0.186.1"
+  }
+}

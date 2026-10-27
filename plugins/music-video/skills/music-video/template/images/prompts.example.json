@@ -1,0 +1,18 @@
+{
+  "style": "Shot on 35mm film, Kodak Portra 400, fine natural grain, soft halation, true-to-life fresh greens and clean sky blues, candid and joyful. No text, no logos, no watermarks, no orange or amber color cast.",
+  "night_style": "Shot on 35mm film at night, Cinestill 800T, fine grain, cool blue screen light, deep indigo shadows, cinematic. No text, no logos, no watermarks, no orange or amber tones.",
+  "surreal_style": "Hyperreal surreal editorial image, crisp like a high-end 3D render and medium-format photograph: raw brutalist concrete architecture, lush vivid green grass, deep saturated cobalt ultramarine blue sky and cobalt accents, mirror-polished chrome objects with sharp reflections, bright midday sun, hard clean shadows, high contrast, clean minimal composition, wide angle. No text, no letters, no logos, no watermarks, no orange or amber tones.",
+  "size": "1536x1024",
+  "images": [
+    {
+      "id": "nightstand_glow",
+      "night": true,
+      "prompt": "A dark bedroom at night, a smartphone glowing bright blue on a wooden nightstand, a sleepy hand reaching out from under the duvet toward it, the rest of the room in deep blue darkness."
+    },
+    {
+      "id": "s_bedroom",
+      "prompt": "A surreal brutalist bedroom built from raw concrete slabs, flooded with bright morning daylight, crisp white bed sheets, a cobalt-blue smartphone glowing on a concrete block nightstand, a sleepy hand reaching out from the sheets toward it, a big rectangular window framing a cobalt sky and a grass bank.",
+      "surreal": true
+    }
+  ]
+}

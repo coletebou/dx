@@ -1,0 +1,76 @@
+{
+  "title": "Song Title",
+  "subtitle": "(optional)",
+  "bpm": 120,
+  "styles": {
+    "positive": [
+      "sunny indie pop crossed with bright dance-pop",
+      "122 bpm, major key, bouncy and euphoric",
+      "bright plucked acoustic guitar riff",
+      "catchy whistled melody hook",
+      "crisp handclaps and finger snaps",
+      "warm analog synth bass",
+      "four-on-the-floor kick drum in the choruses",
+      "playful, expressive, clearly enunciated female lead vocal",
+      "shouted gang vocals on the ad-libs",
+      "polished modern pop mix, wide stereo, punchy low end"
+    ],
+    "negative": [
+      "dark or melancholic mood",
+      "heavy distortion",
+      "trap hi-hat rolls",
+      "muffled or mumbled vocals",
+      "slurred lyrics",
+      "lo-fi muddy mix",
+      "male lead vocal"
+    ]
+  },
+  "sections": [
+    {
+      "name": "Intro",
+      "duration_ms": 6000,
+      "direction": "notification chime, then a filtered robotic spoken voice over sparse plucked guitar",
+      "local_styles": [
+        "sparse intro",
+        "spoken word, robotic filtered voice",
+        "notification chime"
+      ],
+      "lines": [
+        "A short spoken or sung intro line."
+      ]
+    },
+    {
+      "name": "Verse 1",
+      "duration_ms": 27000,
+      "direction": "tight rhythmic verse, muted guitar, snaps",
+      "local_styles": [
+        "rhythmic sung verse",
+        "muted guitar and finger snaps",
+        "building energy"
+      ],
+      "lines": [
+        "Wake up, reach for the glow on the nightstand",
+        "Thumb on the feed like a slot machine hand",
+        "Seven hours twelve is my daily average",
+        "Blue-light tan and a doomscroll habit"
+      ]
+    },
+    {
+      "name": "Chorus",
+      "duration_ms": 23000,
+      "direction": "full band drop, four-on-the-floor, whistle hook between lines",
+      "local_styles": [
+        "huge anthemic chorus",
+        "four-on-the-floor",
+        "whistled hook",
+        "gang vocal shouts"
+      ],
+      "lines": [
+        "I googled how to touch grass (touch grass!)",
+        "Phone on the lawn, face down in the sun",
+        "I googled how to touch grass (touch grass!)",
+        "Screen time falling, falling down to none"
+      ]
+    }
+  ]
+}

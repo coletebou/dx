@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>music video - studio</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<script type="importmap">{ "imports": { "three": "./node_modules/three/build/three.module.js", "three/addons/": "./node_modules/three/examples/jsm/" } }</script>
+<style>html,body{margin:0;background:#111}canvas{display:block;width:100vw;height:auto}</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script src="data.js"></script>
+<script src="src/core.js"></script>
+<script src="src/fx.js"></script>
+<script src="src/grass.js"></script>
+<script src="src/lyrics.js"></script>
+<script src="src/ui.js"></script>
+<script src="src/timeline.js"></script>
+<script src="src/art2d.js"></script>
+<script src="src/shots/example.js"></script>
+<script type="module" src="src/gl3d.js"></script>
+<script type="module" src="src/scenes3d.js"></script>
+<script>
+(async () => {
+  const faces = ['800 40px "Bricolage Grotesque"', 'italic 400 40px "Instrument Serif"', '400 40px "Instrument Serif"', '600 40px "JetBrains Mono"', '600 40px "Inter"', '800 40px "Inter"', '600 40px "Caveat"'];
+  await Promise.all(faces.map(f => document.fonts.load(f)));
+  if (!window.GL) await new Promise(r => window.addEventListener('gl-ready', r, { once: true }));
+  await new Promise(r => (window.SCENES3D_READY ? r() : window.addEventListener('scenes-ready', r, { once: true })));
+  if (window.HERO_READY) await window.HERO_READY;   // optional src/hero.js: rigged character + props
+  finalizeShots();
+  window.ready = true;
+  if (!location.search.includes('render')) {           // live preview: play along with the song time in the hash
+    const t0 = performance.now(), start = parseFloat(location.hash.slice(1) || '0');
+    const loop = async () => { await renderFrame(start + (performance.now() - t0) / 1000); requestAnimationFrame(loop); };
+    loop();
+  }
+})();
+</script>
+</body>
+</html>

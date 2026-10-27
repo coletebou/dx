@@ -1,0 +1,10 @@
+{
+  "name": "music-video",
+  "description": "An original song and a music video for it, end to end: research and lyrics, song takes from Lyria and ElevenLabs Music picked by transcription fidelity and a listening pass, word-level timing on a beat grid, frame-exact kinetic typography and three.js 3D rendered in headless Chrome, optional generated stills, clips and a rigged 3D character, a mastered mix, and full, social and how-it's-made cuts (music-video)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cole Tebou"
+  },
+  "license": "MIT",
+  "keywords": ["claude-code", "music-video", "lyric-video", "three.js", "ffmpeg", "elevenlabs"]
+}

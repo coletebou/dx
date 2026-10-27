@@ -1,0 +1,25 @@
+[
+ {
+  "sfx": "notif",
+  "t": 4.05,
+  "db": -13
+ },
+ {
+  "sfx": "shutter",
+  "line": 5,
+  "word": "googled",
+  "db": -14
+ },
+ {
+  "sfx": "whoosh",
+  "cut": 4,
+  "offset": 0.05,
+  "db": -11
+ },
+ {
+  "sfx": "ambience",
+  "t": 170.0,
+  "db": -20,
+  "fade_in": 1.2
+ }
+]
