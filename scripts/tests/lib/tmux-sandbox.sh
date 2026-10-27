@@ -84,6 +84,22 @@ tsb_find_real() {
   return 1
 }
 
+# tsb_flag_word WORD: one of tmux's global-flag words, read letter by letter as its getopt
+# reads it. Prints S or L when the word selects a socket, 1 when its last letter takes the
+# next word as its value (-f, -uf), else 0. A value letter with text after it has its value
+# attached (-fconf, -S/path): nothing after it in the word is a flag.
+tsb_flag_word() {
+  local rest="${1#-}" l
+  while [[ -n "$rest" ]]; do
+    l="${rest:0:1}" rest="${rest:1}"
+    case "$l" in
+      S|L) printf '%s\n' "$l"; return 0 ;;
+      c|f|T) if [[ -n "$rest" ]]; then printf '0\n'; else printf '1\n'; fi; return 0 ;;
+    esac
+  done
+  printf '0\n'
+}
+
 # tsb_init <dir>: the sandbox lives in <dir> (a fresh mktemp -d). Sets TSB_ROOT, TSB_SOCK,
 # TSB_REAL and TSB_BIN, and exports what the guard script needs.
 tsb_init() {
@@ -112,6 +128,7 @@ tsb_init() {
     printf '#!/usr/bin/env bash\n'
     printf '# tmux, sandboxed by scripts/tests/lib/tmux-sandbox.sh for one test run.\n'
     printf 'real=%q\nroot=%q\n' "$TSB_REAL" "$TSB_ROOT"
+    declare -f tsb_flag_word
     cat <<'GUARD'
 refuse() { printf 'tmux-sandbox: refused: %s\n' "$*" >&2; exit 97; }
 sock="${TSB_SOCK:-}"
@@ -123,14 +140,17 @@ for d in "/tmp/tmux-$uid" "/private/tmp/tmux-$uid"; do
 done
 grep -Fxq -- "$sock" "$root/tsb/created" 2>/dev/null || refuse "socket $sock was not created by this sandbox"
 # Global flags come before the first command; -S or -L there would pick another server.
-# A cluster ending in a value-taking letter (-c, -uf, -2T) takes the next word as its value,
-# as tmux's getopt reads it, so a -S after `-uf /dev/null` is still seen.
+# Each word is read as tmux's getopt reads it (tsb_flag_word), so neither `-uf /dev/null -S x`
+# nor `-fconf -S x` hides the -S.
 args=("$@") i=0
 while (( i < ${#args[@]} )); do
   a="${args[$i]}"
   case "$a" in
-    -*) [[ "$a" =~ ^-[A-Za-z0-9]*[SL] ]] && refuse "the caller passed $a; the sandbox owns the socket"
-        if [[ "$a" =~ ^-[A-Za-z0-9]*[cfT]$ ]]; then i=$((i + 2)); else i=$((i + 1)); fi
+    -*) case "$(tsb_flag_word "$a")" in
+          S|L) refuse "the caller passed $a; the sandbox owns the socket" ;;
+          1) i=$((i + 2)) ;;
+          *) i=$((i + 1)) ;;
+        esac
         continue ;;
     *) break ;;
   esac
@@ -163,14 +183,16 @@ tsb_at() {
   local s="$1"; shift
   tsb_socket_ok "$s" || return
   grep -Fxq -- "$s" "$TSB_ROOT/tsb/created" || { tsb_refuse "socket $s was not created by this sandbox"; return; }
-  # Global flags come before the first command; a -S or -L there would win over ours. A
-  # cluster ending in a value-taking letter (-c, -uf) takes the next word, as in the guard.
+  # Global flags come before the first command; a -S or -L there would win over ours. Each
+  # word is read as tmux's getopt reads it, as in the guard.
   local a skip=0
   for a in "$@"; do
     if (( skip )); then skip=0; continue; fi
     case "$a" in
-      -*) [[ "$a" =~ ^-[A-Za-z0-9]*[SL] ]] && { tsb_refuse "the caller passed $a; the sandbox owns the socket"; return; }
-          [[ "$a" =~ ^-[A-Za-z0-9]*[cfT]$ ]] && skip=1 ;;
+      -*) case "$(tsb_flag_word "$a")" in
+            S|L) tsb_refuse "the caller passed $a; the sandbox owns the socket"; return ;;
+            1) skip=1 ;;
+          esac ;;
       *) break ;;
     esac
   done
