@@ -97,7 +97,7 @@ claude_cmdline_for_tree() {
                 [[ -n "$child" ]] && next+=("$child")
             done < <(children_of "$pid")
         done
-        frontier=("${next[@]}")
+        frontier=(${next[@]+"${next[@]}"})  # Bash 3.2 + set -u: an empty "${next[@]}" is unbound
         next=()
     done
     return 1
@@ -167,7 +167,7 @@ uuid_from_agents_json() {
                 [[ -n "$child" ]] && next+=("$child")
             done < <(children_of "$pid")
         done
-        frontier=("${next[@]}")
+        frontier=(${next[@]+"${next[@]}"})  # Bash 3.2 + set -u: an empty "${next[@]}" is unbound
         next=()
     done
 }
@@ -290,7 +290,7 @@ codex_pid_for_tree() {
                 [[ -n "$child" ]] && next+=("$child")
             done < <(children_of "$pid")
         done
-        frontier=("${next[@]}")
+        frontier=(${next[@]+"${next[@]}"})  # Bash 3.2 + set -u: an empty "${next[@]}" is unbound
         next=()
     done
     return 1
@@ -352,16 +352,21 @@ codex_provider_for_uuid() {
     done < <(find "$CODEX_SESSIONS_ROOT" -name "rollout-*-${uuid}.jsonl" 2>/dev/null | sort -r)
 }
 
-# Provider for a still-running codex, read from the profile flag in its own
-# argv (`codex -p bedrock ...`). Last resort when the rollout is unreadable or
-# predates model_provider: the flag the process was launched with is by
-# definition the flag that reproduces it.
+# The profile flag in a still-running codex's own argv (`codex -p bedrock ...`).
+# It is the first choice: the flag the process was launched with is by
+# definition the flag that reproduces it, and a profile can keep the base
+# config's provider id while pointing it at another endpoint, which no
+# provider-to-profile mapping can see.
 codex_profile_from_argv() {
     local pid="$1" argv tok prev=""
     argv="$(read_cmdline "$pid")" || return 1
     for tok in $argv; do
         if [[ "$prev" == "-p" || "$prev" == "--profile" ]]; then
             printf '%s' "$tok"
+            return 0
+        fi
+        if [[ "$tok" == --profile=?* ]]; then
+            printf '%s' "${tok#--profile=}"
             return 0
         fi
         prev="$tok"
@@ -434,13 +439,12 @@ while IFS=$'\t' read -r sess win pane pid cwd cmd; do
         provider=$(codex_provider_for_uuid "$uuid" || true)
     fi
 
-    profile=$(codex_profile_for_provider "${provider:-}" || true)
-    # Still nothing (rollout unreadable, or written before model_provider
-    # existed)? Trust the -p flag the live process was launched with.
-    if [[ -z "${profile:-}" && -z "${provider:-}" ]]; then
-        profile=$(codex_profile_from_argv "$codex_pid" || true)
-        # Only honor a profile that still has a config file behind it.
-        [[ -n "$profile" && ! -f "$CODEX_STATE_HOME/${profile}.config.toml" ]] && profile=""
+    # The -p flag the live process was launched with wins; only honor a profile
+    # that still has a config file behind it. Without one, map the provider.
+    profile=$(codex_profile_from_argv "$codex_pid" || true)
+    [[ -n "$profile" && ! -f "$CODEX_STATE_HOME/${profile}.config.toml" ]] && profile=""
+    if [[ -z "$profile" ]]; then
+        profile=$(codex_profile_for_provider "${provider:-}" || true)
     fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

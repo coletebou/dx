@@ -12,7 +12,13 @@
 #   2. If the pane already shows its agent as the current command, skip —
 #      something else (the user, parallel-worktrees, etc.) already
 #      launched a session there.
-#   3. Otherwise launch the matching Claude or Codex resume command.
+#   3. If the pane is not at an idle shell (an editor, a pager, an ssh
+#      session: restoring over a live server keeps such panes), skip — keys
+#      typed there would land in that program, or on another machine.
+#   4. If another pane already resumed the same conversation (the save
+#      hook's cwd-mtime fallback can give every pane in a cwd one id), start
+#      a fresh agent instead: two agents on one transcript interleave it.
+#   5. Otherwise launch the matching Claude or Codex resume command.
 #
 # TSV columns: session \t window_index \t pane_index \t cwd \t uuid \t source \t launcher \t bypass
 # Claude launcher is `claude` or `yuma`; bypass is 1 when the session ran with
@@ -24,6 +30,10 @@
 # rollout against the base config's OpenAI endpoint — the session opens but
 # every subsequent turn goes to the wrong provider. Older TSVs lack both
 # columns; those rows resume with no -p, matching previous behavior.
+#
+# Rows are read with a non-whitespace separator: bash treats a tab in IFS as
+# whitespace and collapses an empty column (a Codex row with no provider but a
+# profile) into the next one.
 
 set -euo pipefail
 
@@ -53,6 +63,14 @@ session_is_live() {
     jq -e --arg u "$uuid" '.[] | select(.sessionId == $u)' "$AGENTS_JSON" >/dev/null 2>&1
 }
 
+# An idle shell at its prompt: the only thing it is safe to type a command into.
+pane_command_is_shell() {
+    case "${1#-}" in
+        sh|bash|zsh|fish|dash|ksh|mksh|tcsh|csh) return 0 ;;
+    esac
+    return 1
+}
+
 pane_command_is_agent() {
     local command="$1"
     [[ "$command" == "claude" || "$command" == "claude.exe" || "$command" == "codex" ||
@@ -79,7 +97,7 @@ pane_tree_has_agent() {
                 [[ -n "$child" ]] && next+=("$child")
             done < <(children_of "$pid")
         done
-        frontier=("${next[@]}")
+        frontier=(${next[@]+"${next[@]}"})  # Bash 3.2 + set -u: an empty "${next[@]}" is unbound
         next=()
     done
     return 1
@@ -98,12 +116,21 @@ shell_quote() {
     printf '%q' "$1"
 }
 
+# A TSV with its tabs turned into the unit separator, which IFS does not
+# treat as whitespace, so an empty column stays a column.
+read_tsv() {
+    [[ -r "$1" ]] && tr '\t' '\037' < "$1"
+}
+SEP=$'\037'
+
 resumed=0 fresh_orphan=0 skipped=0
 
 # TSV may have 5 columns (legacy), 6 (with source), 7 (with launcher) or 8
 # (with bypass). Tolerate all; only an explicit `yuma` marker selects Mantle,
 # and only an explicit bypass=1 turns permission checks off.
-while IFS=$'\t' read -r sess win pane cwd uuid source_col launcher_col bypass_col; do
+CLAUDE_CLAIMED="$(mktemp)"
+trap 'rm -f "$AGENTS_JSON" "$CLAIMED_PANES" "$CLAUDE_CLAIMED"' EXIT
+while IFS="$SEP" read -r sess win pane cwd uuid source_col launcher_col bypass_col; do
     [[ -n "$sess" && -n "$win" && -n "$pane" && -n "$uuid" ]] || continue
     [[ -z "${source_col:-}" ]] && source_col="legacy"
 
@@ -132,7 +159,8 @@ while IFS=$'\t' read -r sess win pane cwd uuid source_col launcher_col bypass_co
     pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null || true)
     # `claude` OR a semver-looking proctitle (Claude renames itself to its
     # version; e.g. `2.1.145`).
-    if pane_command_is_agent "$current_cmd" || pane_tree_has_agent "$pane_pid"; then
+    if pane_command_is_agent "$current_cmd" || pane_tree_has_agent "$pane_pid" ||
+        ! pane_command_is_shell "$current_cmd"; then
         skipped=$((skipped+1))
         continue
     fi
@@ -142,7 +170,11 @@ while IFS=$'\t' read -r sess win pane cwd uuid source_col launcher_col bypass_co
     # Clear any partial input the restored shell may have left at the prompt.
     tmux send-keys -t "$target" C-u
 
-    if session_is_live "$uuid"; then
+    if grep -Fqx "$uuid" "$CLAUDE_CLAIMED"; then
+        tmux send-keys -t "$target" "# previous claude session ${uuid} was already resumed in another pane — this one starts fresh:" C-m
+        tmux send-keys -t "$target" "cd $quoted_cwd && ${claude_command}" C-m
+        fresh_orphan=$((fresh_orphan+1))
+    elif session_is_live "$uuid"; then
         # Don't fight a live agent. Spawn fresh, but leave the orphan UUID
         # in scrollback so the user can pick it up later if they want.
         # Use shell echo (not tmux send-keys -l) so the comment lands in
@@ -154,16 +186,17 @@ while IFS=$'\t' read -r sess win pane cwd uuid source_col launcher_col bypass_co
         fresh_orphan=$((fresh_orphan+1))
     else
         tmux send-keys -t "$target" "cd $quoted_cwd && ${claude_command} --resume ${uuid}" C-m
+        printf '%s\n' "$uuid" >> "$CLAUDE_CLAIMED"
         resumed=$((resumed+1))
     fi
-done < <([[ -r "$CLAUDE_IN" ]] && cat "$CLAUDE_IN")
+done < <(read_tsv "$CLAUDE_IN")
 
 # Snapshot root Codex session IDs that are already open. Subagent rollouts use
 # an object-valued metadata source, while resumable root TUIs use source=cli.
 CODEX_LIVE="$(mktemp)"
 CODEX_DUPLICATE_IDS="$(mktemp)"
 CODEX_CLAIMED="$(mktemp)"
-trap 'rm -f "$AGENTS_JSON" "$CLAIMED_PANES" "$CODEX_LIVE" "$CODEX_DUPLICATE_IDS" "$CODEX_CLAIMED"' EXIT
+trap 'rm -f "$AGENTS_JSON" "$CLAIMED_PANES" "$CLAUDE_CLAIMED" "$CODEX_LIVE" "$CODEX_DUPLICATE_IDS" "$CODEX_CLAIMED"' EXIT
 CODEX_LIVE_SCAN_AVAILABLE=0
 if [[ -d /proc/self/fd ]] || command -v lsof >/dev/null 2>&1; then
     codex_session_files_for_pid() {
@@ -186,6 +219,26 @@ if [[ -d /proc/self/fd ]] || command -v lsof >/dev/null 2>&1; then
         done <<< "$lsof_output"
     }
 
+    # A resumed Codex opens its rollout lazily: until its first turn it holds
+    # no descriptor, only `codex resume <uuid>` in its argv (the save hook
+    # reads it the same way).
+    codex_uuid_from_argv() {
+        local pid="$1" argv tok prev=""
+        if [[ -r "/proc/$pid/cmdline" ]]; then
+            argv=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+        else
+            argv=$(ps -ww -o args= -p "$pid" 2>/dev/null) || return 1
+        fi
+        for tok in $argv; do
+            if [[ "$prev" == "resume" && "$tok" =~ ^[0-9a-fA-F-]{32,}$ ]]; then
+                printf '%s\n' "$tok"
+                return 0
+            fi
+            prev="$tok"
+        done
+        return 0
+    }
+
     scan_complete=0
     if codex_pids=$(ps -axo pid=,comm= 2>/dev/null | awk '$2 ~ /(^|\/)codex$/ { print $1 }'); then
         scan_complete=1
@@ -201,6 +254,7 @@ if [[ -d /proc/self/fd ]] || command -v lsof >/dev/null 2>&1; then
                     'select(.type == "session_meta" and .payload.originator == "codex-tui" and .payload.source == "cli") | .payload.id // empty' \
                     >> "$CODEX_LIVE"
             done <<< "$session_paths"
+            codex_uuid_from_argv "$codex_pid" >> "$CODEX_LIVE" || true
         done <<< "$codex_pids"
     fi
     if (( scan_complete )); then
@@ -231,7 +285,7 @@ codex_resumed=0 codex_fresh_orphan=0 codex_skipped=0
 # provider_col is read for TSV alignment and human debugging only — the profile
 # column is what drives the command, so shellcheck's unused warning is expected.
 # shellcheck disable=SC2034
-while IFS=$'\t' read -r sess win pane cwd uuid source_col provider_col profile_col; do
+while IFS="$SEP" read -r sess win pane cwd uuid source_col provider_col profile_col; do
     [[ -n "$sess" && -n "$win" && -n "$pane" && -n "$uuid" ]] || continue
     target="${sess}:${win}.${pane}"
     quoted_cwd=$(shell_quote "$cwd")
@@ -259,7 +313,8 @@ while IFS=$'\t' read -r sess win pane cwd uuid source_col provider_col profile_c
 
     current_cmd=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || true)
     pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null || true)
-    if pane_command_is_agent "$current_cmd" || pane_tree_has_agent "$pane_pid"; then
+    if pane_command_is_agent "$current_cmd" || pane_tree_has_agent "$pane_pid" ||
+        ! pane_command_is_shell "$current_cmd"; then
         codex_skipped=$((codex_skipped+1))
         continue
     fi
@@ -279,7 +334,7 @@ while IFS=$'\t' read -r sess win pane cwd uuid source_col provider_col profile_c
         printf '%s\n' "$uuid" >> "$CODEX_CLAIMED"
         codex_resumed=$((codex_resumed+1))
     fi
-done < <([[ -r "$CODEX_IN" ]] && cat "$CODEX_IN")
+done < <(read_tsv "$CODEX_IN")
 
 # Resurrect's restore.sh emits "Tmux restore complete!" after this hook
 # returns, which would overwrite our message. Defer with a background

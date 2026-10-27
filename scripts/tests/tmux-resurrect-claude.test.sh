@@ -49,6 +49,8 @@ export PATH="$tmp/bin:$PATH"
 U1=11111111-1111-4111-8111-111111111111 U2=22222222-2222-4222-8222-222222222222
 U3=33333333-3333-4333-8333-333333333333 U4=44444444-4444-4444-8444-444444444444
 U5=55555555-5555-4555-8555-555555555555 U6=66666666-6666-4666-8666-666666666666
+U7=77777777-7777-4777-8777-777777777777 U8=88888888-8888-4888-8888-888888888888
+U9=99999999-9999-4999-8999-999999999999 UA=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 
 tsb -f /dev/null new-session -d -s resurrect -n shell -x 200 -y 50 -c "$HOME/repo" 'sh'
 tsb set -g default-shell /bin/sh
@@ -82,12 +84,29 @@ equal "an idle shell never borrows a transcript from its cwd" "" "$(row "$U5")"
 equal "a dotted cwd finds its newest transcript (the cwd-mtime fallback)" "cwd-mtime	claude	0" "$(row "$U6" | cut -f6-8)"
 equal "one row per agent pane" 5 "$(grep -c . <<<"$tsv")"
 
+printf 'save: a Codex pane keeps the profile it was launched with\n'
+# A process whose name really is `codex` (the fake above runs as bash): a copy of bash, idling
+# like a resumed TUI that has not opened its rollout yet, launched with a profile that keeps
+# the base provider id but points it elsewhere.
+mkdir -p "$tmp/cbin" "$HOME/.codex/sessions/2026/10/27"
+cp "$(command -v bash)" "$tmp/cbin/codex"
+printf 'model_provider = "openai"\nopenai_base_url = "https://llm.internal.example/v1"\n' > "$HOME/.codex/internal.config.toml"
+printf '{"type":"session_meta","payload":{"id":"%s","originator":"codex-tui","source":"cli","model_provider":"openai"}}\n' "$U9" \
+  > "$HOME/.codex/sessions/2026/10/27/rollout-2026-10-27T00-00-00-$U9.jsonl"
+tsb new-window -d -t '=resurrect:' -n codex-live -c "$HOME/repo" \
+  "exec $tmp/cbin/codex -c 'while :; do sleep 60; done' -p internal resume $U9"
+until_true 5 pgrep -f -- "-p internal resume $U9" >/dev/null
+bash "$scripts/tmux-resurrect-claude-save"
+equal "the -p flag wins over a provider the base config shares" "argv	openai	internal" \
+  "$(awk -F'\t' -v u="$U9" '$5 == u' "$HOME/.tmux/resurrect/codex-sessions.tsv" | cut -f6-8)"
+
 printf 'restore: each row resumes with exactly the launch it had\n'
 mkdir -p "$tmp/restore"
-for w in r-bypass r-plain r-legacy r-mantle r-live r-busy r-codex; do
+for w in r-bypass r-plain r-legacy r-mantle r-live r-busy r-codex r-dup1 r-dup2 r-codex-live r-codex-noprov; do
   tsb new-window -d -t '=resurrect:' -n "$w" -c "$HOME/repo" 'sh'
 done
 tsb new-window -d -t '=resurrect:' -n r-busy2 -c "$HOME/repo" "exec claude --resume $U2"
+tsb new-window -d -t '=resurrect:' -n r-editor -c "$HOME/repo" 'exec cat'
 idx() { tsb display-message -p -t "=resurrect:=$1" '#{window_index}'; }
 mkdir -p "$HOME/.codex/sessions"
 printf 'model_provider = "amazon-bedrock"\n' > "$HOME/.codex/bedrock.config.toml"
@@ -99,13 +118,19 @@ printf 'model_provider = "amazon-bedrock"\n' > "$HOME/.codex/bedrock.config.toml
   printf 'resurrect\t%s\t0\t%s\t%s\targv\tclaude\t0\n' "$(idx r-live)" "$HOME/repo" "$U5"
   printf 'resurrect\t%s\t0\t%s\t%s\targv\tclaude\t1\n' "$(idx r-busy2)" "$HOME/repo" "$U1"
   printf 'resurrect\t99\t0\t%s\t%s\targv\tclaude\t1\n' "$HOME/repo" "$U1"
+  printf 'resurrect\t%s\t0\t%s\t%s\targv\tclaude\t0\n' "$(idx r-editor)" "$HOME/repo" "$U7"
+  printf 'resurrect\t%s\t0\t%s\t%s\tcwd-mtime\tclaude\t0\n' "$(idx r-dup1)" "$HOME/repo" "$U8"
+  printf 'resurrect\t%s\t0\t%s\t%s\tcwd-mtime\tclaude\t0\n' "$(idx r-dup2)" "$HOME/repo" "$U8"
 } > "$HOME/.tmux/resurrect/claude-sessions.tsv"
-printf 'resurrect\t%s\t0\t%s\t%s\topen-file\tamazon-bedrock\tbedrock\n' "$(idx r-codex)" "$HOME/repo" "$U2" \
-  > "$HOME/.tmux/resurrect/codex-sessions.tsv"
+{
+  printf 'resurrect\t%s\t0\t%s\t%s\topen-file\tamazon-bedrock\tbedrock\n' "$(idx r-codex)" "$HOME/repo" "$U2"
+  printf 'resurrect\t%s\t0\t%s\t%s\topen-file\topenai\t\n' "$(idx r-codex-live)" "$HOME/repo" "$U9"
+  printf 'resurrect\t%s\t0\t%s\t%s\targv\t\tbedrock\n' "$(idx r-codex-noprov)" "$HOME/repo" "$UA"
+} > "$HOME/.tmux/resurrect/codex-sessions.tsv"
 printf '[{"pid": 1, "sessionId": "%s"}]\n' "$U5" > "$tmp/agents-live.json"
 : > "$LOG/launched"
 FAKE_AGENTS="$tmp/agents-live.json" bash "$scripts/tmux-resurrect-claude-restore"
-until_true 10 test "$(grep -c . "$LOG/launched")" -ge 6
+until_true 10 test "$(grep -c . "$LOG/launched")" -ge 10
 launched="$(cat "$LOG/launched")"
 check "bypass=1 resumes with permission checks off" "claude --dangerously-skip-permissions --resume $U1" "$launched"
 check "bypass=0 resumes plain" "claude --resume $U2" "$launched"
@@ -116,6 +141,17 @@ lacks "a session live elsewhere is not resumed twice" "--resume $U5" "$launched"
 screen="$(tsb capture-pane -p -J -t "=resurrect:=r-live")"
 check "it says where to pick it up instead" "previous claude session $U5 is still live elsewhere" "$screen"
 equal "the busy pane and the missing pane got nothing" 1 "$(grep -c -- "--dangerously-skip-permissions --resume $U1" <<<"$launched")"
+lacks "a pane running another program gets no keys" "--resume $U7" "$(tsb capture-pane -p -J -t "=resurrect:=r-editor")$launched"
+equal "a conversation saved for two panes is resumed in one" 1 "$(grep -c -- "--resume $U8" <<<"$launched")"
+check "...and the other starts fresh, saying why" "session $U8 was already resumed in another pane" \
+  "$(tsb capture-pane -p -J -t "=resurrect:=r-dup2")"
+lacks "a codex resumed elsewhere but holding no rollout yet is not resumed twice" "resume $U9" "$launched"
+check "...it says so instead" "previous codex session $U9 is still live elsewhere" \
+  "$(tsb capture-pane -p -J -t "=resurrect:=r-codex-live")"
+check "a codex row with no provider keeps its profile" "codex -p bedrock resume $UA" "$launched"
+# No bash older than 4.4 to run here: on one, an empty "${a[@]}" under set -u is an unbound variable.
+lacks "no bare array copy that dies on an empty array under bash 3.2" '=("${next[@]}")' \
+  "$(cat "$scripts/tmux-resurrect-claude-restore" "$scripts/tmux-resurrect-claude-save")"
 
 printf 'autosave: a backstop that stands down while a snapshot is fresh\n'
 mkdir -p "$HOME/.tmux/plugins/tmux-resurrect/scripts"
