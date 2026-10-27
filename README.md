@@ -85,6 +85,10 @@ Two settings choose what a machine runs, recorded in `~/.df-profile` by the inst
 - **Role** (`--role`): what the machine is for. `local` is a workstation (macOS, Linux or WSL);
   `server` is a box that runs agents, with a leaner shell.
 
+An identity can also carry an overlay for [Drover](https://github.com/coletebou/drover)'s fleet manager
+(its profile, standing orders and what it knows about you):
+[`identities/example/openclaw-manager`](identities/example/openclaw-manager).
+
 Machine-local overrides that never get committed go in `claude/settings.local.json`,
 `claude/mcp.local.json`, `~/.gitconfig.local` and `~/.zshenv.local`.
 
