@@ -447,7 +447,9 @@ mounted_at "$r" nvme1n1 / /data
 mounted_at "$r" nvme2n1 / "$r/root/srv/nvme"
 mounted_at "$r" nvme2n1 /binds/var_lib_docker "$r/root/var/lib/docker"
 mounted_at "$r" nvme2n1 /binds/var_lib_containerd "$r/root/var/lib/containerd"
-printf '%s\n' '{"blockdevices":[{"name":"/dev/nvme2n1","type":"disk","fstype":"ext4","label":"dx-nvme","mountpoint":"'"$r"'/root/var/lib/containerd"}]}' > "$r/lsblk/nvme2n1.json"
+bindtarget="$r/root/var/lib/containerd"
+printf '{"blockdevices":[{"name":"/dev/nvme2n1","type":"disk","fstype":"ext4","label":"dx-nvme","mountpoint":"%s"}]}\n' \
+    "$bindtarget" > "$r/lsblk/nvme2n1.json"
 out="$(nv "$r" detect)"
 check "already mounted elsewhere: in use there" "$r/dev/nvme1n1	AWSA	mounted:/data" "$out"
 check "mounted where it belongs, with bind mounts made from it" "$r/dev/nvme2n1	AWSB	mounted:/srv/nvme" "$out"
