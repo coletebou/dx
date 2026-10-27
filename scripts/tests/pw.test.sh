@@ -274,10 +274,13 @@ tmux set -g base-index 0
 tmux kill-session -t "=keeper"
 # What pw types must also survive zsh, the shell these dotfiles set up: a word that starts
 # with an unquoted = is a command lookup there (EQUALS), which printf %q leaves bare.
+# compat42 gives a newer bash the quoting of bash 4.2 and older (macOS /bin/bash is 3.2).
 if command -v zsh >/dev/null 2>&1; then
-  banner="$(bash -c "$(grep '^shq()' "$pw"); shq \"=== 2 (fix/a';>PWNED;#) ===\"" 2>/dev/null)"
-  equal "the banner pw types reads back as written in zsh" "=== 2 (fix/a';>PWNED;#) ===" \
-    "$(cd "$tmp" && zsh -fc "echo ${banner:-missing}" 2>&1)"
+  for compat in "" "shopt -s compat42 2>/dev/null;"; do
+    banner="$(bash -c "$compat $(grep '^shq()' "$pw"); shq \"=== 2 (fix/a';>PWNED;#) ===\"" 2>/dev/null)"
+    equal "the banner pw types reads back as written in zsh${compat:+ (bash 4.2 quoting)}" \
+      "=== 2 (fix/a';>PWNED;#) ===" "$(cd "$tmp" && zsh -fc "echo ${banner:-missing}" 2>&1)"
+  done
 else
   ok "# SKIP zsh not installed"
 fi

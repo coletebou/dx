@@ -54,12 +54,13 @@ source_pane() {
   done
   printf '%s\n' "$p"
 }
-# inherit PANE: run the script on PANE; prints the pid of the one window it added.
+# inherit PANE: run the script on PANE; prints the pid of the one window it added. With
+# COMPAT=42 the script runs with the quoting rules of bash 4.2 and older (macOS /bin/bash).
 inherit() {
   local before after w pid
   before="$(tsb list-windows -t s: -F '#{window_id}')"
   # A new window gets the PATH of the client that asked for it: put the stand-in first.
-  PATH="$tmp/fake:$PATH" bash "$script" window "$1" >/dev/null 2>&1
+  PATH="$tmp/fake:$PATH" BASH_COMPAT="${COMPAT:-}" bash "$script" window "$1" >/dev/null 2>&1
   after="$(tsb list-windows -t s: -F '#{window_id}')"
   w="$(comm -13 <(sort <<<"$before") <(sort <<<"$after") | head -n 1)"
   [[ -n "$w" ]] || return 0
@@ -75,6 +76,11 @@ echo "an argument with a space"
 pane="$(source_pane a "$tmp/fake/ssh -i '/keys/my key' box.example.com")"
 pid="$(inherit "$pane")"
 equal "stays one argument" 'ssh|-i|/keys/my key|-t|box.example.com|exec "$SHELL" -l|' "$(argv_of "$pid")"
+
+echo "an argument with a single quote, quoted as bash 4.2 and older would"
+pane="$(source_pane q "$tmp/fake/ssh -i \"/keys/o'brien key\" box.example.com")"
+pid="$(COMPAT=42 inherit "$pane")"
+equal "comes back as written" "ssh|-i|/keys/o'brien key|-t|box.example.com|exec \"\$SHELL\" -l|" "$(argv_of "$pid")"
 
 echo "a t inside an option value"
 pane="$(source_pane b "$tmp/fake/ssh -Jbastion -lroot box.example.com")"

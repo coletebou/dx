@@ -102,7 +102,9 @@ warn()   { echo "Warn:  $*" >&2; }
 info()   { echo "$*"; }
 # shq WORD: WORD single-quoted for any shell. printf %q leaves a leading = bare, and zsh's
 # EQUALS expansion reads `=== x` as a command lookup, so text typed into a pane goes this way.
-shq()    { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+# The substitution sits in a plain assignment: inside double quotes, bash 4.2 and older (macOS
+# /bin/bash) keep the replacement's backslashes.
+shq()    { local q; q=${1//\'/\'\\\'\'}; printf "'%s'" "$q"; }
 
 # ───────── engine selection (claude | codex) ─────────────────────────────
 # Each manifest row may pick its runtime in an optional 4th column. Empty →

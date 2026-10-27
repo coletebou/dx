@@ -271,7 +271,9 @@ fi
 if [[ -n "$remote_dir" ]]; then
     # Single-quote for the REMOTE shell; embedded quotes are escaped the POSIX
     # way ('\'') since remote_dir ultimately comes from remote output.
-    esc_dir="${remote_dir//\'/\'\\\'\'}"
+    # A plain assignment, not "...": inside double quotes, bash 4.2 and older (macOS /bin/bash)
+    # keep the replacement's backslashes.
+    esc_dir=${remote_dir//\'/\'\\\'\'}
     # `cd || true` then exec: if the directory is gone (deleted since, or a
     # different fs layout) you still get a shell in $HOME rather than a window
     # that flashes an error and exits.
@@ -284,7 +286,7 @@ fi
 #
 # The command is handed to tmux as a single string, so each element is quoted
 # for the `sh -c` that tmux will run it under.
-shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+shq() { local q; q=${1//\'/\'\\\'\'}; printf "'%s'" "$q"; }   # assigned, as esc_dir is
 
 # tmux runs it with default-shell -c, which is any shell. `exec env ssh` works in
 # all of them and skips a shell function named ssh: `exec command ssh` fails in sh
