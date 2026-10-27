@@ -42,12 +42,16 @@ The user wants a durable record of what's in every tmux pane right now — befor
 ## Content detection
 
 For each pane, the script extracts signals from the captured text:
-- `error_keywords` — count of `ERROR`, `Traceback`, `FAIL`, `error:`, `fatal:`
-- `test_results` — parses `N passed`, `N failed` from pytest/jest output if visible
-- `claude_session` — if a Claude `.jsonl` exists for the pane's cwd, linked
-- `last_command` — from the final shell prompt line if detectable
+- `error_keyword_count` — lines matching `ERROR`, `Traceback`, `FAIL`, `error:` or `fatal:`
+  (any case)
+- `test_summary` — the last `N passed, N failed` (or `N errors`) run in the
+  pytest/jest output, if visible; empty otherwise
+- `claude_transcript` — the path of the Claude `.jsonl` linked for the pane's
+  cwd (the agent's own one when an agent matched, else the newest); empty when
+  there is none or transcripts were not included
 
-These land in `manifest.json` per-pane. README.md summarizes.
+These land in `manifest.json` per-pane, next to `line_count`, `size_bytes` and
+the pane's `pane_command` and `pane_path`. README.md summarizes.
 
 ## Claude agent integration
 
@@ -57,7 +61,8 @@ matches each tmux pane to a live agent by walking the pane's process subtree
 record gets:
 
 - `agent_pid` — Claude process pid
-- `agent_session_id` — `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`
+- `agent_session_id` — the agent's session id (its transcript is
+  `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`)
 - `agent_status` — `busy` / `idle` / other
 - `agent_name` — agent's display name (when set)
 - `agent_kind` — `interactive` etc.

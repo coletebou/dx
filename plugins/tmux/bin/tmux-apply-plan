@@ -145,8 +145,10 @@ done < <(jq -r '.windows[]? | select(.new_name) | [.target, .new_name] | @tsv' "
 
 # ── Phase 4: move windows across sessions and/or reindex ─────────────────
 # Build the move set: pane id → (destination session, final index).
+# Fields are split on \x1f, not a tab: IFS whitespace collapses, so for a
+# same-session reorder ("%7\t\t1", no new_session) read would set dest=1.
 declare -a MV_PANE=() MV_DEST=() MV_IDX=() MV_SRC=()
-while IFS=$'\t' read -r target dest idx; do
+while IFS=$'\x1f' read -r target dest idx; do
     [ -z "$target" ] && continue
     src="$(eff_sess "$(tm display-message -p -t "$target" -F '#{session_name}')")"
     cur_idx="$(tm display-message -p -t "$target" -F '#{window_index}')"
@@ -157,7 +159,7 @@ while IFS=$'\t' read -r target dest idx; do
     # Nothing to do when already in the right session at the right index.
     [ "$dest" = "$src" ] && { [ -z "$idx" ] || [ "$idx" = "$cur_idx" ]; } && continue
     MV_PANE+=("$target"); MV_DEST+=("$dest"); MV_IDX+=("$idx"); MV_SRC+=("$src")
-done < <(jq -r '.windows[]? | [.target, (.new_session // ""), (if .new_index == null then "" else (.new_index|tostring) end)] | @tsv' "$PLAN")
+done < <(jq -r '.windows[]? | [.target, (.new_session // ""), (if .new_index == null then "" else (.new_index|tostring) end)] | join("\u001f")' "$PLAN")
 
 moved=0
 if [ "${#MV_PANE[@]}" -gt 0 ]; then
@@ -228,7 +230,10 @@ if [ "${#MV_PANE[@]}" -gt 0 ]; then
     while IFS=$'\t' read -r i; do
         pane="${MV_PANE[$i]}"; dest="${MV_DEST[$i]}"; want="${MV_IDX[$i]}"
         if [ -z "$want" ]; then
-            info "moved $pane → ${dest} (index unspecified)"
+            # Off its scratch index (900+): left there it would show as window 900
+            # and block the next plan's parking spot. "<session>:" is the next free one.
+            run move-window -s "$pane" -t "${dest}:"
+            info "moved $pane → ${dest} (next free index)"
         else
             run move-window -s "$pane" -t "${dest}:${want}"
             info "moved $pane → ${dest}:${want}"
