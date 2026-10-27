@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2088  # test labels name paths with a literal ~
+# install.test.sh: install.sh into a throwaway HOME. A dry run changes nothing; a real run links
+# every component, moves what it replaces into the backup with a change log, generates valid
+# Claude Code settings, carries an existing git identity over, and a second run changes nothing.
+# It refuses a foreign ~/.dotfiles and never writes into the checkout. Fake claude, launchctl and
+# systemctl only log, so nothing real is registered or scheduled.
+#
+#   bash scripts/tests/install.test.sh            (INSTALL_BASH=/bin/bash to test another bash)
+set -uo pipefail
+
+root="$(cd "$(dirname "$0")/../.." && pwd -P)"
+run_bash="${INSTALL_BASH:-bash}"
+tmp="$(mktemp -d)"
+tmp="$(cd "$tmp" && pwd -P)"
+trap 'rm -rf "$tmp"' EXIT
+
+pass=0 fail=0
+ok()  { printf '  ok   %s\n' "$1"; pass=$((pass + 1)); }
+bad() { printf '  FAIL %s\n       want: %s\n       got:  %s\n' "$1" "$2" "$3"; fail=$((fail + 1)); }
+check() { if [[ "$3" == *"$2"* ]]; then ok "$1"; else bad "$1" "*$2*" "$3"; fi; }
+lacks() { if [[ "$3" != *"$2"* ]]; then ok "$1"; else bad "$1" "no '$2'" "$3"; fi; }
+equal() { if [[ "$3" == "$2" ]]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
+
+mkdir -p "$tmp/bin"
+for t in launchctl systemctl; do
+  printf '#!/bin/sh\nprintf "%%s\\n" "%s $*" >> "%s"\nexit 0\n' "$t" "$tmp/calls" > "$tmp/bin/$t"
+  chmod +x "$tmp/bin/$t"
+done
+# A fake claude whose `mcp get` knows what `mcp add-json` registered, per HOME, like the real one.
+cat > "$tmp/bin/claude" <<EOF
+#!/bin/sh
+printf '%s\n' "claude \$*" >> "$tmp/calls"
+reg="\$HOME/.fake-claude-mcp"
+case "\$1 \$2" in
+  "mcp get") grep -qx "\$3" "\$reg" 2>/dev/null ;;
+  "mcp add-json") eval "n=\\\${\$((\$# - 1))}"; printf '%s\n' "\$n" >> "\$reg" ;;  # the name precedes the JSON
+esac
+EOF
+chmod +x "$tmp/bin/claude"
+export PATH="$tmp/bin:$PATH" GIT_CONFIG_NOSYSTEM=1
+unset XDG_CONFIG_HOME
+newhome() { export HOME="$tmp/home$1"; mkdir -p "$HOME"; }
+inst() { "$run_bash" "$root/install.sh" "$@" 2>&1; }
+before_status="$(git -C "$root" status --porcelain)"
+
+echo "usage"
+newhome 0
+out="$(inst)"; rc=$?
+equal "no components is a usage error" 2 "$rc"
+check "...that lists the components" "worktrees  wt-helper, pw" "$out"
+out="$(inst --with bogus)"; rc=$?
+equal "an unknown component is refused" 1 "$rc"
+out="$(inst --all --identity nobody)"; rc=$?
+equal "an unknown identity is refused" 1 "$rc"
+check "...saying how to make one" "copy identities/example" "$out"
+
+echo "dry run"
+newhome 1
+out="$(inst --all --dry-run)"; rc=$?
+equal "a dry run succeeds" 0 "$rc"
+check "...and says what it would do" "would link ~/.zshrc" "$out"
+equal "...without touching HOME" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
+
+echo "a real install"
+newhome 2
+printf 'mine\n' > "$HOME/.zshrc"
+printf '[user]\n\tname = Sam Example\n\temail = sam@example.com\n' > "$HOME/.gitconfig"
+out="$(inst --all)"; rc=$?
+equal "the install succeeds" 0 "$rc"
+equal "~/.dotfiles points at the checkout" "$root" "$(readlink "$HOME/.dotfiles")"
+equal "~/.zshrc is linked" "$root/zshrc" "$(readlink "$HOME/.zshrc")"
+backup="$(ls -d "$HOME"/.dotfiles-backup/*/ 2>/dev/null | head -n 1)"
+equal "the replaced ~/.zshrc is in the backup" "mine" "$(cat "${backup}.zshrc" 2>&1)"
+check "...with a change log" '"action":"backup"' "$(cat "${backup}changes.jsonl" 2>&1)"
+check "~/.df-profile names the identity and role" "export DF_IDENTITY=example" "$(cat "$HOME/.df-profile")"
+check "...and the role" "export DF_ROLE=local" "$(cat "$HOME/.df-profile")"
+equal "the generated settings are valid JSON with the statusline" "true" \
+  "$(jq '.statusLine.command | test("statusline.sh")' "$HOME/.claude/settings.json" 2>&1)"
+check "...and the base hooks" "load-memory-hook.sh" "$(jq -r '.hooks.SessionStart[].hooks[].command' "$HOME/.claude/settings.json" 2>&1)"
+check "CLAUDE.md imports the base rules" "@~/.dotfiles/base/claude/CLAUDE.base.md" "$(cat "$HOME/.claude/CLAUDE.md")"
+check "...and the identity's" "@~/.dotfiles/identities/example/claude/common.CLAUDE.md" "$(cat "$HOME/.claude/CLAUDE.md")"
+equal "the merged MCP config is valid JSON" "object" "$(jq -r '.mcpServers | type' "$HOME/.claude/mcp.json" 2>&1)"
+equal "git resolves the hooks path under ~/.dotfiles" "$HOME/.dotfiles/base/git/hooks" \
+  "$(git config --global --path --get core.hooksPath 2>&1)"
+# The way git reads it for a commit: all config files, includes followed (--global alone skips them).
+equal "the old git identity was kept" "sam@example.com" "$(cd "$tmp" && git config --get user.email 2>&1)"
+for b in pw pw-append stack-branches stack-claude wt-helper cc-park cc-handoff reflections dream tmux-archive autoreview-pair; do
+  [[ -L "$HOME/.local/bin/$b" && -x "$HOME/.local/bin/$b" ]] || bad "~/.local/bin/$b is a working link" "a link" "$(ls -l "$HOME/.local/bin/$b" 2>&1)"
+done
+ok "the CLIs are linked into ~/.local/bin"
+for s in cc-park fresh-session-handoff parallel-worktrees tmux-archive reflect codex-subagents mcp-agent-safety; do
+  [[ -f "$HOME/.claude/skills/$s/SKILL.md" ]] || bad "skill $s is linked" "SKILL.md" "$(ls -l "$HOME/.claude/skills/$s" 2>&1)"
+done
+ok "the skills are linked into ~/.claude/skills"
+lacks "schedules are not part of --all" "systemctl" "$(cat "$tmp/calls" 2>/dev/null)"
+
+echo "idempotent"
+out="$(inst --all)"; rc=$?
+equal "a second run succeeds" 0 "$rc"
+check "...and changes nothing" "Everything was already in place." "$out"
+equal "...nor makes another backup" "1" "$(ls -d "$HOME"/.dotfiles-backup/*/ | wc -l | tr -d ' ')"
+
+echo "the shell it sets up"
+if command -v zsh >/dev/null 2>&1; then
+  equal "a zsh reads the profile" "example local" "$(env -i HOME="$HOME" PATH="$PATH" zsh -c 'echo "$DF_IDENTITY $DF_ROLE"' 2>&1)"
+else
+  ok "# SKIP zsh not installed"
+fi
+
+echo "a foreign ~/.dotfiles"
+newhome 3
+mkdir -p "$HOME/.dotfiles"
+out="$(inst --with shell)"; rc=$?
+equal "is refused" 1 "$rc"
+check "...with the way out" "--replace-dotfiles" "$out"
+out="$(inst --with shell --replace-dotfiles)"; rc=$?
+equal "--replace-dotfiles moves it into the backup" 0 "$rc"
+equal "...and links the checkout" "$root" "$(readlink "$HOME/.dotfiles")"
+
+echo "schedules"
+newhome 4
+out="$(inst --with schedules --dry-run)"; rc=$?
+equal "a schedules dry run succeeds" 0 "$rc"
+case "$(uname -s)" in
+  Linux)  check "...naming the timers" "would enable the timers" "$out" ;;
+  Darwin) check "...naming the agents" "would load com.cc-park-auto" "$out" ;;
+  *)      ok "# SKIP no launchd or systemd" ;;
+esac
+equal "...writing nothing" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
+
+echo "the checkout"
+equal "nothing was written into the repo" "$before_status" "$(git -C "$root" status --porcelain)"
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[[ "$fail" -eq 0 ]]

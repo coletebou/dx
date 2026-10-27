@@ -1,0 +1,13 @@
+# identities/example/hosts — short labels for your machines, shown in the tmux
+# status bar, the terminal tab title and the Claude Code statusline.
+#
+#   <hostname glob>  <label>  [work]
+#
+# First match wins; the glob is matched against `hostname -s`. "work" gives a
+# machine's sessions a distinct look (an orange label) so you never confuse
+# them. Unmatched machines show their hostname.
+#
+# my-desktop       desk
+# my-laptop        lap
+# build-box-*      build
+# corp-laptop-*    corp     work

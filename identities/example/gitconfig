@@ -1,0 +1,7 @@
+# identities/example/gitconfig — the commit identity for this identity.
+# install.sh writes ~/.gitconfig.identity to include this file. An identity
+# you already had in ~/.gitconfig was carried into ~/.gitconfig.local, which
+# git reads after this file, so it still wins.
+[user]
+	name = Your Name
+	email = you@example.com
