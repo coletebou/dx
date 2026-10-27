@@ -5,11 +5,11 @@
 
 base/git/hooks/pre-push runs this once per outgoing ref, in the repository being pushed,
 when it exists next to the hook's checkout. A repository is a memory repository when its
-history holds a committed claude/memory-homes.conf (rows `<shortname> <path>`, the paths
-inside the repository). For each memory home the push changes, the committed Markdown is
-copied out of Git into a temporary directory and checked with `memory-canary --strict`;
-the working tree and the live memory directories are never read. Any other repository,
-this one included, passes at once and prints nothing.
+history holds a committed claude/memory-homes.conf (rows `<shortname> <path>`; a path outside
+the repository is live memory, with nothing committed to check). For each memory home the
+push changes, the committed Markdown is copied out of Git into a temporary directory and
+checked with `memory-canary --strict`; the working tree and the live memory directories are
+never read. Any other repository, this one included, passes at once and prints nothing.
 
 Exit 0 lets the push proceed; 1 blocks it, with the reason on stderr. Clean verdicts are
 cached by content in ${XDG_CACHE_HOME:-~/.cache}/pre-push-memory (PRE_PUSH_MEMORY_CACHE
