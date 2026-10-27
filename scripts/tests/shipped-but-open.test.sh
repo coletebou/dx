@@ -144,5 +144,32 @@ lacks "...never a field, form or body" "|" "$(grep -E '\| (-f|-F|--field|--raw-f
 lacks "...never an issue or MR command" "issue" "$(grep -E '^(issue|mr|note)\b' "$tmp/all-calls")"
 equal "...and it made calls at all" "yes" "$([[ -s "$tmp/all-calls" ]] && echo yes || echo no)"
 
+echo "the skill's pre-approved commands"
+# Each allowed-tools Bash rule, matched the way Claude Code matches it (`*` is any text, `:*` at the
+# end is ` *`, and a trailing ` *` also matches the bare command), against what it must leave to a
+# prompt and what it should let through. glab sends the LAST method flag it is given, so a rule
+# anchored on `glab api --method GET` still matches a PUT.
+skill="$root/plugins/toolbox/skills/shipped-but-open/SKILL.md"
+matches() {  # matches COMMAND: the allowed-tools rules that match it, one per line
+  python3 - "$skill" "$1" <<'EOF'
+import re, sys
+text, cmd = open(sys.argv[1]).read(), sys.argv[2]
+front = text.split("---")[1]
+for rule in re.findall(r"^\s*-\s*Bash\((.*)\)\s*$", front, re.M):
+    pat = rule[:-2] + " *" if rule.endswith(":*") else rule
+    rx = re.escape(pat).replace(r"\*", ".*")
+    if re.fullmatch(rx, cmd) or (pat.endswith(" *") and pat.count("*") == 1 and cmd == pat[:-2]):
+        print(rule)
+EOF
+}
+for write in 'glab api --method GET projects/1/issues/2 -X PUT -f state_event=close' \
+  'glab api -X POST projects/1/issues/2/notes -f body=done' 'glab api --method DELETE projects/1/issues/2' \
+  'glab issue close 2' 'glab issue note 2 -m shipped' 'git branch -D 12-feature'; do
+  equal "no rule pre-approves: $write" "" "$(matches "$write")"
+done
+for read in 'glab issue view 12' 'glab issue list --assignee=@me'; do
+  check "a rule lets through: $read" "glab issue" "$(matches "$read")"
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

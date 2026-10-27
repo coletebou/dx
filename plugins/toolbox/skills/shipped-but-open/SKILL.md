@@ -2,11 +2,8 @@
 name: shipped-but-open
 description: "Find OPEN GitLab issues that already have a MERGED merge request: work that shipped but whose issue was never closed (common when someone other than the author merges). Use when the user says 'what shipped but is still open', 'find forgotten issues', 'shipped-but-open', 'issues I forgot to close', 'backlog rot', or wants to reconcile merged work against open issues. Read-only sweep; closing is a separate, explicitly approved step."
 allowed-tools:
-  - Bash(glab api:*)
-  - Bash(glab issue view:*)
-  - Bash(glab issue list:*)
-  - Bash(git branch:*)
-  - Bash(git log:*)
+  - Bash(glab issue view *)
+  - Bash(glab issue list *)
 ---
 
 # shipped-but-open
@@ -30,6 +27,21 @@ The project comes from `glab repo view` unless `PROJECT` names one. Calls are se
 `PARALLEL=N` runs N at a time, but some self-hosted instances behind slow links or VPNs stall
 under parallel API load, so raise it only on a fast link. An issue whose lookup fails or times
 out is listed as UNCHECKED and the sweep exits 1: never read a missing row as "not shipped".
+
+## What runs without asking
+
+Only `glab issue view` and `glab issue list` are pre-approved, both read-only (read-only forms
+of `git` need no rule). Everything else asks first, on purpose:
+
+- **The sweep** asks once to run. Every call it makes is `glab api --method GET ...`, fixed in
+  the script and covered by its tests, so it cannot close, comment or label anything.
+- **`glab api` by hand** always asks, reads included. No allowed-tools prefix can confine it to
+  reads: Claude Code matches a rule as a prefix, and glab sends the last method flag it is given,
+  so `glab api --method GET ... -X PUT -f state_event=close` matches a `glab api --method GET`
+  rule and still closes the issue. Write the reads you need as `glab api --method GET ...`
+  so the prompt shows plainly what will run.
+- **Closing and comments** (`glab issue close`, `glab issue note`) always ask: they are the
+  explicitly approved step below.
 
 ## Reading the output: STRONG vs WEAK (this is the whole point)
 
@@ -59,8 +71,8 @@ Recommended flow:
 
 1. Run the sweep.
 2. For each STRONG hit, read the issue body and the merged MR (`glab issue view N`,
-   `glab api projects/:fullpath/merge_requests/M`). Judge: did the merge substantially satisfy
-   the issue?
+   `glab api --method GET projects/:fullpath/merge_requests/M`). Judge: did the merge
+   substantially satisfy the issue?
 3. Present a close list with a one-line justification each; get approval.
 4. Close approved issues **with a comment linking the merged MR**:
    `glab issue close N`, after `glab issue note N -m "Shipped in !M: <what landed>."`.
