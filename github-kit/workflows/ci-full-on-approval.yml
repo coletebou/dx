@@ -1,0 +1,114 @@
+name: CI Full On Approval
+
+# A ready PR runs the full CI lane on every push, so this only covers the gap:
+# when a same-repository, non-draft PR is approved on its current head and
+# that head has no full run in flight or passed (one that failed, or was
+# cancelled before it started), it dispatches one. PRs that carry `ci:full`
+# are skipped at the job `if:`, and a review that approved an older commit is
+# ignored; the next approval of the current head dispatches.
+#
+# Same dispatch path as ci-full-label.yml: workflow_dispatch with the PR
+# number joins the PR's concurrency group, so a later push cancels it like
+# any other stale run. Same-repository PRs only: workflow_dispatch cannot
+# target a fork branch.
+#
+# Off until the repository variable CI_FULL_WORKFLOW names the full CI
+# workflow file. Coverage is judged by one job of that workflow, named by the
+# variable CI_FULL_JOB (default `full`), which runs only on the full lane and
+# is skipped on a draft's fast lane (the kit's README.md has the contract).
+#
+# Two guards run in the step, because the job `if:` reads the event payload,
+# which can be stale by the time the step runs:
+#   - the branch tip must still equal the approved SHA (dispatch takes a
+#     branch name, so a newer push would otherwise be tested and reported as
+#     the approved head), and
+#   - a head whose full lane is already running, or already passed, is not
+#     dispatched again, so a second approver or a re-submitted approval
+#     cannot cancel and restart the suite.
+# A pull_request run of this PR's head branch that has not created its jobs
+# yet also counts as in flight: it waits in the PR's concurrency group while
+# the previous head's run cancels, and an approval often lands in that window.
+# Dispatching then would cancel the PR's own run and move the result to a run
+# the PR does not show. A push can still land between the tip check and the
+# dispatch; the shared concurrency group then cancels the stale run and the
+# new head is covered by the normal rules.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  ci-full-dispatch:
+    if: >-
+      vars.CI_FULL_WORKFLOW != '' &&
+      github.event.review.state == 'approved' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.review.commit_id == github.event.pull_request.head.sha &&
+      !contains(github.event.pull_request.labels.*.name, 'ci:full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Serialize decisions for the same PR; approvals must not both inspect
+    # an uncovered head and dispatch competing runs at the same time.
+    concurrency:
+      group: ci-full-on-approval-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Dispatch the full CI lane for the approved head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ vars.CI_FULL_WORKFLOW }}
+          FULL_JOB: ${{ vars.CI_FULL_JOB || 'full' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          tip="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq .head.sha)"
+          if [[ "$tip" != "$HEAD_SHA" ]]; then
+            echo "Branch tip ${tip:0:7} moved past the approved ${HEAD_SHA:0:7}; not dispatching." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # A run covers the full lane only when its FULL_JOB ran: that job has
+          # no `needs` and its `if:` resolves when the run starts, so it is
+          # `skipped` in fast-lane-only runs and queued, running or finished
+          # otherwise. A completed FULL_JOB still counts as in flight while the
+          # rest of the run finishes; once the run completes, it must have
+          # passed. A run with no jobs yet has not started: a dispatch, a merge
+          # queue run, or a pull_request run of this PR's head branch then
+          # counts as in flight. `--commit` also lists other PRs' runs of the
+          # same commit, which may be a draft's fast lane, so those count only
+          # by their jobs.
+          covered=0
+          for run_id in $(gh run list --workflow "$WORKFLOW" --commit "$HEAD_SHA" \
+            --json databaseId --jq '.[].databaseId'); do
+            # shellcheck disable=SC2016 # $run, $status and $job are jq variables
+            state="$(gh run view "$run_id" --json status,conclusion,jobs,event,headBranch --jq '
+              .conclusion as $run
+              | .status as $status
+              | ([.jobs[] | select(.name == env.FULL_JOB)] | first) as $job
+              | if $job == null then
+                  if $status != "completed" and (
+                    .event == "workflow_dispatch" or .event == "merge_group" or
+                    (.event == "pull_request" and .headBranch == env.HEAD_REF))
+                  then "inflight" else "none" end
+                elif $job.status != "completed" then "inflight"
+                elif $job.conclusion == "success" and $status != "completed" then "inflight"
+                elif $job.conclusion == "success" and $run == "success" then "passed"
+                else "none" end')"
+            if [[ "$state" == "inflight" || "$state" == "passed" ]]; then
+              covered=1
+              break
+            fi
+          done
+          if [[ "$covered" != "0" ]]; then
+            echo "Head ${HEAD_SHA:0:7} already has a ${WORKFLOW} full run in flight or passed; not dispatching again." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh workflow run "$WORKFLOW" --ref "$HEAD_REF" -f "pr=${PR_NUMBER}"
+          echo "Dispatched \`${WORKFLOW}\` for PR #${PR_NUMBER} (\`${HEAD_REF}\` at ${HEAD_SHA:0:7}) on approval." >> "$GITHUB_STEP_SUMMARY"

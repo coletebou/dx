@@ -1,0 +1,53 @@
+name: Stacked PR Retarget
+
+# A stacked PR targets another PR's branch. When that parent merges, GitHub
+# retargets the child to the parent's base, and the child's last CI result was
+# earned against the old base: nothing re-runs, because a base change arrives
+# as an `edited` event.
+#
+# The full CI workflow cannot listen to `edited` itself: every title or body
+# edit would join the PR's concurrency group, cancel the run in flight, and
+# leave a cancelled or skipped check on the head. So a base change is handled
+# here, under a check name of its own, and this job dispatches the full CI
+# workflow for the PR's head with `pr` set, so the dispatched run joins the
+# PR's concurrency group like any other run. Drafts follow the full-lane rule:
+# they run only when they carry `ci:full`. Same-repository PRs only, because
+# workflow_dispatch cannot target a fork branch.
+#
+# Off until the repository variable CI_FULL_WORKFLOW names the full CI
+# workflow file (e.g. ci.yml). That workflow must accept workflow_dispatch
+# with a `pr` input; the kit's README.md has the contract and a skeleton.
+# Edits that do not change the base create one run here with the job skipped.
+
+on:
+  pull_request:
+    types: [edited]
+
+permissions: {}
+
+jobs:
+  retarget-full-lane:
+    if: >-
+      vars.CI_FULL_WORKFLOW != '' &&
+      github.event.changes.base.ref.from != '' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (!github.event.pull_request.draft || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the full CI lane for the retargeted head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ vars.CI_FULL_WORKFLOW }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OLD_BASE: ${{ github.event.changes.base.ref.from }}
+          NEW_BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          gh workflow run "$WORKFLOW" --ref "$HEAD_REF" -f "pr=${PR_NUMBER}"
+          echo "PR #${PR_NUMBER} moved from ${OLD_BASE} to ${NEW_BASE}; dispatched ${WORKFLOW} for ${HEAD_REF} (${HEAD_SHA:0:7})."
+          echo "PR #${PR_NUMBER} moved from \`${OLD_BASE}\` to \`${NEW_BASE}\`. Dispatched \`${WORKFLOW}\` for \`${HEAD_REF}\` at ${HEAD_SHA:0:7}; its checks appear on that commit within a minute." >> "$GITHUB_STEP_SUMMARY"

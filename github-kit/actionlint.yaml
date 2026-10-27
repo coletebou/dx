@@ -1,0 +1,16 @@
+# actionlint configuration (https://github.com/rhysd/actionlint/blob/main/docs/config.md).
+# actionlint reads it from .github/actionlint.yaml; run it with no arguments from the repository root.
+
+self-hosted-runner:
+  # The labels of your self-hosted runners, so actionlint accepts a runs-on that names them.
+  labels: []
+
+# The repository variables the workflows read, so a misspelled vars.NAME is an error. The kit's
+# workflows read these; add the ones your own workflows use, or delete this key to turn the check off.
+config-variables:
+  - CLAUDE_MODEL
+  - CLAUDE_REVIEW_MODEL
+  - CI_FULL_WORKFLOW
+  - CI_FULL_JOB
+  - PR_LABELS_UI_PATHS
+  - PR_LABELS_NOT_UI

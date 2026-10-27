@@ -1,0 +1,89 @@
+name: Claude
+
+# `@claude` in a new issue (its title or body) or in a comment on an issue or
+# a pull request runs Claude Code on it, for a collaborator. Setup (README.md
+# in the kit, "Claude workflows"):
+#   - install the Claude GitHub App on the repository (in Claude Code:
+#     /install-github-app); the action exchanges this job's OIDC token for the
+#     app's token, which is what comments and pushes branches;
+#   - add ONE credential as a secret of environment "claude" (or of the
+#     repository): ANTHROPIC_API_KEY, or CLAUDE_CODE_OAUTH_TOKEN;
+#   - optionally set the repository variable CLAUDE_MODEL to the model id to
+#     run. Unset, the action's default model runs.
+# Without a credential the job says so in a warning and does nothing else.
+#
+# These events always run the default branch's copy of this file, so a pull
+# request cannot edit it to read the secret; restrict environment "claude" to
+# the default branch to make that hold for every way in. Review and
+# review-comment events would run a pull request's own copy, so they are not
+# triggers: mention @claude in a conversation comment instead.
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  claude:
+    # Anyone who can read the repository can comment or open an issue, so the
+    # author must be a collaborator before this job gets a credential.
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+    runs-on: ubuntu-latest
+    environment: claude
+    timeout-minutes: 60
+    # One run per issue or PR at a time; a second mention waits for the first.
+    concurrency:
+      group: claude-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      actions: read # lets Claude read CI results on PRs
+      id-token: write # the exchange for the Claude GitHub App's token
+    steps:
+      - name: Check the configuration
+        id: config
+        env:
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          MODEL: ${{ vars.CLAUDE_MODEL }}
+        run: |
+          if [[ "$HAS_API_KEY" != true && "$HAS_OAUTH_TOKEN" != true ]]; then
+            echo "::warning::No credential: set the ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN secret (environment \"claude\" or the repository) to let @claude run."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          args=""
+          if [[ -n "$MODEL" ]]; then
+            if [[ ! "$MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]*$ ]]; then
+              echo "::error::CLAUDE_MODEL is not a model id: $MODEL"
+              exit 1
+            fi
+            args="--model $MODEL"
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "claude_args=$args" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        if: steps.config.outputs.ready == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        if: steps.config.outputs.ready == 'true'
+        uses: anthropics/claude-code-action@8041f1d17e0e7d2f2cfe35002962e9f26237c0bb # v1.0.263
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: ${{ steps.config.outputs.claude_args }}

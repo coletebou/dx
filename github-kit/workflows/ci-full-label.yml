@@ -1,0 +1,56 @@
+name: CI Full Label
+
+# `ci:full` opts a draft PR into the full CI lane. GitHub cannot filter a
+# `labeled` trigger by label name, and a `labeled` run inside the full CI
+# workflow whose jobs all skip would still post skipped, and therefore
+# passing, checks on top of a red head. So the label is handled here, under a
+# check name of its own that branch protection never requires, and this job
+# dispatches the full CI workflow for the PR's head branch. The dispatched run
+# carries `pr` so it joins the PR's concurrency group and a later push cancels
+# it like any other stale run. Same-repository PRs only: workflow_dispatch
+# cannot target a fork branch.
+#
+# Drafts only. A ready PR already runs the full lane on every push, and a
+# dispatch would join that run's concurrency group and cancel it. The PR
+# shows only its pull_request run, so the cancelled run's red check would
+# hide the dispatched run's green one.
+#
+# Off until the repository variable CI_FULL_WORKFLOW names the full CI
+# workflow file (e.g. ci.yml); the kit's README.md has the contract that
+# workflow follows. Any other label still creates a run here (with the job
+# skipped) and nothing else.
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  ci-full-dispatch:
+    if: >-
+      vars.CI_FULL_WORKFLOW != '' &&
+      github.event.label.name == 'ci:full' &&
+      github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the full CI lane for this PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ vars.CI_FULL_WORKFLOW }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [[ "$SAME_REPO" != "true" ]]; then
+            echo "::error::PR #${PR_NUMBER} comes from a fork; workflow_dispatch cannot target a fork branch. Mark the PR ready for review to run the full lane."
+            exit 1
+          fi
+          gh workflow run "$WORKFLOW" --ref "$HEAD_REF" -f "pr=${PR_NUMBER}"
+          echo "dispatched ${WORKFLOW} for PR #${PR_NUMBER} on ${HEAD_REF} (${HEAD_SHA})"
+          echo "Dispatched \`${WORKFLOW}\` for PR #${PR_NUMBER} (\`${HEAD_REF}\` at ${HEAD_SHA:0:7}). Its checks appear on that commit within a minute." >> "$GITHUB_STEP_SUMMARY"
