@@ -9,14 +9,19 @@ name: Stacked PR Retarget
 # edit would join the PR's concurrency group, cancel the run in flight, and
 # leave a cancelled or skipped check on the head. So a base change is handled
 # here, under a check name of its own, and this job dispatches the full CI
-# workflow for the PR's head with `pr` set, so the dispatched run joins the
-# PR's concurrency group like any other run. Drafts follow the full-lane rule:
+# workflow for the PR's head with `pr` and `base` set: `pr` puts the run in
+# the PR's concurrency group like any other run, and `base` (the new base) is
+# merged into the checkout before the suite runs, so the run tests the child
+# merged onto its new base, which is what the retarget changed, not the
+# unchanged branch alone. Its checks show on the head commit and in the
+# Actions tab, not among the PR's checks. Drafts follow the full-lane rule:
 # they run only when they carry `ci:full`. Same-repository PRs only, because
 # workflow_dispatch cannot target a fork branch.
 #
 # Off until the repository variable CI_FULL_WORKFLOW names the full CI
 # workflow file (e.g. ci.yml). That workflow must accept workflow_dispatch
-# with a `pr` input; the kit's README.md has the contract and a skeleton.
+# with `pr` and `base` inputs and merge `base` first; the kit's README.md has
+# the contract and a skeleton.
 # Edits that do not change the base create one run here with the job skipped.
 
 on:
@@ -48,6 +53,6 @@ jobs:
           OLD_BASE: ${{ github.event.changes.base.ref.from }}
           NEW_BASE: ${{ github.event.pull_request.base.ref }}
         run: |
-          gh workflow run "$WORKFLOW" --ref "$HEAD_REF" -f "pr=${PR_NUMBER}"
-          echo "PR #${PR_NUMBER} moved from ${OLD_BASE} to ${NEW_BASE}; dispatched ${WORKFLOW} for ${HEAD_REF} (${HEAD_SHA:0:7})."
-          echo "PR #${PR_NUMBER} moved from \`${OLD_BASE}\` to \`${NEW_BASE}\`. Dispatched \`${WORKFLOW}\` for \`${HEAD_REF}\` at ${HEAD_SHA:0:7}; its checks appear on that commit within a minute." >> "$GITHUB_STEP_SUMMARY"
+          gh workflow run "$WORKFLOW" --ref "$HEAD_REF" -f "pr=${PR_NUMBER}" -f "base=${NEW_BASE}"
+          echo "PR #${PR_NUMBER} moved from ${OLD_BASE} to ${NEW_BASE}; dispatched ${WORKFLOW} for ${HEAD_REF} (${HEAD_SHA:0:7}) merged onto ${NEW_BASE}."
+          echo "PR #${PR_NUMBER} moved from \`${OLD_BASE}\` to \`${NEW_BASE}\`. Dispatched \`${WORKFLOW}\` for \`${HEAD_REF}\` at ${HEAD_SHA:0:7} merged onto \`${NEW_BASE}\`; its checks appear on that commit (not among the PR's checks) within a minute." >> "$GITHUB_STEP_SUMMARY"

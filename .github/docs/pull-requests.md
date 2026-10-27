@@ -125,5 +125,7 @@ and each run tests the PR merged onto its own base.
 When a parent PR merges, GitHub retargets its children to the parent's base.
 That arrives as an `edited` event, which the CI workflow should ignore (an
 edit must never cancel a run), so `.github/workflows/stacked-pr-retarget.yml`
-dispatches a full run of the child's head instead. Drafts follow the usual
-rule: they get that run only with `ci:full`.
+dispatches a full run of the child's head merged onto its new base instead.
+That run shows on the head commit and in the Actions tab, not among the PR's
+checks, so read it there before merging. Drafts follow the usual rule: they
+get that run only with `ci:full`.

@@ -147,8 +147,12 @@ PR), and a failed or cancelled full lane on a ready PR is repaired by rerunning 
 which keeps that run's commit and event: a run started while the PR was a draft stays a fast
 lane. That workflow keeps this contract:
 
-- it accepts `workflow_dispatch` with a string input `pr` (the dispatching workflows set it to
-  the PR number) and does not listen to `pull_request` `edited` or `labeled`;
+- it accepts `workflow_dispatch` with the string inputs `pr` (the PR number) and `base` (the PR's
+  base branch, the new one after a retarget), which the dispatching workflows set, and does not
+  listen to `pull_request` `edited` or `labeled`;
+- when `base` is set, every job that tests code merges `origin/<base>` into its checkout before
+  anything else runs (a conflict fails the job), so a dispatched run tests what a pull_request run
+  tests, the PR merged onto its base, and a retarget that breaks the integration turns it red;
 - its concurrency group is keyed by the PR, so a dispatched run and the PR's own runs cancel
   each other like runs of one PR: `ci-${{ inputs.pr || github.event.pull_request.number || github.ref }}`;
 - one job, named by `CI_FULL_JOB` (default `full`; the name a run shows for it), has no `needs`
@@ -170,6 +174,10 @@ on:
         description: The pull request this run is for (set by the dispatching workflows)
         required: false
         type: string
+      base:
+        description: The pull request's base branch, merged in before the tests (set with pr)
+        required: false
+        type: string
 concurrency:
   group: ci-${{ inputs.pr || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -180,6 +188,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.base != '' && '0' || '1' }}
+      - name: Merge the base, as a pull_request run would
+        if: inputs.base != ''
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git -c user.name=ci -c user.email=ci@example.invalid merge --no-edit "origin/$BASE"
       - run: make lint unit
   full:
     # Every ready PR, every push and every dispatch; a draft only through ci:full.
@@ -187,11 +204,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.base != '' && '0' || '1' }}
+      - name: Merge the base, as a pull_request run would
+        if: inputs.base != ''
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git -c user.name=ci -c user.email=ci@example.invalid merge --no-edit "origin/$BASE"
       - run: make test-all
 ```
 
-A dispatched run tests the branch tip, not the PR merged onto its base, and only same-repository
-PRs can be dispatched (`workflow_dispatch` cannot target a fork's branch).
+A pull_request run checks out the PR's merge commit already; a dispatched run checks out the
+branch tip, which is why it merges `base` itself (with the history the merge needs). It tests the
+tip as it is when the run starts, and only same-repository PRs can be dispatched
+(`workflow_dispatch` cannot target a fork's branch).
 
 ### Secret scan
 

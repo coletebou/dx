@@ -661,6 +661,54 @@ if command -v jq >/dev/null 2>&1; then
 else
   ok "# SKIP no jq: the approval step not run"
 fi
+run_step "$kit/workflows/stacked-pr-retarget.yml" "Dispatch the full CI lane for the retargeted head" \
+  OLD_BASE=main NEW_BASE=release; rc=$?
+equal "retarget: the dispatch names the new base, for the run to merge" "0 workflow run ci.yml --ref feature -f pr=7 -f base=release" \
+  "$rc $(acts)"
+run_step "$kit/workflows/ci-full-label.yml" "Dispatch the full CI lane for this PR head" SAME_REPO=true BASE_REF=main; rc=$?
+equal "ci:full: the dispatch names the PR's base, for the run to merge" "0 workflow run ci.yml --ref feature -f pr=7 -f base=main" \
+  "$rc $(acts)"
+run_step "$kit/workflows/ci-full-label.yml" "Dispatch the full CI lane for this PR head" SAME_REPO=false BASE_REF=main; rc=$?
+equal "ci:full: a fork PR is refused, with no dispatch" "1 " "$rc $(acts)"
+
+echo "the CI skeleton in the kit's README"
+awk '/^A skeleton:$/ { s = 1; next } s && /^```yaml$/ { y = 1; next } y && /^```$/ { exit } y' "$kit/README.md" > "$tmp/skeleton.yml"
+check "the skeleton takes the base as a dispatch input" $'      base:\n' "$(cat "$tmp/skeleton.yml")"
+check "...and fetches the history a merge needs when it is set" "fetch-depth: \${{ inputs.base != '' && '0' || '1' }}" "$(cat "$tmp/skeleton.yml")"
+merge_step="Merge the base, as a pull_request run would"
+unmerged=""
+for job in fast full; do
+  [[ "$(awk -v j="  $job:" '$0 == j { s = 1; next } s && /^  [a-z]/ { exit } s' "$tmp/skeleton.yml")" == *"- name: $merge_step"* ]] \
+    || unmerged="$unmerged $job"
+done
+equal "...and merges it in every job" "" "$unmerged"
+# The merge step itself, in a clone of the head branch, the way a dispatched run checks it out.
+(
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  g() { git -c user.name=t -c user.email=t@example.invalid -c init.defaultBranch=main "$@"; }
+  g init -q --bare "$tmp/origin.git"
+  g clone -q "$tmp/origin.git" "$tmp/seed" 2>/dev/null
+  printf 'one\n' > "$tmp/seed/shared.txt"
+  g -C "$tmp/seed" add shared.txt && g -C "$tmp/seed" commit -qm base && g -C "$tmp/seed" push -q origin HEAD:main
+  g -C "$tmp/seed" switch -qc feature && printf 'feature\n' > "$tmp/seed/feature.txt"
+  g -C "$tmp/seed" add feature.txt && g -C "$tmp/seed" commit -qm feature && g -C "$tmp/seed" push -q origin feature
+  g -C "$tmp/seed" switch -qc conflict main && printf 'mine\n' > "$tmp/seed/shared.txt"
+  g -C "$tmp/seed" commit -qam conflict && g -C "$tmp/seed" push -q origin conflict
+  g -C "$tmp/seed" switch -q main && printf 'base moved\n' > "$tmp/seed/release.txt" && printf 'two\n' > "$tmp/seed/shared.txt"
+  g -C "$tmp/seed" add release.txt && g -C "$tmp/seed" commit -qam 'base moves on' && g -C "$tmp/seed" push -q origin main
+) > /dev/null 2>&1
+merge_in() {  # merge_in BRANCH BASE: run the skeleton's merge step in a fresh clone of BRANCH
+  rm -rf "$tmp/clone"
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git clone -q --branch "$1" "$tmp/origin.git" "$tmp/clone" 2>/dev/null
+  python3 "$tmp/step.py" "$tmp/skeleton.yml" "$merge_step" > "$tmp/merge.sh" 2> "$tmp/merge.out" || return 99
+  (cd "$tmp/clone" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 BASE="$2" bash -eo pipefail "$tmp/merge.sh") > "$tmp/merge.out" 2>&1
+}
+merge_in feature main; rc=$?
+equal "the skeleton's merge step tests the head merged onto its base" "0 base moved" "$rc $(cat "$tmp/clone/release.txt" 2>&1)"
+equal "...in a merge commit of the two" "2" "$(git -C "$tmp/clone" rev-list --parents -n 1 HEAD 2>/dev/null | wc -w | awk '{ print $1 - 1 }')"
+merge_in conflict main; rc=$?
+[[ "$rc" != 0 && "$rc" != 99 ]] && ok "...and a head that conflicts with its base fails the run" \
+  || bad "...and a head that conflicts with its base fails the run" "a failing merge" "exit $rc: $(cat "$tmp/merge.out")"
 
 echo "this repository's .github"
 for f in workflows/pr-labels.yml scripts/pr-labels.mjs docs/pull-requests.md; do
