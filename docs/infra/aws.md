@@ -54,3 +54,9 @@ interactive shell does.
 Codex CLI has its own provider profiles in `~/.codex/config.toml` (`codex -p <profile>`); the
 same rules apply: credentials from the environment, never in the profile or on the command line.
 See [Codex's configuration docs](https://developers.openai.com/codex/config-basic).
+
+## See also
+
+The other infrastructure playbooks, all optional: [tailscale.md](tailscale.md) (a personal fleet
+over a tailnet), [cloudflare.md](cloudflare.md) (Tunnels, Access, DNS and WAF in front of
+self-hosted services) and [vps.md](vps.md) (a production box).

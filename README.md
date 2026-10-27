@@ -100,9 +100,19 @@ scripts/                          the CLIs (cc-handoff, wt-helper, reflections, 
 scripts/tests/                    the test suites
 claude/*.conf.example             memory tool configuration templates
 launchagents/, systemd/user/      schedule templates
-docs/                             handoff chains, hooks, memory, infrastructure
+docs/                             handoff chains, hooks, memory, workflow, infrastructure
 install.sh                        the installer
 ```
+
+## Docs
+
+| Doc | What it covers |
+|---|---|
+| [Running fleets of agents](docs/workflow/README.md) | coordinator and worker roles, briefs and handoffs, lane terms, parallel worktrees, review before ship, publishing through a scrub gate |
+| [Handoff chains](docs/handoff.md) | how `cc-handoff` moves a long session into a fresh one, on this machine or another |
+| [Claude Code hooks](docs/claude-hooks.md) | every hook, event by event |
+| [Agent memory](docs/memory/README.md) | reflections, the session reflector, transcript analysis and the nightly dreaming sweep |
+| [Infrastructure playbooks](docs/infra/README.md) | a fleet over Tailscale, Cloudflare in front of self-hosted services, a production VPS, Claude Code on Bedrock |
 
 ## Requirements
 
