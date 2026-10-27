@@ -8,6 +8,7 @@ default model and only el1 the section-duration flag, and every model is overrid
 """
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -185,6 +186,42 @@ class MusicVideoTests(unittest.TestCase):
         seen, exit_msg = self.regenerate(proj, hero_ok=False)
         self.assertNotIn("scene", seen, "the scene was generated from the old hero")
         self.assertIn("scene", exit_msg or "")
+
+    def poll(self, name, http_status, body):
+        """gen_videos.py resuming one submitted clip whose every poll answers BODY with HTTP_STATUS
+        (curl as gen_videos runs it, faked); returns the pending ids left afterwards."""
+        proj = Path(self.temp.name) / name
+        (proj / "clips").mkdir(parents=True)
+        job = {"id": "c1", "image": "still", "prompt": "a lawn"}
+        (proj / "clips/jobs.json").write_text(json.dumps([job]))
+        (proj / "clips/pending.json").write_text(json.dumps({"req-1": job}))
+        gen = load("gen_videos", proj)
+
+        def fake_run(cmd, **kwargs):
+            if "-X" in cmd and cmd[cmd.index("-X") + 1] == "GET":   # a status poll
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(body),
+                                                   stderr=f"\nHTTP_STATUS:{http_status}\n")
+            raise AssertionError(f"unexpected call: {cmd}")   # no submit, no download in these cases
+
+        with patch.object(gen.subprocess, "run", side_effect=fake_run), patch.object(gen.time, "sleep"), \
+                patch.dict(os.environ, {"XAI_API_KEY": "test-key"}), \
+                patch.object(sys, "argv", ["gen_videos.py", "--max-wait=0.002"]), \
+                patch.object(sys, "stdout", new_callable=io.StringIO):
+            gen.main()
+        pending = proj / "clips/pending.json"
+        return sorted(json.loads(pending.read_text())) if pending.exists() else []
+
+    def test_a_poll_that_errors_keeps_the_paid_request(self):
+        # A rate limit or server error is no verdict on the clip: dropping it would pay for it twice.
+        self.assertEqual(self.poll("poll-429", 429, {"code": "rate_limited", "error": "Too many requests"}), ["req-1"])
+        self.assertEqual(self.poll("poll-500", 500, {"error": "internal error"}), ["req-1"])
+
+    def test_a_poll_without_a_terminal_status_keeps_the_request(self):
+        self.assertEqual(self.poll("poll-running", 200, {"status": "pending", "error": None}), ["req-1"])
+
+    def test_only_a_terminal_status_drops_the_request(self):
+        self.assertEqual(self.poll("poll-failed", 200, {"status": "failed", "error": "moderation"}), [])
+        self.assertEqual(self.poll("poll-expired", 200, {"status": "expired"}), [])
 
     @unittest.skipUnless(Image, "Pillow not installed")
     def test_a_contact_sheet_renders_wherever_the_script_runs(self):

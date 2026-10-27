@@ -4,7 +4,8 @@
 Usage: python3 gen_videos.py [id ...] [--force] [--max-wait=MINUTES]
 Skips clips whose mp4 already exists. Logs cost per clip (cost_in_usd_ticks / 1e10 = USD).
 Submitted request ids are saved to clips/pending.json as they are accepted, so an interrupted run (or a crash
-while polling) resumes those paid jobs instead of submitting them again.
+while polling) resumes those paid jobs instead of submitting them again. An id leaves pending.json only when
+the API reports the clip done (downloaded), failed or expired; a poll that errors is retried.
 """
 import base64, io, json, os, re, subprocess, sys, tempfile, time
 
@@ -18,7 +19,10 @@ SAFE = re.compile(r"^[A-Za-z0-9_-]+$")   # job ids and image names are file base
 
 
 def api(method, path, body=None):
-    cmd = ["curl", "-sS", "--max-time", "280", "-X", method, "https://api.x.ai/v1" + path, "-K", "-"]
+    """One xAI API call: (HTTP status, parsed JSON body). Status 0 means no HTTP answer at all."""
+    # curl writes the HTTP status to stderr after the body, so stdout stays pure JSON.
+    cmd = ["curl", "-sS", "--max-time", "280", "-X", method, "https://api.x.ai/v1" + path, "-K", "-",
+           "-w", "%{stderr}\nHTTP_STATUS:%{http_code}\n"]
     tmp = None
     if body is not None:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -31,7 +35,8 @@ def api(method, path, body=None):
     finally:
         if tmp:
             os.remove(tmp)
-    return json.loads(out.stdout or "{}")
+    codes = re.findall(r"HTTP_STATUS:(\d{3})", out.stderr or "")
+    return (int(codes[-1]) if codes else 0), json.loads(out.stdout or "{}")
 
 
 def image_data_url(name):
@@ -66,32 +71,36 @@ def main():
         body = {"model": MODEL, "prompt": j["prompt"] + style, "image": {"url": image_data_url(j["image"])},
                 "duration": j.get("duration", 6), "aspect_ratio": j.get("aspect_ratio", "16:9"), "resolution": "720p"}
         try:
-            r = api("POST", "/videos/generations", body)
+            code, r = api("POST", "/videos/generations", body)
         except (ValueError, subprocess.TimeoutExpired) as e:
-            r = {"error": f"{type(e).__name__}: {e}"}
-        if "request_id" in r:
+            code, r = 0, {"error": f"{type(e).__name__}: {e}"}
+        if code == 200 and "request_id" in r:
             pending[r["request_id"]] = j
             save_pending(pending)
             print(f"submitted {j['id']} -> {r['request_id']}", flush=True)
         else:
-            print(f"SUBMIT FAILED {j['id']}: {json.dumps(r)[:300]}", flush=True)
+            print(f"SUBMIT FAILED {j['id']} (HTTP {code or 'none'}): {json.dumps(r)[:300]}", flush=True)
         time.sleep(1)
     total, deadline = 0.0, time.time() + max_wait
     while pending and time.time() < deadline:
         time.sleep(8)
         for rid, j in list(pending.items()):
             try:
-                r = api("GET", f"/videos/{rid}")
-                st = r.get("status")
+                code, r = api("GET", f"/videos/{rid}")
+                # Only a status the API states drops a paid request: an HTTP error, a rate limit or a
+                # body without a terminal status says nothing about the clip, so it is polled again.
+                st = r.get("status") if code == 200 else None
                 if st == "done":
                     subprocess.run(["curl", "-sS", "-f", "-o", os.path.join(CLIPS, j["id"] + ".mp4"), r["video"]["url"]],
                                    check=True, timeout=300)
                     cost = r.get("usage", {}).get("cost_in_usd_ticks", 0) / 1e10
                     total += cost
                     print(f"done {j['id']}  ${cost:.2f}", flush=True)
-                elif st in ("failed", "expired") or (st is None and "error" in json.dumps(r).lower()):
+                elif st in ("failed", "expired"):
                     print(f"FAILED {j['id']}: {json.dumps(r)[:300]}", flush=True)
                 else:
+                    if code != 200:
+                        print(f"poll error {j['id']} (HTTP {code or 'none'}: {json.dumps(r)[:200]}); retrying", flush=True)
                     continue
             except (ValueError, KeyError, subprocess.SubprocessError) as e:   # one bad poll never drops paid jobs
                 print(f"poll error {j['id']} ({type(e).__name__}); retrying", flush=True)
