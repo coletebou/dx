@@ -111,7 +111,8 @@ equal "the agent window opens there" "$(cd "$tmp/ext/proj-alpha" && pwd -P)" \
   "$(cd "$(tmux display-message -p -t "=proj-parallel:alpha" '#{pane_current_path}')" && pwd -P)"
 equal "nothing lands inside the repo" "absent" "$([[ -e "$repo/.claude/worktrees" ]] && echo present || echo absent)"
 equal "the agent window runs the fake claude" 1 "$(stub_runs 1)"
-[[ -s "$calls" ]] || tmux capture-pane -p -t "=proj-parallel:alpha" 2>&1 | sed '/^[[:space:]]*$/d; s/^/         | /' | tail -n 12
+[[ -s "$calls" ]] || { tmux display-message -p -t "=proj-parallel:alpha" 'pane runs #{pane_current_command} (pid #{pane_pid})'
+  tmux capture-pane -p -J -S - -t "=proj-parallel:alpha"; } 2>&1 | sed '/^[[:space:]]*$/d; s/^/         | /' | tail -n 30
 check "...with the session id launch recorded" "--session-id $(awk '/^#   session_id=/ { sub(/^#   session_id=/, ""); print; exit }' "$(cat "$tmp/one.tsv.log-path")")" "$(cat "$calls")"
 
 out="$(in_repo "$pw" teardown "$tmp/one.tsv" 2>&1)"

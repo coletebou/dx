@@ -7,6 +7,7 @@
 # The tmux suites start private servers and refuse to run while a real tmux server's socket is
 # visible: run this where none is (CI), or under a private /tmp (see lib/tmux-sandbox.sh).
 # mcp-agent-safety's suite needs Node 21 or newer; with an older node it is skipped, said so.
+# With RUN_ALL_LOG_DIR set, each failing suite's whole output is also saved there (CI keeps it).
 set -uo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd -P)"
@@ -35,6 +36,9 @@ run() {  # run NAME COMMAND...
     # Python tracebacks whole, through the exception line.
     awk '/^Traceback/ { t = 1 } t { print } t && /^[^ \t]/ && !/^Traceback/ { t = 0 }' "$log" | head -n 60 | sed 's/^/  ! /'
     tail -n 25 "$log" | sed 's/^/    /'
+    if [[ -n "${RUN_ALL_LOG_DIR:-}" ]] && mkdir -p "$RUN_ALL_LOG_DIR"; then
+      cp "$log" "$RUN_ALL_LOG_DIR/$(printf '%s' "$name" | tr '/ ' '__').log"
+    fi
   fi
 }
 
