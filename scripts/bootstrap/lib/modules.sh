@@ -71,12 +71,12 @@ step_tailscale() {
     local keyring arch state key args=() tags="" mid t joined why
     if [ "${BOOTSTRAP_TAILSCALE:-0}" != 1 ]; then step_skip off "no --tailscale"; return 0; fi
     if ! command -v tailscale >/dev/null 2>&1; then
-        sub_begin install
         keyring="$(apt_repo_key tailscale "https://pkgs.tailscale.com/stable/$OS_ID/$OS_CODENAME.noarmor.gpg" "$PIN_TAILSCALE_APT_FPR")"
         arch="$(dpkg --print-architecture)"
         root_write /etc/apt/sources.list.d/tailscale.list \
             "deb [arch=$arch signed-by=$keyring] https://pkgs.tailscale.com/stable/$OS_ID $OS_CODENAME main"
         apt_update force
+        sub_begin apt-install
         apt_get install tailscale
         sub_end
     fi
