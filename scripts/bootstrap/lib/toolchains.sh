@@ -242,6 +242,16 @@ toolchains_ready() {
     tpm_ready
 }
 
+# fast_path_ready: a baked image with everything in place, so the install steps can be skipped.
+# Never under --full, and never when --upgrade asks for work beyond what is installed.
+fast_path_ready() {
+    [ "${BOOTSTRAP_FULL:-0}" != 1 ] || return 1
+    [ "${BOOTSTRAP_UPGRADE:-0}" != 1 ] || return 1
+    apt_packages_ready || return 1
+    [ "${BOOTSTRAP_DOCKER:-1}" != 1 ] || docker_ready || return 1
+    [ "${BOOTSTRAP_TOOLCHAINS:-1}" != 1 ] || toolchains_ready || return 1
+}
+
 # verify_pins: download every pinned asset, for both architectures, and compare with versions.sh.
 verify_pins() {
     local a t url want got bad=0

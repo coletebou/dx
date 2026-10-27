@@ -249,13 +249,6 @@ print_plan() {
     if fast_path_ready; then log "fast path: every pinned tool is already in place"; fi
 }
 
-fast_path_ready() {
-    [ "${BOOTSTRAP_FULL:-0}" != 1 ] || return 1
-    apt_packages_ready || return 1
-    [ "$BOOTSTRAP_DOCKER" != 1 ] || docker_ready || return 1
-    [ "$BOOTSTRAP_TOOLCHAINS" != 1 ] || toolchains_ready || return 1
-}
-
 if [ "$ACTION" = plan ]; then
     print_plan
     exit 0

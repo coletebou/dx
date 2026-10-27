@@ -526,6 +526,87 @@ check "...and then it does" "$r/dev/nvme1n1	S1	blank" "$(NVME_MODELS="Other|Loca
 
 fi
 
+if section upgrade "--upgrade and the fast path"; then
+# upgrade_run CODE: the system and toolchain libs, with apt and every readiness check faked.
+upgrade_run() {
+    (cd "$tmp/harness" && bash -c 'set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"; . "$1/../versions.sh"
+        . "$1/docker.sh"; . "$1/toolchains.sh"
+        as_root() { "$@"; }; apt_get() { echo "apt-get $*"; }; apt_update() { echo "apt-get update"; }
+        apt_ensure() { :; }; apt_packages_ready() { true; }; docker_ready() { true; }; toolchains_ready() { true; }
+        eval "$2"' bash "$lib" "$1" 2>&1)
+}
+equal "a baked image with everything ready takes the fast path" fast "$(upgrade_run 'fast_path_ready && echo fast || echo full')"
+equal "...but not when --upgrade asks for more" full "$(upgrade_run 'BOOTSTRAP_UPGRADE=1; fast_path_ready && echo fast || echo full')"
+equal "...nor under --full" full "$(upgrade_run 'BOOTSTRAP_FULL=1; fast_path_ready && echo fast || echo full')"
+out="$(upgrade_run 'BOOTSTRAP_FAST=1 BOOTSTRAP_UPGRADE=1; run_step system.packages step_packages; printf "%s\n" "${STEP_ROWS[@]}" | cut -f1,2')"
+check "--upgrade upgrades even on the fast path" "apt-get upgrade" "$out"
+check "...and the step says it did work" "system.packages	ok" "$out"
+out="$(upgrade_run 'BOOTSTRAP_UPGRADE=1; run_step system.packages step_packages')"
+check "...and with every package already installed" "apt-get upgrade" "$out"
+out="$(upgrade_run 'BOOTSTRAP_FAST=1; run_step system.packages step_packages; printf "%s\n" "${STEP_ROWS[@]}" | cut -f1,2')"
+lacks "without --upgrade the fast path upgrades nothing" "apt-get upgrade" "$out"
+check "...and skips the step" "system.packages	skip-fast" "$out"
+fi
+
+if section aptkey "apt signing keys: only the pinned key, and nothing but it, is installed"; then
+if command -v gpg >/dev/null 2>&1; then
+    g="$tmp/gpg"
+    mkdir -p "$g/home" "$g/served" "$g/bin"
+    chmod 700 "$g/home"
+    genkey() {  # genkey UID: a throwaway signing key; prints its fingerprint
+        GNUPGHOME="$g/home" gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key "$1" ed25519 sign never 2>/dev/null
+        GNUPGHOME="$g/home" gpg --batch --with-colons --list-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }'
+    }
+    A="$(genkey 'dx test signer <signer@example.invalid>')"
+    B="$(genkey 'dx test intruder <intruder@example.invalid>')"
+    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" > "$g/served/genuine.asc"
+    GNUPGHOME="$g/home" gpg --batch --export "$A" > "$g/served/genuine.gpg"
+    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" "$B" > "$g/served/bundle.asc"
+    GNUPGHOME="$g/home" gpg --batch --export "$B" "$A" > "$g/served/bundle.gpg"
+    GNUPGHOME="$g/home" gpg --batch --armor --export "$B" > "$g/served/other.asc"
+    gpgconf --homedir "$g/home" --kill all 2>/dev/null || true
+    # curl, faked: serves $g/served/<the URL's file name> to -o.
+    cat > "$g/bin/curl" <<EOF
+#!/bin/sh
+out="" last=""
+while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; *) last="\$1"; shift ;; esac; done
+cp "$g/served/\$(basename "\$last")" "\$out"
+EOF
+    chmod +x "$g/bin/curl"
+    keyrun() {  # keyrun FILE FPR: apt_repo_key for a served FILE, root writing under a scratch root
+        (cd "$tmp/harness" && PATH="$g/bin:$PATH" bash -c 'set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"
+            as_root() { "$@"; }; BOOTSTRAP_SYSROOT="$2"; trap cleanup_run EXIT
+            apt_repo_key test "https://example.invalid/keys/$3" "$4"' bash "$lib" "$g/root-$1" "$1" "$2" 2>&1)
+    }
+    fprs_in() {  # the primary fingerprints in a key file, space-separated
+        local h
+        h="$(mktemp -d)"
+        GNUPGHOME="$h" gpg --batch --with-colons --show-keys "$1" 2>/dev/null \
+            | awk -F: '$1 == "pub" { p = 1; next } $1 == "fpr" && p { print $10; p = 0 }' | tr '\n' ' ' | sed 's/ $//'
+        rm -rf "$h"
+    }
+    equal "two different throwaway keys were made" yes "$( [ -n "$A" ] && [ -n "$B" ] && [ "$A" != "$B" ] && echo yes)"
+    out="$(keyrun genuine.asc "$A")"; rc=$?
+    equal "the pinned key alone is accepted" 0 "$rc"
+    equal "...and its keyring path printed for signed-by" /etc/apt/keyrings/test.gpg "$(printf '%s\n' "$out" | tail -n 1)"
+    equal "...holding exactly the pinned key" "$A" "$(fprs_in "$g/root-genuine.asc/etc/apt/keyrings/test.gpg")"
+    out="$(keyrun genuine.gpg "$A")"; rc=$?
+    equal "...armored or binary" "0 $A" "$rc $(fprs_in "$g/root-genuine.gpg/etc/apt/keyrings/test.gpg")"
+    for bundle in bundle.asc bundle.gpg; do
+        out="$(keyrun "$bundle" "$A")"; rc=$?
+        equal "a download holding the pinned key and another one ($bundle) is refused" 1 "$rc"
+        check "...as not exactly the pinned key" "is not exactly the pinned key $A" "$out"
+        equal "...and no keyring is installed" "" "$(ls "$g/root-$bundle/etc/apt/keyrings" 2>/dev/null)"
+    done
+    out="$(keyrun other.asc "$A")"; rc=$?
+    equal "a different key alone is refused" 1 "$rc"
+    equal "...and installs nothing" "" "$(ls "$g/root-other.asc/etc/apt/keyrings" 2>/dev/null)"
+else
+    ok "# SKIP no gpg here"
+fi
+fi
+
 if section aptkey "apt signing keys: only the pinned key, and nothing but it, is installed"; then
 if command -v gpg >/dev/null 2>&1; then
     g="$tmp/gpg"

@@ -239,11 +239,11 @@ apt_packages_ready() {
     for p in $BOOTSTRAP_APT_PACKAGES ${BOOTSTRAP_APT_EXTRA:-}; do pkg_installed "$p" || return 1; done
 }
 
+# --upgrade always runs: neither the fast path nor installed packages make it a no-op.
 step_packages() {
-    if [ "${BOOTSTRAP_FAST:-0}" = 1 ]; then step_skip fast; return 0; fi
-    if apt_packages_ready && [ "${BOOTSTRAP_UPGRADE:-0}" != 1 ]; then
-        step_skip ready "every base package is installed"
-        return 0
+    if [ "${BOOTSTRAP_UPGRADE:-0}" != 1 ]; then
+        if [ "${BOOTSTRAP_FAST:-0}" = 1 ]; then step_skip fast; return 0; fi
+        if apt_packages_ready; then step_skip ready "every base package is installed"; return 0; fi
     fi
     apt_update
     if [ "${BOOTSTRAP_UPGRADE:-0}" = 1 ]; then
