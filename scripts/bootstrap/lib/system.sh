@@ -28,6 +28,9 @@ os_detect() {
 has_systemd() { [ -d /run/systemd/system ]; }
 is_wsl() { [ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || [ -n "${WSL_DISTRO_NAME:-}" ]; }
 
+# sysf PATH: a system file's path, under BOOTSTRAP_SYSROOT (tests point it at a scratch tree).
+sysf() { printf '%s%s\n' "${BOOTSTRAP_SYSROOT:-}" "$1"; }
+
 # root_write FILE CONTENT [MODE]: FILE (written as root) holds CONTENT and a final newline, unless
 # it already does. Sets WROTE to 1 when it wrote and 0 when it did not, so never call it in a
 # pipeline, where WROTE would be set in a subshell. Writes in place: a container's /etc/hosts is a
@@ -74,26 +77,37 @@ apt_ensure() {
     apt_get install --no-install-recommends $missing
 }
 
-# apt_repo_key NAME URL FPR: fetch a repository's signing key and keep it only if its primary
-# key has fingerprint FPR. Installs /etc/apt/keyrings/NAME.gpg (binary) and prints that path.
+# _primary_fprs FILE: the fingerprint of each primary key in an OpenPGP key file, one per line.
+_primary_fprs() {
+    local home
+    home="$(mktemp -d)"
+    GNUPGHOME="$home" gpg --batch --quiet --with-colons --show-keys "$1" 2>/dev/null \
+        | awk -F: '$1 == "pub" { p = 1; next } $1 == "fpr" && p { print $10; p = 0 }' || true
+    rm -rf "$home"
+}
+
+# apt_repo_key NAME URL FPR: fetch a repository's signing key, and install only the key with
+# fingerprint FPR as /etc/apt/keyrings/NAME.gpg (whose path it prints). apt trusts every key in a
+# signed-by keyring, so a download holding any other primary key (the pinned one plus someone
+# else's, say) is refused outright, and what is installed is FPR exported on its own from a keyring
+# that held nothing else, then checked again.
 apt_repo_key() {
-    local name="$1" url="$2" want="$3" dir fprs dest="/etc/apt/keyrings/$1.gpg"
+    local name="$1" url="$2" want="$3" dir fprs got
     command -v gpg >/dev/null 2>&1 || apt_ensure gnupg
     dir="$(mktemp -d)"
     cleanup_add "$dir"
     curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/key" "$url" </dev/null || die "could not fetch the $name signing key: $url"
-    fprs="$(GNUPGHOME="$dir" gpg --batch --quiet --with-colons --show-keys "$dir/key" 2>/dev/null \
-        | awk -F: '$1 == "pub" { p = 1; next } $1 == "fpr" && p { print $10; p = 0 }')"
-    printf '%s\n' "$fprs" | grep -qx "$want" \
-        || die "the $name signing key at $url has fingerprint ${fprs:-none}, not the pinned $want"
-    if head -c 40 "$dir/key" | grep -q 'BEGIN PGP'; then
-        GNUPGHOME="$dir" gpg --batch --quiet --dearmor -o "$dir/key.gpg" "$dir/key"
-    else
-        cp "$dir/key" "$dir/key.gpg"
-    fi
-    as_root install -d -m 0755 /etc/apt/keyrings
-    as_root install -m 0644 "$dir/key.gpg" "$dest"
-    printf '%s\n' "$dest"
+    fprs="$(_primary_fprs "$dir/key")"
+    [ "$fprs" = "$want" ] \
+        || die "the $name signing key at $url is not exactly the pinned key $want (its primary keys: $(printf '%s' "${fprs:-none}" | tr '\n' ' '))"
+    mkdir -m 700 "$dir/home"
+    GNUPGHOME="$dir/home" gpg --batch --quiet --import "$dir/key" 2>/dev/null || die "gpg could not read the $name signing key"
+    GNUPGHOME="$dir/home" gpg --batch --quiet --export "$want" > "$dir/key.gpg"
+    got="$(_primary_fprs "$dir/key.gpg")"
+    [ "$got" = "$want" ] || die "exporting the pinned $name key gave ${got:-nothing}, not $want"
+    as_root install -d -m 0755 "$(sysf /etc/apt/keyrings)"
+    as_root install -m 0644 "$dir/key.gpg" "$(sysf "/etc/apt/keyrings/$name.gpg")"
+    printf '%s\n' "/etc/apt/keyrings/$name.gpg"
 }
 
 # ── steps ────────────────────────────────────────────────────────────────
@@ -108,9 +122,6 @@ valid_hostname() {
         rest="${rest#*.}"
     done
 }
-
-# The system files these steps write, under BOOTSTRAP_SYSROOT (tests point it at a scratch tree).
-sysf() { printf '%s%s\n' "${BOOTSTRAP_SYSROOT:-}" "$1"; }
 
 step_hostname() {
     local want="${BOOTSTRAP_HOSTNAME:-}" short hosts hf line changed=0
