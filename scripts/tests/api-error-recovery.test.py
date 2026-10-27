@@ -68,6 +68,10 @@ class HookTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="api-recovery-test-")
         self.addCleanup(self.tmp.cleanup)
+        # Cleanups run last-in first-out: this one first. The hook hands alerts to a
+        # fire-and-forget notifier and may start a detached diagnostic child, so a test can end
+        # while they still write here; removing the tree under them fails (seen on macOS).
+        self.addCleanup(self.settle)
         root = Path(self.tmp.name)
         self.state = root / "state"
         self.logf = root / "api-errors.jsonl"
@@ -116,6 +120,25 @@ class HookTest(unittest.TestCase):
         st = self.state_of(sid)
         assert st is not None, "expected a failure streak on record"
         return st
+
+    def settle(self, quiet=0.3, timeout=5):
+        """Wait until nothing under the temp dir has changed for `quiet` seconds."""
+        def snapshot():
+            out = set()
+            for p in Path(self.tmp.name).rglob("*"):
+                try:
+                    out.add((str(p), p.stat().st_size))
+                except OSError:
+                    pass
+            return out
+        deadline, last, since = time.time() + timeout, None, time.time()
+        while time.time() < deadline:
+            now = snapshot()
+            if now != last:
+                last, since = now, time.time()
+            elif time.time() - since >= quiet:
+                return
+            time.sleep(0.05)
 
     def alerts_seen(self):
         # Notifier writes are fire-and-forget, so wait until the file stops growing
