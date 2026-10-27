@@ -14,6 +14,25 @@
   described commit messages through a command, the Anthropic API or Amazon Bedrock, off by
   default. An hourly timer comes with `--with schedules`.
 - `install.sh --installed` reruns the components a machine installed (each real run records them).
+- **Plugins:** `toolbox` (disk-reclaim, a bounded disk survey and cleanup protocol for macOS
+  and Linux; shipped-but-open, open GitLab issues whose work already merged) and `music-video`
+  (an original song and its music video, end to end; vendored OFL fonts).
+- **GitHub repo kit** (`github-kit/`, `./install.sh --with github-kit --target DIR`): issue
+  forms, a PR template and its rules, a label set with an idempotent `gh` sync, and workflows
+  for PR size and proof labels, secret scans, Claude Code, stacked-PR retargets and a
+  label-gated full CI lane. This repository uses it on itself.
+- **Terminal and editor:** Ghostty config and terminfo, VS Code settings and recommended
+  extensions, a Brewfile, pinned global Node CLIs installed from a verified lock, and Codex
+  defaults, each an install component.
+- **Memory:** memory-canary (capacity and integrity checks for memory homes), a pre-push gate
+  for repositories that commit memory, and codex-memory-bridge (memory shared with Codex).
+- **Drover:** an example overlay for its fleet manager, and `--with manager` to use it.
+- **Docs:** playbooks for a fleet over Tailscale, Cloudflare in front of self-hosted services,
+  and a production VPS (`docs/infra/`); how this setup runs fleets of agents
+  (`docs/workflow/`).
+- **Fixes:** pw starts each agent through one short typed line (macOS dropped the end of long
+  typed input, so an agent could fail to start); every CI action is pinned to a release commit,
+  and a failing suite's whole output is kept as an artifact.
 
 ## 0.1.0 (2026-10-27)
 
