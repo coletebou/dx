@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+# provision: set up a fresh Debian or Ubuntu box for dx, then run its install.sh. Every phase is
+# idempotent, so a second run (or a run on a baked image) changes only what is missing.
+#
+#   provision --plan                  what each phase would do, changing nothing
+#   provision                         set up the box, then install.sh --all --dry-run
+#   provision --install               ... then install.sh --all for real
+#   provision --with shell,git,tmux   ... then install.sh --with those, for real
+#
+# Phases, in order (an overlay can hook in before and after each):
+#   system      hostname and /etc/hosts, inotify limits, a UTF-8 locale, apt timeouts, packages
+#   nvme        find local instance-store NVMe (read-only); with --nvme, put Docker data,
+#               caches and swap there and redo it at every boot
+#   docker      Docker from Docker's apt repository, and QEMU binfmt for the other architecture
+#   toolchains  pinned, sha256-checked: tmux, gitleaks, lazygit, eza, delta, zoxide, Ghostty's
+#               terminfo; and for the user: fnm with Node, starship, Claude Code, tmux plugins
+#   modules     opt-in: AWS CLI v2, Terraform, Tailscale
+#   install     dx's install.sh as the user (a dry run unless --install or --with)
+#
+# What gets installed:
+#   --install           install.sh --all for real (default: install.sh --all --dry-run)
+#   --with LIST         install.sh --with LIST for real
+#   --no-install        do not run install.sh at all
+#   --identity ID       install.sh's identity      --role ROLE   its role (default: server)
+#   --user NAME         the login user to set up (default: you; as root, $SUDO_USER or root)
+#   --no-docker         no Docker or binfmt         --no-toolchains   none of the pinned tools
+#   --aws  --terraform  the AWS CLI v2, Terraform
+#   --tailscale         install Tailscale and join, with the key in --tailscale-authkey-file
+#                       PATH or the BOOTSTRAP_TAILSCALE_AUTHKEY variable (never an argument)
+#   --tailscale-tags T  e.g. tag:server             --tailscale-hostname NAME
+#   --tailscale-ssh     also turn Tailscale SSH on (off by default)
+#   --tailscale-rejoin  log out first and join again
+# The box:
+#   --hostname NAME     set the hostname, and its 127.0.1.1 line
+#   --hosts-entry "ADDRESS NAME..."   an /etc/hosts line, in a managed block (repeatable)
+#   --upgrade           apt-get upgrade as well
+#   --nvme              use the local instance-store NVMe (see the nvme phase)
+#   --ec2               EC2 extras: --nvme, and stop the hibernation agent's RAM-sized swap file
+# How it runs:
+#   --overlay DIR       private hooks and defaults (also BOOTSTRAP_OVERLAY; docs/bootstrap.md)
+#   --full              ignore the readiness markers: reinstall every pinned tool
+#   --cloud-init        for user-data (detected as root without a terminal under cloud-init):
+#                       log to /var/log/dx-bootstrap.log, write a done or failed marker
+#   --trace             a bash trace in /var/log/dx-bootstrap-trace.log (mode 0600)
+#   --verify-pins       download every pinned asset and check its sha256, changing nothing
+#   -h, --help
+# Settings can also come from the environment (BOOTSTRAP_*, docs/bootstrap.md lists them).
+set -Eeuo pipefail
+
+BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+BOOTSTRAP_LIB="$BOOTSTRAP_DIR/lib"
+BOOTSTRAP_DX_DIR="$(cd "$BOOTSTRAP_DIR/../.." && pwd -P)"
+BOOTSTRAP_TAG=provision
+# shellcheck source=scripts/bootstrap/lib/harness.sh
+. "$BOOTSTRAP_LIB/harness.sh"
+# shellcheck source=scripts/bootstrap/versions.sh
+. "$BOOTSTRAP_DIR/versions.sh"
+# shellcheck source=scripts/bootstrap/lib/system.sh
+. "$BOOTSTRAP_LIB/system.sh"
+# shellcheck source=scripts/bootstrap/lib/nvme.sh
+. "$BOOTSTRAP_LIB/nvme.sh"
+# shellcheck source=scripts/bootstrap/lib/docker.sh
+. "$BOOTSTRAP_LIB/docker.sh"
+# shellcheck source=scripts/bootstrap/lib/toolchains.sh
+. "$BOOTSTRAP_LIB/toolchains.sh"
+# shellcheck source=scripts/bootstrap/lib/modules.sh
+. "$BOOTSTRAP_LIB/modules.sh"
+# shellcheck source=scripts/bootstrap/lib/overlay.sh
+. "$BOOTSTRAP_LIB/overlay.sh"
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
+
+# ── settings: the overlay's defaults, then the flags ─────────────────────
+need_arg() { [ "$2" -ge 2 ] || die "$1 needs a value (see --help)"; }
+
+# The overlay first, so its overlay.env can set defaults the flags then override.
+_prev=""
+for _a in "$@"; do
+    case "$_a" in
+        --overlay=*) BOOTSTRAP_OVERLAY="${_a#--overlay=}" ;;
+    esac
+    [ "$_prev" != --overlay ] || BOOTSTRAP_OVERLAY="$_a"
+    _prev="$_a"
+done
+unset _a _prev
+if [ -n "${BOOTSTRAP_OVERLAY:-}" ]; then
+    BOOTSTRAP_OVERLAY="$(cd "$BOOTSTRAP_OVERLAY" 2>/dev/null && pwd -P)" || die "no overlay directory: ${BOOTSTRAP_OVERLAY}"
+    overlay_check "$BOOTSTRAP_OVERLAY"
+    overlay_load_env "$BOOTSTRAP_OVERLAY"
+fi
+
+ACTION=run
+BOOTSTRAP_INSTALL="${BOOTSTRAP_INSTALL:-dry-run}"     # dry-run, all, with or none
+BOOTSTRAP_WITH="${BOOTSTRAP_WITH:-}"
+BOOTSTRAP_ROLE="${BOOTSTRAP_ROLE:-server}"
+BOOTSTRAP_IDENTITY="${BOOTSTRAP_IDENTITY:-}"
+BOOTSTRAP_DOCKER="${BOOTSTRAP_DOCKER:-1}"
+BOOTSTRAP_TOOLCHAINS="${BOOTSTRAP_TOOLCHAINS:-1}"
+BOOTSTRAP_HOSTS_ENTRIES="${BOOTSTRAP_HOSTS_ENTRIES:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --install)          BOOTSTRAP_INSTALL=all; shift ;;
+        --with)             need_arg "$1" $#; BOOTSTRAP_INSTALL=with BOOTSTRAP_WITH="$2"; shift 2 ;;
+        --with=*)           BOOTSTRAP_INSTALL=with BOOTSTRAP_WITH="${1#--with=}"; shift ;;
+        --no-install)       BOOTSTRAP_INSTALL=none; shift ;;
+        --identity)         need_arg "$1" $#; BOOTSTRAP_IDENTITY="$2"; shift 2 ;;
+        --role)             need_arg "$1" $#; BOOTSTRAP_ROLE="$2"; shift 2 ;;
+        --user)             need_arg "$1" $#; BOOTSTRAP_USER="$2"; shift 2 ;;
+        --hostname)         need_arg "$1" $#; BOOTSTRAP_HOSTNAME="$2"; shift 2 ;;
+        --hosts-entry)      need_arg "$1" $#; BOOTSTRAP_HOSTS_ENTRIES="${BOOTSTRAP_HOSTS_ENTRIES:+$BOOTSTRAP_HOSTS_ENTRIES
+}$2"; shift 2 ;;
+        --upgrade)          BOOTSTRAP_UPGRADE=1; shift ;;
+        --nvme)             BOOTSTRAP_NVME=1; shift ;;
+        --ec2)              BOOTSTRAP_EC2=1 BOOTSTRAP_NVME=1; shift ;;
+        --no-docker)        BOOTSTRAP_DOCKER=0; shift ;;
+        --no-toolchains)    BOOTSTRAP_TOOLCHAINS=0; shift ;;
+        --aws)              BOOTSTRAP_AWS=1; shift ;;
+        --terraform)        BOOTSTRAP_TERRAFORM=1; shift ;;
+        --tailscale)        BOOTSTRAP_TAILSCALE=1; shift ;;
+        --tailscale-authkey-file) need_arg "$1" $#; BOOTSTRAP_TAILSCALE_AUTHKEY_FILE="$2"; shift 2 ;;
+        --tailscale-tags)   need_arg "$1" $#; BOOTSTRAP_TAILSCALE_TAGS="$2"; shift 2 ;;
+        --tailscale-hostname) need_arg "$1" $#; BOOTSTRAP_TAILSCALE_HOSTNAME="$2"; shift 2 ;;
+        --tailscale-ssh)    BOOTSTRAP_TAILSCALE_SSH=1; shift ;;
+        --tailscale-rejoin) BOOTSTRAP_TAILSCALE_REJOIN=1; shift ;;
+        --overlay)          need_arg "$1" $#; shift 2 ;;      # read above
+        --overlay=*)        shift ;;
+        --full)             BOOTSTRAP_FULL=1; shift ;;
+        --cloud-init)       BOOTSTRAP_CLOUD_INIT=1; shift ;;
+        --trace)            BOOTSTRAP_TRACE=1; shift ;;
+        --plan)             ACTION=plan; shift ;;
+        --verify-pins)      ACTION=verify-pins; shift ;;
+        -h|--help)          usage; exit 0 ;;
+        *)                  die "unknown argument: $1 (see --help)" ;;
+    esac
+done
+case "$BOOTSTRAP_ROLE" in local|server) ;; *) die "--role must be local or server, not: $BOOTSTRAP_ROLE" ;; esac
+case "$BOOTSTRAP_INSTALL" in dry-run|all|with|none) ;; *) die "BOOTSTRAP_INSTALL must be dry-run, all, with or none" ;; esac
+BOOTSTRAP_INSTALL_MODE=install
+[ "$BOOTSTRAP_INSTALL" != dry-run ] || BOOTSTRAP_INSTALL_MODE=dry-run
+
+if [ "$ACTION" = verify-pins ]; then
+    BOOTSTRAP_TAG=verify-pins
+    trap cleanup_run EXIT
+    verify_pins
+    exit $?
+fi
+
+[ "$(uname -s)" = Linux ] || die "provision is for Debian and Ubuntu Linux (this is $(uname -s))"
+os_detect
+BOOTSTRAP_ARCH="$(bootstrap_arch)"
+
+# The user: --user, else whoever ran sudo, else this user.
+if [ -z "${BOOTSTRAP_USER:-}" ]; then
+    if is_root; then BOOTSTRAP_USER="${SUDO_USER:-root}"; else BOOTSTRAP_USER="$(id -un)"; fi
+fi
+TARGET_USER="$BOOTSTRAP_USER"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"
+[ -n "$TARGET_HOME" ] || die "no such user: $TARGET_USER (create it first; docs/infra/vps.md shows how)"
+if ! is_root && [ "$TARGET_USER" != "$(id -un)" ]; then
+    log "setting up $TARGET_USER from $(id -un): the per-user steps run through sudo -u"
+fi
+[ -n "${HOME:-}" ] && [ "$HOME" != / ] || HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+export HOME
+
+# under_cloud_init: some ancestor of this process is cloud-init (user-data runs under it).
+under_cloud_init() {
+    local pid=$$ comm
+    while [ "${pid:-0}" -gt 1 ]; do
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || return 1
+        case "$comm" in cloud-init*) return 0 ;; esac
+        pid="$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f2)" || return 1
+    done
+    return 1
+}
+
+# Cloud-init mode: asked for, or detected (root, no terminal, run by cloud-init).
+BOOTSTRAP_MODE=interactive
+if [ "${BOOTSTRAP_CLOUD_INIT:-0}" = 1 ] || { is_root && [ ! -t 0 ] && under_cloud_init; }; then
+    BOOTSTRAP_MODE=cloud-init
+fi
+
+# ── the plan ─────────────────────────────────────────────────────────────
+install_args() {  # the install.sh arguments this run uses, one per line
+    case "$BOOTSTRAP_INSTALL" in
+        dry-run) printf '%s\n' --all --dry-run ;;
+        all) printf '%s\n' --all ;;
+        with) printf '%s\n' --with "$BOOTSTRAP_WITH" ;;
+    esac
+    [ -z "$BOOTSTRAP_IDENTITY" ] || printf '%s\n' --identity "$BOOTSTRAP_IDENTITY"
+    printf '%s\n' --role "$BOOTSTRAP_ROLE"
+}
+
+plan_line() { printf '  %-24s %s\n' "$1" "$2"; }
+plan_ready() { if "$@" 2>/dev/null; then echo "ready"; else echo "install"; fi; }
+plan_tool() {  # plan_tool TOOL DEST
+    local p
+    p="$(pin_version "$1"):$(pin_sha "$1")"
+    if ready_ok "$1" "$p" "$2"; then echo "ready ($(pin_version "$1"))"; else echo "install $(pin_version "$1")"; fi
+}
+plan_user_tool() {
+    local p
+    p="$(pin_version "$1"):$(pin_sha "$1")"
+    if ready_ok "user-$TARGET_USER-$1" "$p" "$(user_tool_file "$1")"; then echo "ready ($(pin_version "$1"))"; else echo "install $(pin_version "$1")"; fi
+}
+onoff() { if [ "${!1:-0}" = 1 ]; then echo "$2"; else echo "off"; fi; }
+
+print_plan() {
+    local t
+    log "plan for $OS_PRETTY ($OS_ID $OS_CODENAME, $BOOTSTRAP_ARCH), user $TARGET_USER ($TARGET_HOME), mode $BOOTSTRAP_MODE"
+    [ -z "${BOOTSTRAP_OVERLAY:-}" ] || log "overlay: $BOOTSTRAP_OVERLAY"
+    echo "system"
+    plan_line hostname "${BOOTSTRAP_HOSTNAME:-off}"
+    plan_line hosts "$( [ -n "$BOOTSTRAP_HOSTS_ENTRIES" ] && printf '%s' "$BOOTSTRAP_HOSTS_ENTRIES" | grep -c . | sed 's/$/ managed entries/' || echo off)"
+    plan_line inotify "/etc/sysctl.d/60-dx-inotify.conf"
+    plan_line locale "$(grep -qiE '^LANG=.*UTF-?8' /etc/default/locale 2>/dev/null && echo ready || echo 'LANG=C.UTF-8')"
+    plan_line apt-config "/etc/apt/apt.conf.d/80-dx-timeouts"
+    plan_line packages "$(plan_ready apt_packages_ready)"
+    plan_line ec2-swap "$(onoff BOOTSTRAP_EC2 'stop hibinit-agent, cap the root swap file')"
+    echo "nvme"
+    nvme_report | sed 's/^/  /'
+    plan_line apply "$(onoff BOOTSTRAP_NVME 'format a blank instance store, bind Docker data and caches, swap')"
+    echo "docker"
+    if [ "$BOOTSTRAP_DOCKER" = 1 ]; then
+        plan_line docker "$(plan_ready docker_ready)"
+        plan_line binfmt "qemu-user-static"
+    else
+        plan_line docker off
+    fi
+    echo "toolchains"
+    if [ "$BOOTSTRAP_TOOLCHAINS" = 1 ]; then
+        plan_line tmux "$(plan_tool tmux /usr/local/bin/tmux)"
+        for t in gitleaks lazygit eza delta zoxide; do plan_line "$t" "$(plan_tool "$t" "/usr/local/bin/$t")"; done
+        plan_line terminfo "$(infocmp -x xterm-ghostty >/dev/null 2>&1 && echo ready || echo "ncurses $PIN_TERMINFO_SRC_TAG ghostty entry")"
+        for t in fnm node starship claude; do plan_line "$t" "$(plan_user_tool "$t")"; done
+        plan_line tpm "$(plan_ready tpm_ready)"
+    else
+        plan_line toolchains off
+    fi
+    echo "modules"
+    plan_line aws "$(onoff BOOTSTRAP_AWS "AWS CLI $PIN_AWSCLI_VERSION")"
+    plan_line terraform "$(onoff BOOTSTRAP_TERRAFORM "Terraform $PIN_TERRAFORM_VERSION")"
+    plan_line tailscale "$(onoff BOOTSTRAP_TAILSCALE "join with tags ${BOOTSTRAP_TAILSCALE_TAGS:-none}, ssh $( [ "${BOOTSTRAP_TAILSCALE_SSH:-0}" = 1 ] && echo on || echo off)")"
+    echo "install"
+    if [ "$BOOTSTRAP_INSTALL" = none ]; then
+        plan_line install.sh off
+    else
+        plan_line install.sh "$BOOTSTRAP_DX_DIR/install.sh $(install_args | tr '\n' ' ')"
+    fi
+    if fast_path_ready; then log "fast path: every pinned tool is already in place"; fi
+}
+
+fast_path_ready() {
+    [ "${BOOTSTRAP_FULL:-0}" != 1 ] || return 1
+    apt_packages_ready || return 1
+    [ "$BOOTSTRAP_DOCKER" != 1 ] || docker_ready || return 1
+    [ "$BOOTSTRAP_TOOLCHAINS" != 1 ] || toolchains_ready || return 1
+}
+
+if [ "$ACTION" = plan ]; then
+    print_plan
+    exit 0
+fi
+
+# ── running ──────────────────────────────────────────────────────────────
+if [ "$BOOTSTRAP_MODE" = cloud-init ]; then
+    is_root || die "cloud-init mode runs as root"
+    export DEBIAN_FRONTEND=noninteractive
+    BOOTSTRAP_LOG="${BOOTSTRAP_LOG:-/var/log/dx-bootstrap.log}"
+    touch "$BOOTSTRAP_LOG" && chmod 640 "$BOOTSTRAP_LOG"
+    exec > >(tee -a "$BOOTSTRAP_LOG") 2>&1
+fi
+
+# Root, said once and up front: sudo asks here (if it asks at all), not halfway through.
+if ! is_root; then
+    command -v sudo >/dev/null 2>&1 || die "the system phases need root: run this as root, or install sudo"
+    BOOTSTRAP_SUDO_REASON="the system phases install packages with apt and write under /etc, /usr/local and /var/lib/dx-bootstrap"
+    log "sudo: $BOOTSTRAP_SUDO_REASON"
+    _SUDO_SAID=1
+    sudo -v
+fi
+
+# The Tailscale key leaves the environment before any hook or per-user step starts.
+tailscale_take_key
+
+as_root mkdir -p "$BOOTSTRAP_STATE_DIR/ready"
+TIMINGS_TMP="$(mktemp)"
+BOOTSTRAP_TIMINGS="$TIMINGS_TMP"
+# As the user: root running git in a checkout another user owns gets "dubious ownership".
+DX_COMMIT="$(as_user git -C "$BOOTSTRAP_DX_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+if [ "${BOOTSTRAP_TRACE:-0}" = 1 ]; then
+    BOOTSTRAP_TRACE_LOG="${BOOTSTRAP_TRACE_LOG:-/var/log/dx-bootstrap-trace.log}"
+    is_root || BOOTSTRAP_TRACE_LOG="$TARGET_HOME/.local/state/dx-bootstrap-trace.log"
+    mkdir -p "${BOOTSTRAP_TRACE_LOG%/*}"
+    ( umask 077; : >> "$BOOTSTRAP_TRACE_LOG" )
+    exec 9>>"$BOOTSTRAP_TRACE_LOG"
+    BASH_XTRACEFD=9
+    PS4='+ ${EPOCHREALTIME:-} ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}: '
+    log "trace: $BOOTSTRAP_TRACE_LOG (it records the commands this run executes; keep it private)"
+    set -x
+fi
+
+FAILED_STEP=""
+on_exit() {
+    local rc=$?
+    set +x
+    FAILED_STEP="${_STEP_NAME:-}"
+    harness_on_exit "$rc"
+    timing_table
+    if [ -s "$TIMINGS_TMP" ]; then
+        { printf '# run %s mode=%s fast=%s dx=%s exit=%s\n' "$(date -u +%FT%TZ)" "$BOOTSTRAP_MODE" "${BOOTSTRAP_FAST:-0}" "$DX_COMMIT" "$rc"
+          cat "$TIMINGS_TMP"; } | as_root tee -a "$BOOTSTRAP_STATE_DIR/timings.tsv" >/dev/null 2>&1 || true
+    fi
+    rm -f "$TIMINGS_TMP"
+    if [ "$rc" -eq 0 ]; then
+        printf 'status=ok\nat=%s\ndx=%s\nmode=%s\nfast=%s\n' "$(date -u +%FT%TZ)" "$DX_COMMIT" "$BOOTSTRAP_MODE" "${BOOTSTRAP_FAST:-0}" \
+            | as_root tee "$BOOTSTRAP_STATE_DIR/done" >/dev/null 2>&1 || true
+        as_root rm -f "$BOOTSTRAP_STATE_DIR/failed" 2>/dev/null || true
+    else
+        printf 'status=err-%s\nstep=%s\nat=%s\ndx=%s\n' "$rc" "${FAILED_STEP:-none}" "$(date -u +%FT%TZ)" "$DX_COMMIT" \
+            | as_root tee "$BOOTSTRAP_STATE_DIR/failed" >/dev/null 2>&1 || true
+        as_root rm -f "$BOOTSTRAP_STATE_DIR/done" 2>/dev/null || true
+        printf '[provision] failed (exit %s) in %s%s\n' "$rc" "${FAILED_STEP:-setup}" \
+            "${BOOTSTRAP_LOG:+; the whole log is $BOOTSTRAP_LOG}" >&2
+    fi
+}
+trap on_exit EXIT
+trap 'warn "failed at ${BASH_SOURCE[0]##*/}:$LINENO: $BASH_COMMAND"' ERR
+
+log "dx provision ($DX_COMMIT) on $OS_PRETTY, $BOOTSTRAP_ARCH, for $TARGET_USER; mode $BOOTSTRAP_MODE"
+if [ "${BOOTSTRAP_FAST:-}" = "" ]; then
+    BOOTSTRAP_FAST=0
+    if fast_path_ready; then
+        BOOTSTRAP_FAST=1
+        log "fast path: every pinned tool is in place (a baked image?): install steps are skipped"
+    fi
+fi
+
+# ── phases ───────────────────────────────────────────────────────────────
+phase_system() {
+    run_step system.hostname step_hostname
+    run_step system.hosts step_hosts
+    run_step system.inotify step_inotify
+    run_step system.locale step_locale
+    run_step system.apt-config step_apt_config
+    run_step system.packages step_packages
+    run_step system.ec2-swap step_ec2_swap
+}
+phase_nvme() {
+    run_step nvme.detect step_nvme_detect
+    run_step nvme.apply step_nvme_apply
+}
+phase_docker() {
+    run_step docker.engine step_docker
+    run_step docker.binfmt step_binfmt
+}
+TOOL_STEPS="tmux gitleaks lazygit eza delta zoxide terminfo fnm node starship claude tpm"
+phase_toolchains() {
+    local t
+    if [ "$BOOTSTRAP_TOOLCHAINS" != 1 ]; then
+        for t in $TOOL_STEPS; do skip_steps off "toolchains.$t"; done
+        return 0
+    fi
+    for t in $TOOL_STEPS; do run_step "toolchains.$t" "step_$t"; done
+}
+phase_modules() {
+    run_step modules.aws step_aws
+    run_step modules.terraform step_terraform
+    run_step modules.tailscale step_tailscale
+}
+
+step_install_sh() {
+    local args=() a
+    if [ "$BOOTSTRAP_INSTALL" = none ]; then step_skip off "--no-install"; return 0; fi
+    while IFS= read -r a; do args+=("$a"); done < <(install_args)
+    as_user test -r "$BOOTSTRAP_DX_DIR/install.sh" \
+        || die "$TARGET_USER cannot read $BOOTSTRAP_DX_DIR (clone dx into their home: bootstrap.sh --user $TARGET_USER)"
+    log "  as $TARGET_USER: install.sh ${args[*]}"
+    as_user bash "$BOOTSTRAP_DX_DIR/install.sh" "${args[@]}"
+}
+
+# The login shell becomes zsh when the shell component is really installed.
+step_login_shell() {
+    local zsh current
+    case "$BOOTSTRAP_INSTALL:,$BOOTSTRAP_WITH," in
+        all:*|with:*,shell,*) ;;
+        *) step_skip off "the shell component is not being installed"; return 0 ;;
+    esac
+    zsh="$(command -v zsh || true)"
+    [ -n "$zsh" ] || { step_skip off "no zsh"; return 0; }
+    current="$(getent passwd "$TARGET_USER" | cut -d: -f7)"
+    if [ "$current" = "$zsh" ] || [ "${current##*/}" = zsh ]; then step_skip ready "already zsh"; return 0; fi
+    as_root usermod -s "$zsh" "$TARGET_USER"
+    log "  login shell of $TARGET_USER: $zsh"
+}
+phase_install() {
+    run_step install.install-sh step_install_sh
+    run_step install.login-shell step_login_shell
+}
+
+for _phase in $OVERLAY_PHASES; do
+    overlay_run "pre-$_phase"
+    "phase_$_phase"
+    overlay_run "post-$_phase"
+done
+unset _phase
+
+log "done."
+if [ "$BOOTSTRAP_INSTALL_MODE" = dry-run ] && [ "$BOOTSTRAP_INSTALL" != none ]; then
+    log "install.sh ran as a dry run: rerun with --install (or --with LIST) to apply it"
+fi
+[ "$BOOTSTRAP_DOCKER" != 1 ] || [ "$TARGET_USER" = root ] || log "log in again for the docker group to apply to $TARGET_USER"
+[ "$BOOTSTRAP_TOOLCHAINS" != 1 ] || log "sign Claude Code in: run claude as $TARGET_USER"
