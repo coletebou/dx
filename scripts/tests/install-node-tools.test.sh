@@ -188,14 +188,18 @@ equal "...leaving only the current one" "1" "$(cd "$p/node-tools-installs" && ls
 
 echo "a running consumer"
 # A stand-in for a tool still running: its argv holds PATH, as node's does for a CLI started
-# through the published link (node resolves the link itself; ps shows the link).
-consume() {  # consume PATH: start it, and wait until the process list shows it
-  sh -c 'sleep 120' "$1" & consumers+=("$!")
+# through the published link (node resolves the link itself; ps shows the link). The `; :` keeps
+# the shell from exec'ing sleep in its place (bash does, and so macOS's /bin/sh and newer dash),
+# which would take PATH out of the process list a moment after it appeared.
+consume() {  # consume PATH: start it, and wait until the process list shows it (a FAIL if never)
+  bash -c 'sleep 120; :' "$1" & consumers+=("$!")
   local tries=0
-  while (( tries++ < 10 )); do
+  while (( tries++ < 25 )); do
     ps -A -ww -o command= | grep -qF -- "$1" && return 0
     sleep 0.2
   done
+  bad "the consumer stand-in shows $1 in the process list" "a process whose argv holds it" \
+    "$(ps -o command= -p "${consumers[${#consumers[@]}-1]}" 2>&1)"
 }
 stop_consumers() { local c; for c in "${consumers[@]}"; do kill "$c" 2>/dev/null; wait "$c" 2>/dev/null; done; consumers=(); }
 consume "$p/bin/beta"
