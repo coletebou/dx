@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # tmux-sandbox.sh: private tmux servers for tests, built so a test can never reach a
 # real one. Source it from a bash test:
 #
@@ -122,13 +123,15 @@ for d in "/tmp/tmux-$uid" "/private/tmp/tmux-$uid"; do
 done
 grep -Fxq -- "$sock" "$root/tsb/created" 2>/dev/null || refuse "socket $sock was not created by this sandbox"
 # Global flags come before the first command; -S or -L there would pick another server.
+# A cluster ending in a value-taking letter (-c, -uf, -2T) takes the next word as its value,
+# as tmux's getopt reads it, so a -S after `-uf /dev/null` is still seen.
 args=("$@") i=0
 while (( i < ${#args[@]} )); do
   a="${args[$i]}"
   case "$a" in
-    -c|-f|-T) i=$((i + 2)); continue ;;
     -*) [[ "$a" =~ ^-[A-Za-z0-9]*[SL] ]] && refuse "the caller passed $a; the sandbox owns the socket"
-        i=$((i + 1)); continue ;;
+        if [[ "$a" =~ ^-[A-Za-z0-9]*[cfT]$ ]]; then i=$((i + 2)); else i=$((i + 1)); fi
+        continue ;;
     *) break ;;
   esac
 done
@@ -160,13 +163,14 @@ tsb_at() {
   local s="$1"; shift
   tsb_socket_ok "$s" || return
   grep -Fxq -- "$s" "$TSB_ROOT/tsb/created" || { tsb_refuse "socket $s was not created by this sandbox"; return; }
-  # Global flags come before the first command; a -S or -L there would win over ours.
+  # Global flags come before the first command; a -S or -L there would win over ours. A
+  # cluster ending in a value-taking letter (-c, -uf) takes the next word, as in the guard.
   local a skip=0
   for a in "$@"; do
     if (( skip )); then skip=0; continue; fi
     case "$a" in
-      -c|-f|-T) skip=1 ;;
-      -*) [[ "$a" =~ ^-[A-Za-z0-9]*[SL] ]] && { tsb_refuse "the caller passed $a; the sandbox owns the socket"; return; } ;;
+      -*) [[ "$a" =~ ^-[A-Za-z0-9]*[SL] ]] && { tsb_refuse "the caller passed $a; the sandbox owns the socket"; return; }
+          [[ "$a" =~ ^-[A-Za-z0-9]*[cfT]$ ]] && skip=1 ;;
       *) break ;;
     esac
   done

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # out= only keeps a refused call's output off the terminal; checks read $code
 # tmux-sandbox.test.sh: proves scripts/tests/lib/tmux-sandbox.sh cannot reach a tmux server
 # it did not create. A DECOY server (its socket in this test's own temp dir) stands in for
 # the real one, and this shell pretends to run inside one of its panes ($TMUX points at it):
@@ -74,7 +75,8 @@ equal "a command's own -S (capture-pane -S -) still works" 0 "$code"
 
 printf 'every way to aim at another server is refused\n'
 for attempt in "-S $decoy kill-server" "-S $decoy list-sessions" "-L default kill-server" "-L default list-sessions" \
-    "-uS $decoy list-sessions" "set -g @x 1 ; kill-server" "kill-serv" "kill-server"; do
+    "-uS $decoy list-sessions" "-uf /dev/null -S $decoy list-sessions" "set -g @x 1 ; kill-server" \
+    "kill-serv" "kill-server"; do
   # shellcheck disable=SC2086 # each attempt is a word list on purpose
   out="$("$TSB_BIN/tmux" $attempt 2>&1)"; code=$?
   equal "tmux $attempt: refused (97)" 97 "$code"
@@ -93,6 +95,8 @@ out="$(tsb -L default list-sessions 2>&1)"; code=$?
 equal "tsb -L default: refused" 97 "$code"
 out="$(tsb -f /dev/null -uS "$decoy" list-sessions 2>&1)"; code=$?
 equal "tsb -f <file> -uS <socket>: refused" 97 "$code"
+out="$(tsb -uf /dev/null -S "$decoy" list-sessions 2>&1)"; code=$?
+equal "tsb -uf <file> -S <socket> (a value flag inside a cluster): refused" 97 "$code"
 out="$(tsb set -g @x 1 \; kill-server 2>&1)"; code=$?
 equal "tsb ... \\; kill-server: refused" 97 "$code"
 equal "the decoy server lives" "ops work-chat" "$(decoy_alive | xargs)"
