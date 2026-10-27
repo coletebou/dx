@@ -1,0 +1,1011 @@
+#!/bin/bash
+# dotsync: keep one dotfiles checkout in sync across your machines.
+#
+#   dotsync                 commit what changed here (behind a secret scan), pull, push, rerun
+#                           install.sh when the pull changed it, then update your other machines
+#   dotsync --wait          the same, waiting for the other machines
+#   dotsync --local         this machine only
+#   dotsync --host box-b    this machine, then box-b only (waits for it)
+#   dotsync status | peers | doctor | pause | resume
+#
+# docs/dotsync.md has the setup, the peers file, hooks, commit-message providers and every setting.
+
+# The whole run is one function, parsed before any of it runs: a pull may replace this very file,
+# and bash would otherwise read the rest of the run from the new version.
+dotsync_main() {
+set -euo pipefail
+DOTSYNC_ORIGINAL_ARGS=("$@")
+
+# ── where it runs from ───────────────────────────────────────────────────
+# The physical path of this script, following symlinks (~/.local/bin/dotsync links into the
+# checkout). No readlink -f: older macOS lacks it.
+dotsync_resolve() {
+  local path="$1" dir link hops=0
+  while [[ -L "$path" && "$hops" -lt 40 ]]; do
+    dir="$(cd -P "$(dirname "$path")" && pwd)"
+    link="$(readlink "$path")"
+    case "$link" in /*) path="$link" ;; *) path="$dir/$link" ;; esac
+    hops=$((hops + 1))
+  done
+  dir="$(cd -P "$(dirname "$path")" && pwd)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$path")"
+}
+DOTSYNC_SELF="$(dotsync_resolve "${BASH_SOURCE[0]}")"
+DOTSYNC_SCRIPTS="$(dirname "$DOTSYNC_SELF")"
+# The checkout it syncs: DOTFILES_DIR when set, else the checkout this script lives in, else
+# ~/.dotfiles.
+if [[ -z "${DOTFILES_DIR:-}" ]]; then
+  if [[ -e "$DOTSYNC_SCRIPTS/../.git" && -f "$DOTSYNC_SCRIPTS/../scripts/dotsync" ]]; then
+    DOTFILES_DIR="$(cd -P "$DOTSYNC_SCRIPTS/.." && pwd)"
+  else
+    DOTFILES_DIR="$HOME/.dotfiles"
+  fi
+fi
+export DOTFILES_DIR
+# shellcheck source=lib/dotsync-runtime.sh
+source "$DOTSYNC_SCRIPTS/lib/dotsync-runtime.sh"
+# shellcheck source=lib/dotsync-peers.sh
+source "$DOTSYNC_SCRIPTS/lib/dotsync-peers.sh"
+
+DOTSYNC_CONFIG_DIR="${DOTSYNC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dotsync}"
+dotsync_load_config "$DOTSYNC_CONFIG_DIR/config" || true
+DOTSYNC_PEERS_FILE="${DOTSYNC_PEERS_FILE:-$DOTSYNC_CONFIG_DIR/peers}"
+DOTSYNC_HOOKS_DIR="${DOTSYNC_HOOKS_DIR:-$DOTSYNC_CONFIG_DIR/hooks}"
+DOTSYNC_STATE_DIR="${DOTSYNC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dotsync}"
+TIMING_LOG_DIR="$DOTSYNC_STATE_DIR"
+PAUSE_FILE="$DOTSYNC_STATE_DIR/pause"
+HEARTBEAT_FILE="$DOTSYNC_STATE_DIR/heartbeat.json"
+# Per-user kernel lock. Never unlink it while another run may be waiting on it.
+LOCKFILE="${DOTSYNC_LOCK_FILE:-${XDG_RUNTIME_DIR:-$HOME/.local/state}/dotsync/lock}"
+_DOTSYNC_HOST="$(dotsync_machine "$HOME/.df-profile")"
+sender_identity="$(dotsync_identity "$HOME/.df-profile")" || sender_identity=""
+export DOTSYNC_PEERS_FILE DOTSYNC_HOOKS_DIR DOTSYNC_STATE_DIR
+
+usage() {
+  cat <<'EOF'
+Usage: dotsync [--local | --host HOST ...] [--wait] [--strict-peers] [--pull-only]
+               [--dry-run [--json]] [--one-line] [--verbose] [--scheduled]
+       dotsync status [--refresh] | peers | doctor [--json] | pause | resume
+
+Syncs this machine's dotfiles checkout with its upstream, then runs `dotsync --local` on
+every peer whose identity matches this machine's. A manual run returns once this machine is
+pushed; the peers update in the background (dotsync status shows the result).
+
+  --local         this machine only
+  --host HOST     only this peer (repeatable); implies --wait and --strict-peers
+  --wait          wait for the peers and include them in the exit status
+  --strict-peers  an unreachable peer fails the run too
+  --pull-only     never commit or push here; just pull (for a machine that only receives)
+  --dry-run       print what a run would do; no network, no writes (--json for JSON)
+  --one-line      a single result line (what peers print over ssh)
+  --verbose       show git's own output
+  --scheduled     a timer's run: skips while paused or while you or an agent is editing
+
+  status          pause state, the schedule, the last background fan-out, and every
+                  machine's heartbeat (--refresh fetches the heartbeats first)
+  peers           the peers dotsync would contact, and where each comes from
+  doctor          a bounded, read-only diagnosis of this machine (--json)
+  pause, resume   stop and restart unattended runs (timers, and runs started by a peer)
+
+Configuration: ~/.config/dotsync/{config,peers,hooks/}; see docs/dotsync.md.
+EOF
+}
+
+dotsync_host_is_excluded() {
+  local candidate="$1" excluded
+  for excluded in ${DOTSYNC_EXCLUDED_HOSTS[@]+"${DOTSYNC_EXCLUDED_HOSTS[@]}"}; do
+    dotsync_same_host "$candidate" "$excluded" && return 0
+  done
+  return 1
+}
+
+# The background fan-out a manual run leaves: prints "<pid> <age>" while it is alive. A
+# recycled pid that is not dotsync is not mistaken for it.
+dotsync_fanout_running() {
+  local pid started
+  [[ -f "$TIMING_LOG_DIR/fanout-pid" ]] || return 1
+  pid="$(sed -n 's/^pid=\([0-9]*\) .*/\1/p' "$TIMING_LOG_DIR/fanout-pid")"
+  started="$(sed -n 's/.* started=\([0-9]*\).*/\1/p' "$TIMING_LOG_DIR/fanout-pid")"
+  [[ "$pid" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -p "$pid" -o command= 2>/dev/null | grep -Eq '(^|/)dotsync( |$)' || return 1
+  printf '%s %s\n' "$pid" "$(( $(date +%s) - started ))"
+}
+
+dotsync_fanout_status() {
+  local running line ts result incomplete dispatched seconds
+  if running="$(dotsync_fanout_running)"; then
+    echo "fan-out:   running in the background (pid ${running% *}, ${running#* }s so far); log: $TIMING_LOG_DIR/fanout.log"
+    return 0
+  fi
+  [[ -s "$TIMING_LOG_DIR/fanout-result" ]] || return 0
+  line="$(head -n 1 "$TIMING_LOG_DIR/fanout-result")"
+  ts="$(printf '%s' "$line" | sed -n 's/^ts=\([0-9]*\).*/\1/p')"
+  result="$(printf '%s' "$line" | sed -n 's/.* result=\([a-z-]*\).*/\1/p')"
+  incomplete="$(printf '%s' "$line" | sed -n 's/.* incomplete=\([0-9]*\).*/\1/p')"
+  dispatched="$(printf '%s' "$line" | sed -n 's/.* dispatched=\([0-9]*\).*/\1/p')"
+  seconds="$(printf '%s' "$line" | sed -n 's/.* seconds=\([0-9]*\).*/\1/p')"
+  [[ "$ts" =~ ^[0-9]+$ ]] || return 0
+  echo "fan-out:   last finished $(dotsync_age_label $(( $(date +%s) - ts ))): ${result:-unknown}, ${incomplete:-?}/${dispatched:-?} peer(s) incomplete, ${seconds:-?}s; log: $TIMING_LOG_DIR/fanout.log"
+}
+
+# Best-effort desktop notification; the text travels as arguments, never inside a script.
+dotsync_notify() {
+  [[ "${DOTSYNC_NOTIFY:-1}" != 0 ]] || return 0
+  if command -v osascript >/dev/null 2>&1; then
+    osascript - "$1" "$2" >/dev/null 2>&1 <<'OSA' || true
+on run argv
+  display notification (item 2 of argv) with title (item 1 of argv)
+end run
+OSA
+  elif command -v notify-send >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    notify-send "$1" "$2" >/dev/null 2>&1 || true
+  fi
+}
+
+# One line per machine: this machine's local heartbeat, then each published one.
+dotsync_report_heartbeats() {
+  local now ref host json ts rc result flag stale_after
+  now="$(date +%s)"
+  stale_after=$(( ${DOTSYNC_STALE_HOURS:-24} * 3600 ))
+  echo "machines:"
+  {
+    [[ -s "$HEARTBEAT_FILE" ]] && printf '%s\t%s\n' "$_DOTSYNC_HOST" "$(head -c 4096 "$HEARTBEAT_FILE")"
+    git -C "$DOTFILES_DIR" for-each-ref --format='%(refname)' "$DOTSYNC_HEARTBEAT_REFS/" 2>/dev/null \
+      | while IFS= read -r ref; do
+          host="${ref#"$DOTSYNC_HEARTBEAT_REFS"/}"
+          dotsync_same_host "$host" "$_DOTSYNC_HOST" && [[ -s "$HEARTBEAT_FILE" ]] && continue
+          json="$(git -C "$DOTFILES_DIR" cat-file -p "$ref:heartbeat.json" 2>/dev/null | head -c 4096)" || continue
+          printf '%s\t%s\n' "$host" "$json"
+        done
+  } | {
+    seen=0
+    while IFS=$'\t' read -r host json; do
+      seen=1
+      ts="$(dotsync_json_field "$json" ts)"
+      rc="$(dotsync_json_field "$json" exit)"
+      result="$(dotsync_json_field "$json" result)"
+      if [[ ! "$ts" =~ ^[0-9]+$ ]]; then
+        printf '  %-22s (unreadable heartbeat)\n' "$host"
+        continue
+      fi
+      flag=""
+      [[ $(( now - ts )) -le "$stale_after" ]] || flag="  STALE"
+      [[ -z "$rc" || "$rc" == 0 ]] || flag="$flag  exit=$rc"
+      printf '  %-22s %-12s %s%s%s\n' "$host" "$(dotsync_age_label $(( now - ts )))" "${result:-?}" "$flag" \
+        "$(dotsync_same_host "$host" "$_DOTSYNC_HOST" && printf '  (this machine)')"
+    done
+    [[ "$seen" -eq 1 ]] || echo "  no heartbeats yet (each machine publishes one on its next sync)"
+  }
+}
+
+dotsync_upstream_remote() {
+  local upstream
+  upstream="$(git -C "$DOTFILES_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || return 1
+  printf '%s\n' "${upstream%%/*}"
+}
+
+# ── subcommands, before the run's own argument parsing ───────────────────
+case "${1:-}" in
+  doctor)
+    shift
+    exec python3 "$DOTSYNC_SCRIPTS/dotsync-doctor" --repo "$DOTFILES_DIR" --state-dir "$DOTSYNC_STATE_DIR" \
+      --lock-file "$LOCKFILE" "$@"
+    ;;
+  pause)
+    (umask 077; mkdir -p "$DOTSYNC_STATE_DIR"; : >"$PAUSE_FILE")
+    echo "dotsync: paused ($PAUSE_FILE). Timers and runs a peer starts skip until 'dotsync resume'; a dotsync you run here still syncs."
+    exit 0
+    ;;
+  resume)
+    rm -f "$PAUSE_FILE"
+    echo "dotsync: resumed"
+    exit 0
+    ;;
+  peers)
+    shift
+    [[ "$#" -eq 0 ]] || { echo "dotsync peers: no arguments" >&2; exit 2; }
+    echo "this machine: $_DOTSYNC_HOST (identity ${sender_identity:-unknown})"
+    echo "peers file:   $DOTSYNC_PEERS_FILE$([[ -f "$DOTSYNC_PEERS_FILE" ]] || printf ' (missing)')"
+    peers_tsv="$(dotsync_peers_list "$sender_identity")"
+    if [[ -n "$peers_tsv" ]]; then
+      printf '%s\n' "$peers_tsv" | while IFS=$'\t' read -r p_alias p_identity p_role p_source; do
+        p_note=""
+        [[ "$p_identity" == - || "$p_identity" == "$sender_identity" ]] || p_note="  (skipped: another identity)"
+        printf '  %-22s identity %-10s role %-8s from %s%s\n' "$p_alias" "$p_identity" "$p_role" "$p_source" "$p_note"
+      done
+    else
+      echo "  none listed: add one ssh alias per line to the peers file"
+    fi
+    if [[ -n "${DOTSYNC_TAILSCALE_TAG:-}" ]]; then
+      echo "tailnet machines tagged $DOTSYNC_TAILSCALE_TAG:"
+      dotsync_tailnet_peers "$DOTSYNC_TAILSCALE_TAG" | sed 's/^/  /'
+    fi
+    echo "Every peer's own ~/.df-profile is read before anything runs there; another identity is never synced."
+    exit 0
+    ;;
+  status)
+    shift
+    refresh=0
+    case "${1:-}" in --refresh) refresh=1 ;; '') ;; *) echo "dotsync status: unknown argument: $1" >&2; exit 2 ;; esac
+    if [[ -f "$PAUSE_FILE" ]]; then
+      p_mtime="$(stat -c %Y "$PAUSE_FILE" 2>/dev/null || stat -f %m "$PAUSE_FILE" 2>/dev/null || echo 0)"
+      p_mtime="$(printf '%s' "$p_mtime" | tr -dc '0-9')"
+      p_age=$(( $(date +%s) - ${p_mtime:-0} ))
+      if [[ "$p_age" -ge 86400 ]]; then
+        echo "scheduled: paused $(dotsync_age_label "$p_age"): WARNING, unattended syncs have been skipping all that time ('dotsync resume')"
+      else
+        echo "scheduled: paused $(dotsync_age_label "$p_age") ('dotsync resume' to re-enable)"
+      fi
+    else
+      echo "scheduled: active (timers skip only while you or an agent is editing the checkout)"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [[ "$(uname -s)" == Linux ]]; then
+      timer_state="$(systemctl --user is-active dotsync.timer 2>/dev/null || true)"
+      [[ -z "$timer_state" ]] || echo "timer:     systemd dotsync.timer $timer_state"
+    elif command -v launchctl >/dev/null 2>&1; then
+      if launchctl list 2>/dev/null | grep -q 'com\.dotsync$'; then echo "timer:     launchd com.dotsync"; fi
+    fi
+    dotsync_fanout_status
+    if [[ "$refresh" -eq 1 ]] && remote="$(dotsync_upstream_remote)"; then
+      dotsync_timeout 20 git -C "$DOTFILES_DIR" fetch --quiet "$remote" "$DOTSYNC_HEARTBEAT_FETCH" </dev/null 2>/dev/null \
+        || echo "dotsync: could not fetch the heartbeats from $remote; showing the last ones fetched" >&2
+    fi
+    echo ""
+    dotsync_report_heartbeats
+    exit 0
+    ;;
+  help) usage; exit 0 ;;
+esac
+
+# ── arguments ────────────────────────────────────────────────────────────
+local_only=0 one_line=0 verbose=0 scheduled=0 peer_run=0 dry_run=0 json_plan=0 strict_peers=0
+pull_only=0 wait_peers=0
+[[ "${DOTSYNC_WAIT:-0}" != 1 ]] || wait_peers=1
+[[ "${DOTSYNC_PULL_ONLY:-0}" != 1 ]] || pull_only=1
+selected_hosts=()
+DOTSYNC_EXCLUDED_HOSTS=()
+if [[ -n "${DOTSYNC_EXCLUDE_HOSTS:-}" ]]; then
+  read -r -a DOTSYNC_EXCLUDED_HOSTS <<< "$DOTSYNC_EXCLUDE_HOSTS"
+  for excluded_host in "${DOTSYNC_EXCLUDED_HOSTS[@]}"; do
+    dotsync_valid_host "$excluded_host" || { echo "dotsync: invalid DOTSYNC_EXCLUDE_HOSTS entry: $excluded_host" >&2; exit 2; }
+  done
+fi
+while [[ "$#" -gt 0 ]]; do
+  arg="$1"
+  case "$arg" in
+    --local) local_only=1 ;;
+    --dry-run|-n) dry_run=1 ;;
+    --json) json_plan=1 ;;
+    --strict-peers) strict_peers=1 ;;
+    --wait) wait_peers=1 ;;
+    --pull-only) pull_only=1 ;;
+    --host|--host=*)
+      if [[ "$arg" == --host ]]; then
+        [[ "$#" -ge 2 ]] || { echo 'dotsync: --host requires a name' >&2; exit 2; }
+        shift
+        selected_host="$1"
+      else
+        selected_host="${arg#--host=}"
+      fi
+      dotsync_valid_host "$selected_host" || { echo "dotsync: invalid --host: $selected_host" >&2; exit 2; }
+      selected_hosts+=("$selected_host")
+      strict_peers=1
+      ;;
+    --one-line) one_line=1 ;;
+    --verbose|-v) verbose=1 ;;
+    --scheduled) scheduled=1 ;;
+    --peer) peer_run=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "dotsync: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+if [[ "$local_only" -eq 1 && ${#selected_hosts[@]} -gt 0 ]]; then
+  echo 'dotsync: --local and --host cannot be combined' >&2
+  exit 2
+fi
+if [[ "$json_plan" -eq 1 && "$dry_run" -eq 0 ]]; then
+  echo 'dotsync: --json requires --dry-run; use doctor --json for health' >&2
+  exit 2
+fi
+for selected_host in ${selected_hosts[@]+"${selected_hosts[@]}"}; do
+  if dotsync_host_is_excluded "$selected_host"; then
+    echo "dotsync: --host $selected_host conflicts with DOTSYNC_EXCLUDE_HOSTS" >&2
+    exit 2
+  fi
+done
+# Timers and runs a peer starts have nobody watching: they honour the pause and the
+# active-editing guard.
+unattended=0
+[[ "$scheduled" -eq 0 && "$peer_run" -eq 0 ]] || unattended=1
+
+if [[ "$dry_run" -eq 1 ]]; then
+  dotsync_print_plan "$_DOTSYNC_HOST" "$sender_identity" "$local_only" "$pull_only" "$json_plan" \
+    "$([[ "$local_only" -eq 1 || ${#selected_hosts[@]} -gt 0 ]] || dotsync_peers_list "$sender_identity")" \
+    ${selected_hosts[@]+"${selected_hosts[@]}"}
+  exit 0
+fi
+
+# Timeouts. Nobody waits on an unattended run, so its ssh connections get longer; the per-peer
+# ceiling bounds a peer that answers and then stalls (mid-install, blocked on a prompt).
+if [[ "$scheduled" -eq 1 ]]; then
+  DOTSYNC_SSH_TIMEOUT="${DOTSYNC_SSH_TIMEOUT:-15}"
+  DOTSYNC_PEER_TIMEOUT="${DOTSYNC_PEER_TIMEOUT:-600}"
+else
+  DOTSYNC_SSH_TIMEOUT="${DOTSYNC_SSH_TIMEOUT:-5}"
+  DOTSYNC_PEER_TIMEOUT="${DOTSYNC_PEER_TIMEOUT:-180}"
+fi
+for value in "$DOTSYNC_SSH_TIMEOUT" "$DOTSYNC_PEER_TIMEOUT"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "dotsync: timeouts must be whole seconds: $value" >&2; exit 2; }
+done
+export DOTSYNC_GIT_TIMEOUT
+
+EXIT_CODE=0
+DOTSYNC_PHASE=initialization
+DOTSYNC_RESULT=running
+DOTSYNC_FAILED_PHASE=""
+
+defer_reason=""
+fanout_background=0
+post_sync_ran=0
+
+# ── timing ───────────────────────────────────────────────────────────────
+(umask 077; mkdir -p "$TIMING_LOG_DIR")
+TIMING_LOG="$TIMING_LOG_DIR/dotsync-timing.log"
+if [[ -f "$TIMING_LOG" ]]; then
+  log_size="$(wc -c <"$TIMING_LOG" | tr -d ' ')"
+  [[ "$log_size" -le 2097152 ]] || mv "$TIMING_LOG" "$TIMING_LOG.1" 2>/dev/null || true
+fi
+# Milliseconds: bash 5's EPOCHREALTIME, else perl, else whole seconds (BSD date has no %N).
+ts_ms() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local t="$EPOCHREALTIME" frac
+    frac="${t#*.}000"
+    printf '%s%s' "${t%.*}" "${frac:0:3}"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MTime::HiRes=time -e 'printf "%d", int(time()*1000)'
+  else
+    printf '%s000' "$(date +%s)"
+  fi
+}
+fmt_dur() {
+  local ms="$1"
+  if [[ "$ms" -lt 1000 ]]; then printf '%dms' "$ms"
+  elif [[ "$ms" -lt 60000 ]]; then printf '%d.%02ds' "$((ms / 1000))" "$(( (ms % 1000) / 10 ))"
+  else printf '%dm%02ds' "$((ms / 60000))" "$(( (ms / 1000) % 60 ))"
+  fi
+}
+RUN_START_MS="$(ts_ms)"
+STEP_START_MS="$RUN_START_MS"
+STEP_RECORDS=()
+log_step() {
+  local now dur
+  now="$(ts_ms)"
+  dur=$((now - STEP_START_MS))
+  STEP_RECORDS+=("$1=${dur}ms")
+  printf '  step %-14s %s\n' "$1" "$(fmt_dur "$dur")" >>"$TIMING_LOG"
+  [[ "$one_line" -eq 1 || "$verbose" -eq 0 ]] || printf 'dotsync:   %-15s %s\n' "$1" "$(fmt_dur "$dur")"
+  STEP_START_MS="$now"
+}
+finalize_timing() {
+  local total=$(( $(ts_ms) - RUN_START_MS ))
+  {
+    printf '  total           %s\n' "$(fmt_dur "$total")"
+    [[ "${#STEP_RECORDS[@]}" -eq 0 ]] || printf '  summary: %s total=%dms\n' "${STEP_RECORDS[*]}" "$total"
+    echo ""
+  } >>"$TIMING_LOG"
+}
+
+# ── heartbeat and the end of every run ───────────────────────────────────
+write_heartbeat() {
+  local rc="${1:-0}" hb_branch="${branch:-unknown}"
+  [[ "$rc" -ne 0 ]] || rc="${EXIT_CODE:-0}"
+  hb_branch="${hb_branch//\\/\\\\}"
+  hb_branch="${hb_branch//\"/\\\"}"
+  (umask 077
+   printf '{"version":1,"host":"%s","ts":%s,"iso":"%s","exit":%s,"result":"%s","phase":"%s","branch":"%s","head":"%s","pushed":%s,"pulled":%s,"peers_failed":%s,"scheduled":%s,"peer":%s,"deferred":%s,"pull_only":%s,"triggered_by":"%s"}\n' \
+     "$_DOTSYNC_HOST" "$(date +%s)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$rc" "${DOTSYNC_RESULT:-unknown}" \
+     "${DOTSYNC_PHASE:-unknown}" "$hb_branch" "${end_head:-}" "${pushed_commits:-0}" "${pulled_commits:-0}" \
+     "${peers_failed_count:-0}" "$scheduled" "$peer_run" "$([[ -n "$defer_reason" ]] && echo 1 || echo 0)" \
+     "$pull_only" "$(dotsync_valid_host "${DOTSYNC_TRIGGERED_BY:-}" && printf '%s' "$DOTSYNC_TRIGGERED_BY")" \
+     >"$HEARTBEAT_FILE.tmp" && mv "$HEARTBEAT_FILE.tmp" "$HEARTBEAT_FILE") 2>/dev/null || true
+}
+
+publish_heartbeat() {
+  local remote
+  [[ "$pull_only" -eq 0 && "${DOTSYNC_FAILED_PHASE:-}" != git-fetch ]] || return 0
+  remote="$(dotsync_upstream_remote 2>/dev/null)" || return 0
+  (cd "$DOTFILES_DIR" && dotsync_heartbeat_publish "$HEARTBEAT_FILE" "$_DOTSYNC_HOST" "$remote") || true
+}
+
+# dotsync_result RC: the run's one-word outcome.
+dotsync_result() {
+  if [[ "$1" -ne 0 ]]; then echo failed
+  elif [[ -n "$defer_reason" ]]; then echo deferred
+  elif [[ "${peers_failed_count:-0}" -gt 0 ]]; then echo partial
+  elif [[ "$pull_only" -eq 1 ]]; then echo pull-only
+  else echo ok
+  fi
+}
+
+dotsync_finish() {
+  local rc="${1:-0}"
+  # Background peer workers inherit the shell; only the coordinator finishes the run.
+  [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || return "$rc"
+  trap - EXIT INT TERM HUP
+  [[ "$rc" -ne 0 ]] || rc="${EXIT_CODE:-0}"
+  DOTSYNC_RESULT="$(dotsync_result "$rc")"
+  DOTSYNC_PHASE="${DOTSYNC_FAILED_PHASE:-$DOTSYNC_PHASE}"
+  # A peer asked to reach a commit it does not hold after an otherwise clean run reports
+  # stale-config (exit 3): an unrelated branch must not read as success. A failure stays one.
+  if [[ "$rc" -eq 0 && -z "$defer_reason" && "${DOTSYNC_EXPECTED_HEAD:-}" =~ ^[0-9a-f]{40,64}$ ]] \
+      && ! git -C "$DOTFILES_DIR" merge-base --is-ancestor "$DOTSYNC_EXPECTED_HEAD" HEAD 2>/dev/null; then
+    DOTSYNC_RESULT=stale-config
+    rc=3
+  fi
+  end_head="$(git -C "$DOTFILES_DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -n "${prefetch_pid:-}" ]]; then
+    wait "$prefetch_pid" 2>/dev/null || true
+    rm -f "${prefetch_out:-}" "${prefetch_out:-}.rc"
+  fi
+  if [[ -n "${preflight_pid:-}" ]]; then wait "$preflight_pid" 2>/dev/null || true; fi
+  [[ -z "${preflight_out:-}" ]] || rm -f "$preflight_out"
+  finalize_timing || true
+  write_heartbeat "$rc"
+  # The background fan-out publishes the final heartbeat itself.
+  [[ "$fanout_background" -eq 1 ]] || publish_heartbeat
+  # On a one-line run this lands in last-run.log, where the peer's owner finds it.
+  [[ -z "$defer_reason" ]] || echo "dotsync: deferred: $defer_reason"
+  if [[ "$one_line" -eq 1 ]]; then
+    printf 'result=%s exit=%s phase=%s branch=%s head=%s\n' \
+      "$DOTSYNC_RESULT" "$rc" "$DOTSYNC_PHASE" "${branch:-unknown}" "${end_head:0:12}" >&3
+  elif [[ "$rc" -ne 0 ]]; then
+    printf 'dotsync: result=%s exit=%s phase=%s; run dotsync doctor\n' "$DOTSYNC_RESULT" "$rc" "$DOTSYNC_PHASE" >&2
+  fi
+  exec 9>&-
+  if [[ -n "${SSH_CM_DIR:-}" && "$fanout_background" -eq 0 ]]; then rm -rf "$SSH_CM_DIR" 2>/dev/null || true; fi
+  exit "$rc"
+}
+
+# ── the lock ─────────────────────────────────────────────────────────────
+# The run re-executes itself under the lock helper, which holds fd 9 across the exec: the lock
+# needs no flock(1) and works on stock macOS. A busy lock waits DOTSYNC_LOCK_WAIT seconds,
+# then exits 75 without syncing.
+_lock_helper="$DOTSYNC_SCRIPTS/lib/dotsync-lock.py"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo 'dotsync: Python 3 is required (the portable lock and the activity check)' >&2
+  exit 75
+fi
+if [[ "${DOTSYNC_LOCK_HELD:-}" != "$LOCKFILE" ]] || ! python3 "$_lock_helper" --check "$LOCKFILE" 9; then
+  _lock_rc=0
+  python3 "$_lock_helper" --acquire "$LOCKFILE" "${DOTSYNC_LOCK_WAIT:-5}" \
+    "${BASH:-/bin/bash}" "$DOTSYNC_SELF" ${DOTSYNC_ORIGINAL_ARGS[@]+"${DOTSYNC_ORIGINAL_ARGS[@]}"} || _lock_rc=$?
+  if [[ "$_lock_rc" -eq 75 ]] && _fanout_running="$(dotsync_fanout_running)"; then
+    echo "dotsync: the previous run is still updating peers in the background (pid ${_fanout_running% *}, ${_fanout_running#* }s); try again shortly, or see dotsync status" >&2
+  fi
+  return "$_lock_rc"
+fi
+unset DOTSYNC_LOCK_HELD _lock_helper
+exec 3>&1
+if [[ "$one_line" -eq 1 ]]; then
+  (umask 077; : >"$TIMING_LOG_DIR/last-run.log")
+  exec >>"$TIMING_LOG_DIR/last-run.log" 2>&1
+fi
+trap 'dotsync_finish "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') host=$_DOTSYNC_HOST pid=$$ local=$local_only scheduled=$scheduled peer=$peer_run ===" >>"$TIMING_LOG"
+log_step lock
+
+DOTSYNC_PHASE=repository
+if [[ ! -d "$DOTFILES_DIR" ]] || [[ "$(git -C "$DOTFILES_DIR" rev-parse --show-toplevel 2>/dev/null)" != "$(cd -P "$DOTFILES_DIR" && pwd)" ]]; then
+  echo "dotsync: $DOTFILES_DIR is not the top of a git checkout (set DOTFILES_DIR)" >&2
+  exit 1
+fi
+ORIGINAL_DIR="$(pwd)"
+cd "$DOTFILES_DIR"
+
+# Hooks see where they run and what the run is.
+export DOTSYNC_HOST="$_DOTSYNC_HOST" DOTSYNC_IDENTITY="$sender_identity" DOTSYNC_SCHEDULED="$scheduled" \
+  DOTSYNC_PEER="$peer_run"
+
+# ── the unattended guard ─────────────────────────────────────────────────
+# A timer, or a run another machine started, never commits, rebases or pushes while this
+# machine is paused, while a file the checkout holds uncommitted changes in was edited in the
+# last DOTSYNC_QUIET_MINUTES (10), or while a Claude Code or Codex session working in the
+# checkout wrote its transcript in the last DOTSYNC_SESSION_MINUTES (30). A dotsync you run
+# yourself skips the guard. A deferred run changes nothing and syncs on the next clean run.
+DOTSYNC_PHASE=guard
+if [[ "$unattended" -eq 1 ]]; then
+  if [[ -f "$PAUSE_FILE" ]]; then
+    defer_reason="paused (dotsync resume)"
+  else
+    activity_rc=0
+    activity="$(python3 "$DOTSYNC_SCRIPTS/lib/dotsync-activity.py" --repo "$DOTFILES_DIR" \
+      --quiet-minutes "${DOTSYNC_QUIET_MINUTES:-10}" --session-minutes "${DOTSYNC_SESSION_MINUTES:-30}" 2>&1)" \
+      || activity_rc=$?
+    case "$activity_rc" in
+      0) defer_reason="$activity" ;;
+      1) ;;
+      *) defer_reason="the activity check failed ($activity); deferring to be safe" ;;
+    esac
+  fi
+fi
+log_step guard
+
+upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)"
+start_head="$(git rev-parse HEAD)"
+start_head_short="$(git rev-parse --short HEAD)"
+end_head="$start_head"
+pulled_commits=0 pushed_commits=0 committed=0 rebase_failed=0 push_failed=0
+quiet=(--quiet)
+[[ "$verbose" -eq 0 ]] || quiet=()
+if [[ -n "$upstream" ]]; then
+  dotsync_ensure_heartbeat_fetch "${upstream%%/*}"
+  ahead_count="$(git rev-list --count "$upstream..HEAD" 2>/dev/null || echo 0)"
+  if [[ "$ahead_count" -gt 5 && -z "$defer_reason" ]]; then
+    echo "dotsync: WARNING: $ahead_count local commits ahead of $upstream (earlier syncs likely failed to push)" >&2
+  fi
+fi
+dotsync_share_ssh
+export DOTSYNC_START_HEAD="$start_head"
+
+if [[ -n "$defer_reason" ]]; then
+  log_step deferred
+else
+  # ── the fast path: clean and level with the remote ─────────────────────
+  # One ls-remote instead of a fetch. A dirty tree can never take it, so it is checked first.
+  remote_unchanged=0
+  if [[ -n "$upstream" && -z "$(git status --porcelain 2>/dev/null)" ]]; then
+    remote_head="$(dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+      ls-remote "${upstream%%/*}" "refs/heads/${upstream#*/}" </dev/null 2>/dev/null | awk 'NR == 1 { print $1 }' || true)"
+    [[ -z "$remote_head" || "$remote_head" != "$start_head" ]] || remote_unchanged=1
+  fi
+  log_step fast-path-check
+
+  if [[ "$remote_unchanged" -eq 0 ]]; then
+    # Start the fetch now; it overlaps staging and committing (it writes only objects and
+    # remote-tracking refs, never the index).
+    prefetch_pid=""
+    if [[ -n "$upstream" && "$verbose" -eq 0 ]]; then
+      prefetch_out="$TIMING_LOG_DIR/prefetch.$$"
+      ( rc=0; dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+          fetch --quiet >"$prefetch_out" 2>&1 </dev/null 9>&- 3>&- || rc=$?
+        printf '%s\n' "$rc" >"$prefetch_out.rc" ) &
+      prefetch_pid="$!"
+    fi
+
+    # ── 1. commit what changed here ──────────────────────────────────────
+    if [[ "$pull_only" -eq 0 ]]; then
+      DOTSYNC_PHASE=hook-pre-commit
+      if ! dotsync_run_hooks pre-commit; then
+        echo "dotsync: a pre-commit hook failed; nothing was committed or pushed" >&2
+        exit 1
+      fi
+      DOTSYNC_PHASE=commit
+      if [[ -n "$(git ls-files -u 2>/dev/null)" ]]; then
+        echo "dotsync: the checkout has unmerged paths (an unresolved conflict); resolve them, then rerun" >&2
+        dotsync_fail unmerged
+        exit 1
+      fi
+      dotsync_stage_changes || { dotsync_fail commit; exit 1; }
+      log_step commit-stage
+      if ! git diff --cached --quiet; then
+        DOTSYNC_PHASE=secret-scan
+        if ! dotsync_check_staged; then
+          # Leave the change where it was, unstaged, and stop: nothing is committed or pushed.
+          git reset -q 2>/dev/null || true
+          echo "dotsync: nothing was committed or pushed; your changes are still in the working tree" >&2
+          dotsync_fail secret-scan
+          exit 1
+        fi
+        log_step commit-check
+        DOTSYNC_PHASE=commit
+        commit_msg="$(dotsync_describe_staged "$_DOTSYNC_HOST" || dotsync_commit_message "$_DOTSYNC_HOST")"
+        log_step commit-describe
+        # Another git process (an editor, a status poll) can hold index.lock for a moment.
+        lock_wait=0
+        while [[ -e "$(git rev-parse --git-path index.lock)" && "$lock_wait" -lt 20 ]]; do
+          sleep 0.5
+          lock_wait=$((lock_wait + 1))
+        done
+        if git diff --cached --quiet; then
+          echo "dotsync: the staged changes were committed or unstaged by another process; nothing to commit" >&2
+        else
+          # The scan above is the same staged scan a gitleaks pre-commit hook runs: skip its copy.
+          if [[ "$verbose" -eq 1 ]]; then
+            SKIP="${SKIP:+$SKIP,}gitleaks" git commit -m "$commit_msg"
+          else
+            SKIP="${SKIP:+$SKIP,}gitleaks" git commit --quiet -m "$commit_msg"
+          fi
+          committed=1
+        fi
+      fi
+    fi
+    log_step commit
+
+    # ── 2. pull ──────────────────────────────────────────────────────────
+    fetch_failed=0
+    DOTSYNC_PHASE=git-fetch
+    if [[ -z "$upstream" ]]; then
+      echo "dotsync: branch $branch has no upstream; nothing pulled or pushed (git branch --set-upstream-to)" >&2
+      fetch_failed=1 rebase_failed=1
+      dotsync_fail git-upstream
+    else
+      if [[ -n "$prefetch_pid" ]]; then
+        wait "$prefetch_pid" 2>/dev/null || true
+        prefetch_rc="$(cat "$prefetch_out.rc" 2>/dev/null || echo missing)"
+        [[ ! -s "$prefetch_out" ]] || cat "$prefetch_out" >&2
+        rm -f "$prefetch_out" "$prefetch_out.rc"
+        prefetch_pid=""
+        if [[ "$prefetch_rc" != 0 ]]; then
+          echo "dotsync: background fetch failed (rc=$prefetch_rc); retrying" >&2
+          dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+            fetch --quiet </dev/null 9>&- || fetch_failed=1
+        fi
+      else
+        dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+          fetch ${quiet[@]+"${quiet[@]}"} </dev/null 9>&- || fetch_failed=1
+      fi
+      if [[ "$fetch_failed" -eq 1 ]]; then
+        rebase_failed=1
+        echo "dotsync: fetch failed; nothing pulled or pushed, local commits kept" >&2
+        dotsync_fail git-fetch
+      else
+        pulled_commits="$(git rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)"
+      fi
+    fi
+    log_step git-fetch
+
+    DOTSYNC_PHASE=git-rebase
+    if [[ "$rebase_failed" -eq 0 ]]; then
+      # --autostash keeps a tree a live writer dirtied between the commit and the rebase. A
+      # writer appending to a tracked log mid-rebase ("would be overwritten") is a race, not a
+      # conflict: abort and try again. A real conflict is aborted and stops here.
+      rebase_err="$(dotsync_mktemp)" || rebase_err=/dev/null
+      for rebase_attempt in 1 2 3; do
+        rebase_failed=0
+        git rebase --autostash ${quiet[@]+"${quiet[@]}"} "$upstream" 2>"$rebase_err" </dev/null || rebase_failed=1
+        [[ "$rebase_failed" -eq 0 ]] && break
+        # An append right after the autostash fails the rebase before it starts, leaving only
+        # the stash in the rebase state: --quit, then put the stash back.
+        rebase_dir="$(git rev-parse --git-path rebase-merge)"
+        if [[ -f "$rebase_dir/autostash" && ! -f "$rebase_dir/head-name" ]]; then
+          git rebase --quit 2>/dev/null || true
+          git stash pop --quiet 2>/dev/null \
+            || echo "dotsync: a rebase raced a live write before it started; its autostash is stash@{0}: apply it by hand" >&2
+        fi
+        [[ "$rebase_attempt" -lt 3 ]] && grep -qE 'would be overwritten|You have unstaged changes' "$rebase_err" 2>/dev/null || break
+        git rebase --abort 2>/dev/null || true
+        echo "dotsync: the rebase raced a live write (attempt $rebase_attempt); retrying" >&2
+        sleep 1
+      done
+      [[ "$rebase_err" == /dev/null ]] || { cat "$rebase_err" >&2; rm -f "$rebase_err"; }
+      if [[ "$rebase_failed" -eq 1 ]]; then
+        echo "dotsync: the rebase onto $upstream conflicted; aborted, your commits are kept here and nothing was pushed" >&2
+        git rebase --abort 2>/dev/null || true
+        dotsync_fail git-rebase
+      elif [[ -n "$(git ls-files -u 2>/dev/null)" ]]; then
+        # The commits rebased, but putting uncommitted changes back conflicted: git keeps them
+        # in the stash list. Nothing with conflict markers is ever staged or pushed.
+        echo "dotsync: your uncommitted changes conflicted with the pull; they are kept in 'git stash list', and the files show the conflict" >&2
+        dotsync_fail autostash
+      fi
+    fi
+    log_step git-rebase
+
+    # ── 3. push ──────────────────────────────────────────────────────────
+    push_preflight_ls_remote() {
+      dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+        ls-remote "${upstream%%/*}" "refs/heads/${upstream#*/}" 2>/dev/null </dev/null 9>&- | awk 'NR == 1 { print $1 }'
+    }
+    push_preflight_start() {
+      [[ -n "$upstream" ]] || return 0
+      preflight_out="$TIMING_LOG_DIR/preflight.$$"
+      ( push_preflight_ls_remote >"$preflight_out" || true ) &
+      preflight_pid="$!"
+    }
+    # Another machine often pushes between this fetch and this push. One ls-remote catches the
+    # race before the push (and before a pre-push secret scan of a doomed push).
+    push_preflight() {
+      local remote_tip=""
+      [[ -n "$upstream" ]] || return 0
+      if [[ -n "${preflight_pid:-}" ]]; then
+        wait "$preflight_pid" 2>/dev/null || true
+        preflight_pid=""
+        IFS= read -r remote_tip <"$preflight_out" 2>/dev/null || true
+        rm -f "$preflight_out"
+        preflight_out=""
+      else
+        remote_tip="$(push_preflight_ls_remote)"
+      fi
+      [[ -n "$remote_tip" ]] || return 0
+      git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null && return 0
+      dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+        fetch --quiet </dev/null 9>&- || return 0
+      git rebase --quiet "$upstream" </dev/null || { git rebase --abort 2>/dev/null; return 1; }
+    }
+    # Each lost race needs a fresh fetch, rebase and push; two in a row are common when several
+    # machines sync together. A recovered race prints a note, not git's rejection block.
+    push_with_retry() {
+      local q=--quiet attempt err rc first=0
+      push_preflight || first=1
+      [[ "$verbose" -eq 0 ]] || q=""
+      err="$(dotsync_mktemp)" || return 1
+      for attempt in 0 1 2 3; do
+        [[ "$attempt" -ge "$first" ]] || continue
+        if [[ "$attempt" -gt 0 ]]; then
+          sleep $(( attempt + RANDOM % 3 ))
+          dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+            fetch ${q:+"$q"} </dev/null 9>&- || break
+          if ! git rebase ${q:+"$q"} "$upstream" </dev/null; then
+            git rebase --abort 2>/dev/null || true
+            echo "dotsync: the retry rebase failed (attempt $attempt); retrying" >&2
+            continue
+          fi
+        fi
+        rc=0
+        dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+          push ${q:+"$q"} 2>"$err" </dev/null 9>&- || rc=$?
+        if [[ "$rc" -eq 0 ]]; then
+          cat "$err" >&2; rm -f "$err"; return 0
+        fi
+        if [[ "$attempt" -lt 3 ]] && grep -qE 'rejected|cannot lock ref' "$err"; then
+          echo "dotsync: the push lost a race with another machine; rebasing and retrying" >&2
+        else
+          cat "$err" >&2
+        fi
+      done
+      rm -f "$err"
+      return 1
+    }
+
+    DOTSYNC_PHASE=git-push
+    if [[ "$pull_only" -eq 1 ]]; then
+      :
+    elif [[ "$rebase_failed" -eq 0 && -n "$upstream" ]] && [[ "$(git rev-list --count "$upstream..HEAD" 2>/dev/null || echo 0)" -gt 0 ]]; then
+      push_preflight_start
+      # Last chance to describe generic commits while they are still local only.
+      if [[ "$one_line" -eq 1 ]]; then
+        dotsync_reword_unpublished "$_DOTSYNC_HOST" >/dev/null
+      else
+        dotsync_reword_unpublished "$_DOTSYNC_HOST" | sed 's/^/dotsync: /'
+      fi
+      DOTSYNC_PHASE=secret-scan
+      if ! dotsync_scan_outgoing "$upstream..HEAD"; then
+        push_failed=1
+        dotsync_fail secret-scan
+      else
+        DOTSYNC_PHASE=git-push
+        if push_with_retry; then
+          pushed_commits="$(git rev-list --count "$start_head..HEAD" 2>/dev/null || echo 0)"
+          pushed_commits=$(( pushed_commits - pulled_commits ))
+          [[ "$pushed_commits" -ge 0 ]] || pushed_commits=0
+        else
+          push_failed=1
+          dotsync_fail git-push
+          echo "dotsync: the push failed after retries; local commits kept" >&2
+        fi
+      fi
+    fi
+    log_step git-push
+  fi
+
+  end_head="$(git rev-parse HEAD)"
+  # ── the summary ──────────────────────────────────────────────────────────
+  if [[ "$remote_unchanged" -eq 1 ]]; then
+    summary="up to date ($branch @$start_head_short)"
+  else
+    actions=()
+    [[ "$committed" -eq 0 ]] || actions+=("committed")
+    [[ "$pulled_commits" -eq 0 || "$rebase_failed" -eq 1 ]] || actions+=("pulled $pulled_commits")
+    [[ "$pushed_commits" -eq 0 ]] || actions+=("pushed $pushed_commits")
+    [[ "$pull_only" -eq 0 ]] || actions+=("pull-only")
+    [[ "$rebase_failed" -eq 0 ]] || actions+=("REBASE-FAIL")
+    [[ "$push_failed" -eq 0 ]] || actions+=("PUSH-FAIL")
+    stat="$(git diff --shortstat "$start_head..$end_head" 2>/dev/null | sed -E 's/^[[:space:]]+//')"
+    if [[ -n "$stat" ]]; then summary="synced ($branch @$(git rev-parse --short HEAD)) | $stat"
+    else summary="up to date ($branch @$(git rev-parse --short HEAD))"
+    fi
+    [[ "${#actions[@]}" -eq 0 ]] || summary="$summary | $(printf '%s, ' "${actions[@]}" | sed 's/, $//')"
+  fi
+  if [[ "$one_line" -eq 1 ]]; then echo "$summary"; else echo "dotfiles: $summary"; fi
+
+  # ── 4. apply: install.sh, then the post-pull hooks ─────────────────────
+  # install.sh reruns when the pull changed something it installs. It reruns the components
+  # this machine installed (install.sh --installed), from the new checkout, never asking for
+  # input; its output is in install.log.
+  if [[ "$rebase_failed" -eq 0 && "${DOTSYNC_NO_INSTALL:-0}" != 1 && "$end_head" != "$start_head" ]]; then
+    install_trigger="$(git diff --name-only "$start_head..$end_head" 2>/dev/null \
+      | grep -Ev "${DOTSYNC_INSTALL_IGNORE:-(^|/)tests?/|^docs/|\\.md\$}" \
+      | grep -E "${DOTSYNC_INSTALL_TRIGGER:-^(install\\.sh|base/|roles/|identities/|scripts/|plugins/|systemd/|launchagents/|claude/|zshenv|zshrc|aliases|profile\\.|zprofile\\.)}" \
+      | head -n 1 || true)"
+    if [[ -n "$install_trigger" ]]; then
+      DOTSYNC_PHASE=install
+      install_cmd="${DOTSYNC_INSTALL_CMD:-./install.sh --installed}"
+      if [[ -n "${DOTSYNC_INSTALL_CMD:-}" || -x "$DOTFILES_DIR/install.sh" ]]; then
+        [[ "$one_line" -eq 1 ]] || echo "dotsync: re-running install ($install_trigger changed); log: $TIMING_LOG_DIR/install.log"
+        (umask 077; : >"$TIMING_LOG_DIR/install.log")
+        if ! (cd "$DOTFILES_DIR" && sh -c "$install_cmd") </dev/null >"$TIMING_LOG_DIR/install.log" 2>&1 3>&- 9>&-; then
+          echo "dotsync: install failed; the config arrived but is not fully installed; details: $TIMING_LOG_DIR/install.log" >&2
+          dotsync_fail install
+        fi
+        log_step install
+      fi
+    fi
+  fi
+  if [[ "$rebase_failed" -eq 0 ]]; then
+    export DOTSYNC_END_HEAD="$end_head"
+    DOTSYNC_PHASE=hook-post-pull
+    dotsync_run_hooks post-pull || true
+    log_step post-pull
+  fi
+fi
+
+# ── 5. the peers ─────────────────────────────────────────────────────────
+run_post_sync() {
+  [[ "$post_sync_ran" -eq 0 ]] || return 0
+  post_sync_ran=1
+  DOTSYNC_RESULT="$(dotsync_result "${EXIT_CODE:-0}")"
+  export DOTSYNC_RESULT DOTSYNC_END_HEAD="${end_head:-}"
+  dotsync_run_hooks post-sync || true
+}
+
+if [[ "$local_only" -eq 1 || -n "$defer_reason" ]]; then
+  [[ -n "$defer_reason" ]] || run_post_sync
+  DOTSYNC_PHASE=finished
+  cd "$ORIGINAL_DIR" 2>/dev/null || true
+  exit "$EXIT_CODE"
+fi
+
+dotsync_fanout() {
+  local candidates=() discovered=() host entry alias identity skip pids=() pid m expected latest
+  DOTSYNC_PHASE=peer-sync
+  if [[ -z "$sender_identity" ]]; then
+    echo "dotsync: this machine has no identity (DF_IDENTITY in ~/.df-profile); peers are never synced without one" >&2
+    dotsync_fail peer-identity
+    return 0
+  fi
+  if [[ ${#selected_hosts[@]} -gt 0 ]]; then
+    for host in "${selected_hosts[@]}"; do
+      skip=0
+      for m in ${candidates[@]+"${candidates[@]}"}; do dotsync_same_host "$host" "$m" && skip=1; done
+      [[ "$skip" -eq 1 ]] || candidates+=("$host")
+    done
+  else
+    while IFS=$'\t' read -r alias identity _; do
+      [[ -n "$alias" ]] || continue
+      if [[ "$identity" != - && "$identity" != "$sender_identity" ]]; then
+        [[ "$one_line" -eq 1 ]] || echo "$alias: skipped (listed for identity $identity)"
+        continue
+      fi
+      candidates+=("$alias")
+    done < <(dotsync_peers_list "$sender_identity")
+    while IFS= read -r host; do
+      [[ -n "$host" ]] || continue
+      skip=0
+      for m in ${candidates[@]+"${candidates[@]}"}; do dotsync_same_host "$host" "$m" && skip=1; done
+      [[ "$skip" -eq 1 ]] || { candidates+=("$host"); discovered+=("$host"); }
+    done < <(dotsync_tailnet_peers "${DOTSYNC_TAILSCALE_TAG:-}")
+  fi
+
+  SSH_CM_DIR="$(mktemp -d "/tmp/dotsync-cm.XXXXXX")"
+  expected="$(git rev-parse HEAD 2>/dev/null || true)"
+  for host in ${candidates[@]+"${candidates[@]}"}; do
+    if dotsync_same_host "$host" "$_DOTSYNC_HOST"; then continue; fi
+    if dotsync_host_is_excluded "$host"; then
+      echo "$host: excluded (DOTSYNC_EXCLUDE_HOSTS)"
+      continue
+    fi
+    entry=0
+    for m in ${discovered[@]+"${discovered[@]}"}; do [[ "$m" != "$host" ]] || entry=1; done
+    dotsync_sync_peer "$host" "$entry" "$expected" &
+    pids+=("$!")
+  done
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    wait "$pid" || { dotsync_fail peer-sync; echo 'dotsync: a peer worker exited unexpectedly; see the peer logs' >&2; }
+  done
+  peers_dispatched="${#pids[@]}"
+  log_step peer-sync
+  if [[ "$peers_dispatched" -eq 0 ]]; then
+    [[ "$one_line" -eq 1 ]] || echo "dotsync: no peers to update (dotsync peers)"
+  fi
+
+  # Peers push what they committed themselves. Fetch once (the heartbeats come with it), and
+  # give the peers that already synced one catch-up pass when the branch moved meanwhile.
+  if [[ "$peers_dispatched" -gt 0 && -n "$upstream" ]]; then
+    dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+      fetch --quiet </dev/null 9>&- 2>/dev/null || true
+    latest="$(git rev-parse "$upstream" 2>/dev/null || true)"
+    if [[ -n "$latest" && "$latest" != "$expected" && -s "$SSH_CM_DIR/succeeded" ]] \
+        && ! git merge-base --is-ancestor "$latest" "$expected" 2>/dev/null; then
+      DOTSYNC_PHASE=peer-catchup
+      pids=()
+      while IFS= read -r host; do
+        ( SSH_CM_DIR="$SSH_CM_DIR/catchup" && mkdir -p "$SSH_CM_DIR" && dotsync_sync_peer "$host" 0 "$latest" ) &
+        pids+=("$!")
+      done <"$SSH_CM_DIR/succeeded"
+      for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" || true; done
+      if [[ -s "$SSH_CM_DIR/catchup/errors" ]]; then
+        cat "$SSH_CM_DIR/catchup/errors" >>"$SSH_CM_DIR/errors"
+        cat "$SSH_CM_DIR/catchup/failed" >>"$SSH_CM_DIR/failed" 2>/dev/null || true
+      fi
+      log_step peer-catchup
+    fi
+  fi
+
+  peers_failed_count=0
+  [[ ! -s "$SSH_CM_DIR/errors" ]] || dotsync_fail peer-sync
+  if [[ -s "$SSH_CM_DIR/failed" ]]; then
+    peers_failed_count="$(sort -u "$SSH_CM_DIR/failed" | wc -l | tr -d ' ')"
+    echo "dotsync: $peers_failed_count/$peers_dispatched peer(s) incomplete: $(sort -u "$SSH_CM_DIR/failed" | tr '\n' ' ')" >&2
+    # One offline laptop is a partial run; reaching no peer at all is a failure.
+    if [[ "$peers_dispatched" -gt 0 && -s "$SSH_CM_DIR/unreachable" ]] \
+        && [[ "$(sort -u "$SSH_CM_DIR/unreachable" | wc -l | tr -d ' ')" -eq "$peers_dispatched" ]]; then
+      echo 'dotsync: no peer was reachable; check your ssh routes and each peer log' >&2
+      dotsync_fail peer-sync
+    fi
+  fi
+  return 0
+}
+
+# Record a background fan-out for dotsync status and the heartbeat, and notify on a problem.
+dotsync_fanout_report() {
+  local start_ms="$1" end_ms result
+  end_ms="$(ts_ms)"
+  result="$(dotsync_result "${EXIT_CODE:-0}")"
+  DOTSYNC_RESULT="$result"
+  DOTSYNC_PHASE="${DOTSYNC_FAILED_PHASE:-peer-sync}"
+  end_head="$(git -C "$DOTFILES_DIR" rev-parse HEAD 2>/dev/null || true)"
+  run_post_sync
+  write_heartbeat "${EXIT_CODE:-0}"
+  publish_heartbeat
+  printf 'ts=%s result=%s incomplete=%s dispatched=%s seconds=%s\n' "$(date +%s)" "$result" \
+    "${peers_failed_count:-0}" "${peers_dispatched:-0}" "$(( (end_ms - start_ms) / 1000 ))" \
+    >"$TIMING_LOG_DIR/fanout-result.tmp" && mv "$TIMING_LOG_DIR/fanout-result.tmp" "$TIMING_LOG_DIR/fanout-result"
+  printf '  step %-14s %s\n' fanout-total "$(fmt_dur $((end_ms - start_ms)))" >>"$TIMING_LOG"
+  echo "fan-out: result=$result incomplete=${peers_failed_count:-0}/${peers_dispatched:-0}"
+  if [[ "$result" != ok ]]; then
+    dotsync_notify "dotsync: peers $result" "${peers_failed_count:-0} of ${peers_dispatched:-0} peer(s) incomplete. Run: dotsync status"
+  fi
+  [[ -z "${SSH_CM_DIR:-}" ]] || rm -rf "$SSH_CM_DIR" 2>/dev/null || true
+}
+
+# A manual run returns once this machine is pushed; the peers update in a detached child that
+# keeps this run's lock (fd 9), so no later run commits or pushes underneath it. Timers,
+# --wait, --host and --strict-peers runs wait, and the peers decide their exit status.
+if [[ "$scheduled" -eq 0 && "$one_line" -eq 0 && "$wait_peers" -eq 0 && "$strict_peers" -eq 0 \
+      && "${#selected_hosts[@]}" -eq 0 ]]; then
+  fanout_log="$TIMING_LOG_DIR/fanout.log"
+  (umask 077; : >"$fanout_log")
+  (
+    # Survive the terminal closing; hold none of the caller's descriptors.
+    trap '' HUP
+    exec 3>&- </dev/null >>"$fanout_log" 2>&1
+    fanout_start_ms="$(ts_ms)"
+    STEP_START_MS="$fanout_start_ms"
+    echo "=== fan-out $(date '+%Y-%m-%d %H:%M:%S') host=$_DOTSYNC_HOST run=$$ ==="
+    # shellcheck disable=SC2154  # fanout_rc is assigned inside the trap string
+    trap 'fanout_rc=$?; [[ "$fanout_rc" -eq 0 || "${EXIT_CODE:-0}" -ne 0 ]] || EXIT_CODE="$fanout_rc"; dotsync_fanout_report "$fanout_start_ms"' EXIT
+    DOTSYNC_SSH_TIMEOUT=15
+    dotsync_fanout
+  ) &
+  fanout_pid="$!"
+  fanout_background=1
+  printf 'pid=%s started=%s\n' "$fanout_pid" "$(date +%s)" >"$TIMING_LOG_DIR/fanout-pid"
+  echo "dotsync: peers updating in the background (pid $fanout_pid); see dotsync status or $fanout_log"
+  DOTSYNC_PHASE=peer-sync-background
+else
+  dotsync_fanout
+  run_post_sync
+  DOTSYNC_PHASE=finished
+fi
+
+cd "$ORIGINAL_DIR" 2>/dev/null || true
+exit "$EXIT_CODE"
+}
+
+dotsync_main "$@"
