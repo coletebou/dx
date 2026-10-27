@@ -7,13 +7,17 @@ one machine is waiting on the next. One run:
 1. goes through each repository under `~/code`: commits uncommitted work as a temporary WIP
    commit, pulls what origin has, pushes, and turns its own WIP commit back into uncommitted
    changes;
-2. then runs `codesync --local` on each of your other machines over ssh, one after another, each
-   bounded by a timeout. A machine whose identity differs from this one's is never touched;
-3. finally runs `dotsync --local` when [dotsync](dotsync.md) is installed.
+2. then runs `codesync --local --peer` on each of your other machines over ssh, one after
+   another, each bounded by a timeout. A machine whose identity differs from this one's is never
+   touched;
+3. finally runs `dotsync --local` when [dotsync](dotsync.md) is installed (on a peer,
+   `dotsync --local --peer`, so that machine's pause and editing guard hold).
 
-It only syncs clones that already exist (it never clones), only on a branch, and only when the
-clone's `origin` matches `CODESYNC_REMOTE_MATCH` (default: `github\.com`). It works on macOS and
-Linux with bash 3.2 or newer, git, awk and OpenSSH. Nothing schedules it: it runs when you run it.
+Nothing is committed or pushed without a [gitleaks](https://github.com/gitleaks/gitleaks) scan:
+not uncommitted files, not commits you made by hand. It only syncs clones that already exist (it
+never clones), only on a branch, and only when the clone's `origin` matches
+`CODESYNC_REMOTE_MATCH` (default: `github\.com`). It works on macOS and Linux with bash 3.2 or
+newer, git, gitleaks, awk and OpenSSH. Nothing schedules it: it runs when you run it.
 
 ## Setup for two machines
 
@@ -26,6 +30,9 @@ Say `box-a` and `box-b` are ssh aliases that reach your two machines (`~/.ssh/co
    ```bash
    ~/.dotfiles/install.sh --with shell,git,sync --identity example   # same identity on both
    ```
+
+   Install gitleaks too (`brew install gitleaks`, or a release binary): without it codesync
+   still pulls, but commits and pushes nothing.
 
 2. **Check that each reaches the other without a prompt.** codesync uses
    `ssh -o BatchMode=yes`, so a key (or Tailscale SSH) must work non-interactively, and the
@@ -58,15 +65,22 @@ and pushed, your work in progress included, with nothing else to set up.
 
 ## What happens to one repository
 
-For a clone on a branch whose origin matches:
+For a clone on a branch whose origin matches, and with no merge, rebase, cherry-pick, revert,
+`git am` or bisect in progress and no unmerged path (that one is left alone and reported: staging
+would mark its conflicts resolved, markers and all):
 
 1. **Uncommitted changes become a WIP commit.** Staged, unstaged and untracked files (minus what
-   `.gitignore` excludes) go into one commit, subject `WIP: codesync <date> <time>`, with a
+   `.gitignore` excludes) are staged and scanned with `gitleaks git --pre-commit --staged`. A
+   finding, a scanner error or no gitleaks at all unstages them again and stops there. Otherwise
+   they go into one commit, subject `WIP: codesync <date> <time>`, with a
    `Codesync-Machine: <machine>` trailer naming the machine that made it (`DF_MACHINE` from
-   `~/.df-profile`, else the short hostname).
-2. **What origin has and it lacks is pulled**, with `git pull --rebase`, so its commits go on top.
-3. **It pushes.** A real commit is pushed normally; a WIP commit is force-pushed under the rules
-   below.
+   `~/.df-profile`, else the short hostname). The scan is codesync's own, so it holds where a
+   repository's own hooks (husky, lefthook) would skip yours.
+2. **What origin has and it lacks is pulled**: one fetch, then a rebase onto exactly the tip
+   that fetch brought, so its commits go on top.
+3. **It pushes**, unless it is level with that tip: first `gitleaks git` scans every commit the
+   push would publish (one you made by hand with hooks skipped too), then a real commit is pushed
+   normally and a WIP commit is force-pushed under the rules below.
 4. **Its own WIP commit is unwrapped again**: a soft reset puts the changes back in the working
    tree, uncommitted (staged versus unstaged is not kept). The commit stays on origin.
 
@@ -102,8 +116,11 @@ replace it with a newer one from the same machine. Reset it by hand if you meant
 - Only when the remote's base is in ours: the remote's tip, or its parent when the tip is itself
   a WIP, must be our base or an ancestor of it. Otherwise: `Remote has commits you don't have!`,
   and nothing is pushed.
-- Always with `--force-with-lease` against `origin/<branch>` as codesync fetched it, so a commit
-  another machine pushed after that fetch makes the push fail instead of disappearing.
+- Always with a lease on the exact tip codesync fetched and checked,
+  `--force-with-lease=refs/heads/<branch>:<sha>`, so a commit another machine pushed after that
+  fetch makes the push fail instead of disappearing. (A bare `--force-with-lease` would compare
+  with `origin/<branch>` at push time, which an editor's background fetch can have moved to that
+  very commit.)
 - A WIP on a branch with a single commit is never force-pushed (there is no base to check).
 - Before it force-pushes, a tag `codesync-backup-<time>` marks the remote tip it replaces; every
   unwrap first tags the WIP as `codesync-unwrap-<time>`. After a repository syncs, it keeps the
@@ -117,10 +134,16 @@ with your changes uncommitted, never in the middle of a rebase:
 
 | What happened | What codesync does |
 |---|---|
+| `left alone: a merge is in progress` (or a rebase, cherry-pick, revert, `git am`, bisect, or unmerged paths) | nothing at all: finish or abort it, then rerun |
 | `fetch failed` | nothing (network, credentials, or a branch that is not on origin yet) |
+| `gitleaks found a potential secret`, or `gitleaks is required` | unstages again, commits nothing; the files stay as they were |
 | the WIP commit was refused (a pre-commit hook, an index lock) | unstages again; the changes stay as they were |
 | `pull failed; resolve it by hand` (a conflict) | aborts the rebase and unwraps its WIP: your files hold your version, no conflict markers |
+| `refusing to push` (the outgoing scan) | pushes nothing and unwraps its WIP |
 | `push failed` (the lease, a hook, a rejection) | unwraps its WIP; anything it pulled stays |
+
+Credentials a URL carries (a user and token before the `@` of an `https://` remote) never reach
+its output: in its own lines and in git's, they read `https://***@host/...`.
 
 ### Which directories count
 
@@ -180,11 +203,13 @@ is skipped.
 ssh -o ConnectTimeout=$CODESYNC_SSH_TIMEOUT -o BatchMode=yes <peer> sh -s   < the script
 ```
 
-The script checks the identity, then runs `codesync --local` from the peer's PATH, with
+The script checks the identity, then runs `codesync --local --peer` from the peer's PATH, with
 `~/.local/bin` (where `install.sh` links it) added at the end; `CODESYNC_REMOTE_CMD` names another
 command. The peer reads its own `~/.config/codesync/config`: nothing of this machine's
 environment travels. `--local` means the peer syncs its repositories and stops; it never fans out
-further.
+further. `--peer` says nobody is at that machine: its dotsync step runs as `dotsync --local
+--peer`, so while that machine is paused (`dotsync pause`) or someone (or an agent) is editing its
+dotfiles, its dotsync defers instead of committing, rebasing and pushing.
 
 Each peer is cut off after `CODESYNC_PEER_TIMEOUT` seconds (default 300), with GNU `timeout` (or
 `gtimeout`) when there is one and a built-in watchdog otherwise, and the run goes on to the next.
@@ -216,7 +241,7 @@ write is ignored.
 | `CODESYNC_PEER_TIMEOUT` | `300` | seconds one peer may take |
 | `CODESYNC_SSH_TIMEOUT` | `5` | ssh `ConnectTimeout`, in seconds |
 | `CODESYNC_REMOTE_CMD` | `codesync` | the command a peer runs (a name or a path; no spaces or quotes) |
-| `CODESYNC_DOTSYNC` | `auto` | `auto` runs `~/.local/bin/dotsync --local` at the end when it exists; `0` never |
+| `CODESYNC_DOTSYNC` | `auto` | `auto` runs `~/.local/bin/dotsync --local` at the end when it exists (`--local --peer` on a peer); `0` never |
 
 ```bash
 # ~/.config/codesync/config
@@ -237,10 +262,18 @@ not sync; 2 a usage or settings error.
 - **`WIP-vs-WIP rebase conflicted; refusing to drop remote WIP`**: two machines both had
   uncommitted changes in that repository. On this one: `git stash`, `codesync --local` (it pulls
   the other machine's work as a commit), `git stash pop`, resolve if needed, rerun.
-- **`the WIP commit was refused (a hook?)`**: a pre-commit hook said no; its reason follows. With
-  this repo's git hooks, that is gitleaks finding a secret in an uncommitted or untracked file, or
-  gitleaks not being installed. Untracked files travel too: put anything that must never leave
-  the machine (`.env`, keys) in `.gitignore`.
+- **`left alone: a merge is in progress`** (or another operation, or unmerged paths): finish it
+  (`git merge --continue`, `git rebase --continue`, ...) or abort it, then rerun.
+- **`gitleaks found a potential secret`**: something uncommitted, untracked files included, looks
+  like a credential. The files are as they were, unstaged. Find it with the command codesync
+  prints, then move the file out, put it in `.gitignore` (`.env`, keys: anything that must never
+  leave the machine), or record a false positive in `.gitleaksignore`. The secret itself is never
+  printed.
+- **`gitleaks is required`**: install gitleaks; until then codesync pulls but commits and pushes
+  nothing.
+- **`refusing to push`**: a commit on the branch that is not on origin yet (one you made by hand,
+  say) looks like it holds a credential. Rewrite it, then rerun.
+- **`the WIP commit was refused (a hook?)`**: a pre-commit hook said no; its reason follows.
 - **`push failed`** after `stale info`: another machine pushed between this one's fetch and push.
   Rerun.
 - **`Remote has commits you don't have!`**: pull by hand (`git pull --rebase`), then rerun.
@@ -261,6 +294,10 @@ bash scripts/tests/codesync.test.sh
 Every machine in it is a throwaway HOME with clones of local bare repositories, reached through a
 fake `ssh` that maps `box-b` (and three more aliases) to "run this with HOME=<that machine's
 home>" and refuses any other name. It proves the two-machine round trip, the second run, the
-identity refusal, the guarded force-push (a racing push and the ancestry check), a dirty peer, a
-conflict and a refused commit left with the changes uncommitted, a hung peer cut off at the
-timeout, the peers file, the profile parser, the config file, dry runs and the dotsync step.
+identity refusal, the guarded force-push (a racing push, the same race after a background fetch,
+and the ancestry check), a dirty peer, a conflict and a refused commit left with the changes
+uncommitted, unfinished merges, cherry-picks, `git am`, bisects and unmerged paths left alone,
+the secret scan (an untracked secret, a hand-made commit, no gitleaks), redacted URLs, a hung
+peer cut off at the timeout, the peers file, the profile parser, the config file, dry runs, and
+the dotsync step, including a paused peer whose real dotsync defers. It needs gitleaks, and skips
+without it.

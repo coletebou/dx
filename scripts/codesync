@@ -16,10 +16,14 @@
 #
 # Safety:
 #   - Uncommitted changes are never lost. A repository it cannot sync (a conflict, a refused
-#     commit or push) is put back with them uncommitted, and the run reports it.
+#     commit or push) is put back with them uncommitted, and the run reports it. One in the
+#     middle of a merge, rebase, cherry-pick, revert, am or bisect, or with unmerged paths, is
+#     left alone.
+#   - Nothing is committed or pushed past gitleaks: the staged WIP and every outgoing commit are
+#     scanned, and without gitleaks nothing is committed or pushed at all.
 #   - It never force-pushes over commits it lacks: only a WIP commit is force-pushed, only when
-#     the remote's base is in its own, and with --force-with-lease, so a push that lands after
-#     its fetch is refused rather than overwritten.
+#     the remote's base is in its own, and with a lease on the exact tip it fetched, so a push
+#     that lands after its fetch is refused rather than overwritten.
 #   - Every commit it force-pushes over or unwraps keeps a tag (codesync-backup-*,
 #     codesync-unwrap-*): the newest five of each, and any younger than a week.
 #   - Another machine is synced only when its own ~/.df-profile names this machine's identity;
@@ -32,7 +36,7 @@ MACHINE_TRAILER="Codesync-Machine"
 TAG_KEEP_RECENT=5
 TAG_KEEP_DAYS=7
 
-DRY_RUN=false VERBOSE=false LOCAL_ONLY=false LIST_PEERS=false MACHINE="" made_wip=false
+DRY_RUN=false VERBOSE=false LOCAL_ONLY=false PEER_RUN=false LIST_PEERS=false MACHINE="" made_wip=false
 HOSTS=()
 synced=0 skipped=0 failed=0 wip_created=0 wip_unwrapped=0 peers_synced=0 peer_problems=0
 
@@ -61,27 +65,34 @@ Options:
   --local, -l     this machine only
   --host HOST     after this machine, sync HOST only (repeatable; an ssh alias)
   --peers         list the peers it would contact and where each comes from, then exit
+  --peer          a run another machine started (what a peer runs; implies --local)
   -h, --help      this help
 
 Per repository (a checkout on a branch whose origin matches CODESYNC_REMOTE_MATCH):
-  1. uncommitted changes, untracked files included, become a commit "WIP: codesync <time>"
+  1. uncommitted changes, untracked files included, pass a gitleaks scan and become a
+     commit "WIP: codesync <time>"
   2. commits on origin it lacks are pulled, rebasing on top of them
-  3. it pushes; a WIP commit is force-pushed only when the remote holds nothing it lacks
+  3. after a gitleaks scan of what it would publish, it pushes; a WIP commit is
+     force-pushed only when the remote holds nothing it lacks
   4. its own WIP commit is unwrapped back to uncommitted changes
   A WIP commit pulled from another machine becomes "sync: apply codesync changes" there.
 
 Safety:
   - a repository it cannot sync is put back with your changes uncommitted, and reported
-  - never force-pushes over commits it lacks (ancestry check plus --force-with-lease)
+  - one in the middle of a merge, rebase, cherry-pick, revert, am or bisect, or with
+    unmerged paths, is left alone, and reported
+  - nothing is committed or pushed without gitleaks, or past a finding (fail closed)
+  - never force-pushes over commits it lacks: an ancestry check, then a lease on the exact
+    tip it fetched (--force-with-lease=<branch>:<sha>)
   - backup tags codesync-backup-* and codesync-unwrap-* mark what it replaced or unwrapped
   - a peer is synced only when its ~/.df-profile names this machine's DF_IDENTITY
 
 Peers (one ssh alias per line, then optionally its identity; '#' starts a comment):
   CODESYNC_PEERS_FILE if set, else ~/.config/codesync/peers if it exists, else dotsync's
   list: ~/.config/dotsync/peers (or DOTSYNC_PEERS_FILE) plus
-  ~/.dotfiles/identities/<identity>/dotsync-peers. A peer runs `codesync --local` from its
-  PATH (with ~/.local/bin added); ssh never prompts (BatchMode) and each peer is cut off at
-  CODESYNC_PEER_TIMEOUT.
+  ~/.dotfiles/identities/<identity>/dotsync-peers. A peer runs `codesync --local --peer`
+  from its PATH (with ~/.local/bin added); ssh never prompts (BatchMode) and each peer is
+  cut off at CODESYNC_PEER_TIMEOUT.
 
 Settings (environment, else ~/.config/codesync/config as literal KEY=value lines):
   CODE_DIR               where the repositories are (default: ~/code)
@@ -93,8 +104,8 @@ Settings (environment, else ~/.config/codesync/config as literal KEY=value lines
   CODESYNC_PEER_TIMEOUT  seconds one peer may take (default: 300)
   CODESYNC_SSH_TIMEOUT   ssh ConnectTimeout in seconds (default: 5)
   CODESYNC_REMOTE_CMD    the command a peer runs (default: codesync)
-  CODESYNC_DOTSYNC       auto: run ~/.local/bin/dotsync --local at the end when it exists;
-                         0: never (default: auto)
+  CODESYNC_DOTSYNC       auto: run ~/.local/bin/dotsync --local at the end when it exists
+                         (with --peer on a peer, so its pause holds); 0: never (default: auto)
   CODESYNC_CONFIG        the config file itself (default: ~/.config/codesync/config)
 
 Exit status: 0 everything synced or was skipped, 1 a repository or peer did not, 2 usage.
@@ -161,6 +172,12 @@ codesync_valid_identity() {
 
 codesync_lower() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# A filter: the credentials a URL may carry (the user and token before its @) become ***, in
+# anything codesync prints, its own lines and git's.
+codesync_redact() {
+    sed -E 's#(://)[^/@[:space:]]*@#\1***@#g'
 }
 
 # ── ~/.df-profile, read as data ──────────────────────────────────────────
@@ -293,36 +310,90 @@ has_untracked_files() {
     [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]
 }
 
+# An operation left half done, or paths still unmerged: printed when there is one. Staging then
+# would mark the conflicts resolved, markers and all, and the WIP commit would finish the merge.
+unfinished_operation() {
+    local git_dir
+    git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || { echo "its git directory cannot be read"; return 0; }
+    if [[ -e "$git_dir/MERGE_HEAD" ]]; then echo "a merge is in progress"
+    elif [[ -d "$git_dir/rebase-apply" && -e "$git_dir/rebase-apply/applying" ]]; then echo "a git am is in progress"
+    elif [[ -d "$git_dir/rebase-merge" || -d "$git_dir/rebase-apply" ]]; then echo "a rebase is in progress"
+    elif [[ -e "$git_dir/CHERRY_PICK_HEAD" ]]; then echo "a cherry-pick is in progress"
+    elif [[ -e "$git_dir/REVERT_HEAD" ]]; then echo "a revert is in progress"
+    elif [[ -d "$git_dir/sequencer" ]]; then echo "a cherry-pick or revert sequence is in progress"
+    elif [[ -e "$git_dir/BISECT_LOG" ]]; then echo "a bisect is in progress"
+    elif [[ -n "$(git ls-files -u 2>/dev/null)" ]]; then echo "unmerged paths (resolve them, or git restore them)"
+    else return 1
+    fi
+}
+
+# The secret gate, fail closed: no gitleaks, a finding, or a scanner error all refuse. The
+# scanner's own output never reaches codesync's, so a secret value is never printed.
+codesync_scan_staged() {
+    if ! command -v gitleaks >/dev/null 2>&1; then
+        log "  ${RED}gitleaks is required to commit (https://github.com/gitleaks/gitleaks); changes left uncommitted${NC}"
+        return 1
+    fi
+    if ! gitleaks git --pre-commit --staged --redact --no-banner . >/dev/null 2>&1; then
+        log "  ${RED}gitleaks found a potential secret in the changes (or could not finish); changes left uncommitted${NC}"
+        log "    (see it with: git add -A && gitleaks git --pre-commit --staged --redact --verbose .; false positive: .gitleaksignore)"
+        return 1
+    fi
+}
+
+# codesync_scan_outgoing RANGE: the commits a push would publish, ones made by hand included.
+codesync_scan_outgoing() {
+    if ! command -v gitleaks >/dev/null 2>&1; then
+        log "  ${RED}gitleaks is required to push (https://github.com/gitleaks/gitleaks); refusing to push${NC}"
+        return 1
+    fi
+    if ! gitleaks git --redact --no-banner --log-opts="$1" . >/dev/null 2>&1; then
+        log "  ${RED}gitleaks found a potential secret in the commits to push, or could not finish; refusing to push${NC}"
+        log "    (see it with: gitleaks git --redact --verbose --log-opts='$1' .)"
+        return 1
+    fi
+}
+
 # The machine a WIP commit names in its trailer, lowercased (empty for one without it).
 wip_machine() {
     codesync_lower "$(git log -1 --format=%b "$1" 2>/dev/null | sed -n "s/^$MACHINE_TRAILER: //p" | tail -n 1)"
 }
 
-# Stage everything and commit it as a WIP. A refused commit (a hook, a lock) unstages again and
-# fails: the changes stay as they were.
+# git's own output, indented and with credentials masked, on stderr.
+show_git_output() {
+    [[ -z "$1" ]] || printf '%s\n' "$1" | codesync_redact | sed 's/^/    /' >&2
+}
+
+# Stage everything, scan it for secrets, and commit it as a WIP. A finding, a missing gitleaks
+# or a refused commit (a hook, a lock) unstages again and fails: the changes stay as they were.
 commit_wip() {
     local out
     if ! out="$(git add -A 2>&1)"; then
         git reset -q 2>/dev/null || true
         log "  ${RED}could not stage the changes${NC}"
-        [[ -z "$out" ]] || printf '%s\n' "$out" | sed 's/^/    /' >&2
+        show_git_output "$out"
+        return 1
+    fi
+    if ! codesync_scan_staged; then
+        git reset -q 2>/dev/null || true
         return 1
     fi
     if ! out="$(git commit --quiet -m "$WIP_PREFIX $(date '+%Y-%m-%d %H:%M:%S')" \
             -m "$MACHINE_TRAILER: ${MACHINE:-unknown}" 2>&1)"; then
         git reset -q 2>/dev/null || true
         log "  ${RED}the WIP commit was refused (a hook?); changes left uncommitted${NC}"
-        [[ -z "$out" ]] || printf '%s\n' "$out" | sed 's/^/    /' >&2
+        show_git_output "$out"
         return 1
     fi
     made_wip=true
 }
 
-# Pull with rebase. A pull that stops (a conflict) is aborted, so no repository is ever left in
-# the middle of a rebase with conflict markers in its files.
+# try_rebase SHA: rebase onto the remote tip this run fetched and checked, never a newer one a
+# fetch elsewhere brought in. A rebase that stops (a conflict) is aborted, so no repository is
+# ever left in the middle of a rebase with conflict markers in its files.
 try_rebase() {
-    local branch="$1" out git_dir
-    if out="$(git pull --rebase --quiet origin "$branch" 2>&1)"; then
+    local onto="$1" out git_dir
+    if out="$(git rebase --quiet "$onto" 2>&1)"; then
         return 0
     fi
     git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
@@ -330,7 +401,7 @@ try_rebase() {
         git rebase --abort >/dev/null 2>&1 || true
     fi
     log "  ${RED}pull failed; resolve it by hand (git pull --rebase)${NC}"
-    [[ -z "$out" ]] || printf '%s\n' "$out" | sed 's/^/    /' >&2
+    show_git_output "$out"
     return 1
 }
 
@@ -347,9 +418,10 @@ give_back() {
 
 # Force-push a WIP, only if no remote commit would be lost.
 # Args: branch, remote_head (empty when the remote branch does not exist), remote_msg.
+#   Every check, and the lease, use remote_head: the tip this run fetched. origin/<branch> may
+#   have moved since (an editor's background fetch), to commits nothing here has checked.
 safe_force_push() {
     local branch="$1" remote_head="${2-}" remote_msg="${3-}"
-    local remote_branch="origin/$branch"
     local local_head local_msg local_count local_base remote_count remote_base backup_tag push_err rc
 
     if [[ -z "$remote_head" ]]; then
@@ -373,14 +445,14 @@ safe_force_push() {
         local_base="$local_head"
     fi
 
-    remote_count=$(git rev-list --count "$remote_branch" 2>/dev/null || echo "0")
+    remote_count=$(git rev-list --count "$remote_head" 2>/dev/null || echo "0")
     if is_wip_commit "$remote_msg"; then
         if [[ "$remote_count" -lt 2 ]]; then
             log "  ${RED}ERROR: Remote WIP on single-commit history; cannot validate base.${NC}"
             log "  ${YELLOW}Refusing force-push. Resolve manually.${NC}"
             return 1
         fi
-        remote_base=$(git rev-parse "$remote_branch~1" 2>/dev/null || echo "")
+        remote_base=$(git rev-parse "$remote_head~1" 2>/dev/null || echo "")
     else
         remote_base="$remote_head"
     fi
@@ -409,13 +481,14 @@ safe_force_push() {
     git tag "$backup_tag" "$remote_head" 2>/dev/null || true
     vlog "Created backup tag: $backup_tag"
 
-    # The lease is origin/<branch> as fetched: a push that landed since is refused, not lost.
-    if push_err=$(git push --force-with-lease --quiet origin "$branch" 2>&1); then
+    # The lease names the checked tip itself: a push that landed since is refused, not lost,
+    # whatever origin/<branch> says by now.
+    if push_err=$(git push --force-with-lease="refs/heads/$branch:$remote_head" --quiet origin "$branch" 2>&1); then
         return 0
     else
         rc=$?
         log "  ${RED}push failed (rc=$rc):${NC}"
-        [[ -z "$push_err" ]] || printf '%s\n' "$push_err" >&2
+        show_git_output "$push_err"
         return 1
     fi
 }
@@ -471,7 +544,7 @@ sync_repo() {
     remote_head=$(git rev-parse "origin/$branch" 2>/dev/null || echo "")
     remote_msg=""
     if [[ -n "$remote_head" ]]; then
-        remote_msg=$(git log -1 --format=%s "origin/$branch" 2>/dev/null || echo "")
+        remote_msg=$(git log -1 --format=%s "$remote_head" 2>/dev/null || echo "")
     fi
 
     # Step 1: uncommitted changes become a WIP commit.
@@ -488,8 +561,8 @@ sync_repo() {
     if [[ -n "$remote_head" && "$remote_head" != "$local_head" ]] \
         && ! git merge-base --is-ancestor "$remote_head" HEAD 2>/dev/null; then
         if is_wip_commit "$remote_msg" && is_wip_commit "$local_msg" \
-            && [[ -n "$MACHINE" && "$(wip_machine "origin/$branch")" == "$MACHINE" ]] \
-            && git merge-base --is-ancestor "origin/$branch~1" HEAD~1 2>/dev/null; then
+            && [[ -n "$MACHINE" && "$(wip_machine "$remote_head")" == "$MACHINE" ]] \
+            && git merge-base --is-ancestor "$remote_head~1" HEAD~1 2>/dev/null; then
             # The remote WIP is this machine's own from an earlier run, and nothing was built on
             # it: everything in it came from this working tree, which is the newer copy. Our WIP
             # replaces it (step 3 force-pushes behind a backup tag of it).
@@ -502,7 +575,7 @@ sync_repo() {
                 made_wip=false
                 vlog "Unwrapped local WIP to integrate remote WIP"
             fi
-            if ! try_rebase "$branch"; then
+            if ! try_rebase "$remote_head"; then
                 log "  ${RED}WIP-vs-WIP rebase conflicted; refusing to drop remote WIP.${NC}"
                 log "  ${YELLOW}Resolve manually, then re-run codesync.${NC}"
                 return 1
@@ -515,13 +588,13 @@ sync_repo() {
         elif is_wip_commit "$remote_msg"; then
             # Remote is WIP, we have real commits.
             local_tree=$(git rev-parse "HEAD^{tree}" 2>/dev/null || echo "")
-            remote_tree=$(git rev-parse "origin/$branch^{tree}" 2>/dev/null || echo "")
+            remote_tree=$(git rev-parse "$remote_head^{tree}" 2>/dev/null || echo "")
             # Equal trees are not enough: remote history we lack would be dropped.
-            remote_only_count=$(git rev-list --count "origin/$branch" "^HEAD" 2>/dev/null || echo "0")
+            remote_only_count=$(git rev-list --count "$remote_head" "^HEAD" 2>/dev/null || echo "0")
             if [[ -n "$local_tree" && -n "$remote_tree" && "$local_tree" == "$remote_tree" \
                   && "$remote_only_count" -eq 0 ]]; then
                 vlog "Real commit has same content as remote WIP, will replace"
-            elif ! try_rebase "$branch"; then
+            elif ! try_rebase "$remote_head"; then
                 give_back
                 return 1
             elif is_wip_commit "$(git log -1 --format=%s 2>/dev/null)"; then
@@ -534,7 +607,7 @@ sync_repo() {
             else
                 log "  ${GREEN}rebased on remote${NC}"
             fi
-        elif ! try_rebase "$branch"; then
+        elif ! try_rebase "$remote_head"; then
             # Remote has real commits: our WIP or commits go on top, or nothing changes.
             give_back
             return 1
@@ -543,9 +616,15 @@ sync_repo() {
         fi
     fi
 
-    # Step 3: push.
+    # Step 3: push, after a secret scan of every commit it would publish. Level with the
+    # fetched tip, there is nothing to push.
     local_msg=$(git log -1 --format=%s 2>/dev/null || echo "")
-    if is_wip_commit "$local_msg"; then
+    if [[ -n "$remote_head" && "$(git rev-parse HEAD)" == "$remote_head" ]]; then
+        vlog "Nothing to push"
+    elif ! codesync_scan_outgoing "${remote_head:+$remote_head..}HEAD"; then
+        give_back
+        return 1
+    elif is_wip_commit "$local_msg"; then
         if safe_force_push "$branch" "$remote_head" "$remote_msg"; then
             log "  ${GREEN}pushed${NC}"
         else
@@ -561,7 +640,7 @@ sync_repo() {
             log "  ${GREEN}pushed (force)${NC}"
         else
             log "  ${RED}push failed${NC}"
-            [[ -z "$push_err" ]] || printf '%s\n' "$push_err" >&2
+            show_git_output "$push_err"
             give_back
             return 1
         fi
@@ -618,7 +697,7 @@ display_name() {
 }
 
 sync_all_repos() {
-    local dir name remote branch repo_start_ms
+    local dir name remote branch repo_start_ms operation
     while IFS= read -r dir; do
         name="$(display_name "$dir")"
         if [[ ! -d "$dir/.git" ]]; then
@@ -629,8 +708,13 @@ sync_all_repos() {
         cd "$dir"
         remote=$(git remote get-url origin 2>/dev/null || echo "")
         if [[ -z "$remote" ]] || ! [[ "$remote" =~ $CODESYNC_REMOTE_MATCH ]]; then
-            vlog "$name: origin does not match CODESYNC_REMOTE_MATCH (${remote:-none}), skipping"
+            vlog "$name: origin does not match CODESYNC_REMOTE_MATCH ($(printf '%s' "${remote:-none}" | codesync_redact)), skipping"
             skipped=$((skipped + 1))
+            continue
+        fi
+        if operation="$(unfinished_operation)"; then
+            log "${RED}$name: left alone: $operation${NC} (finish or abort it, then rerun)"
+            failed=$((failed + 1))
             continue
         fi
         branch=$(current_branch || true)
@@ -736,7 +820,7 @@ if ! command -v $3 >/dev/null 2>&1; then
     printf 'codesync: %s is not on PATH here\n' '$3' >&2
     exit 127
 fi
-exec $3 --local
+exec $3 --local --peer
 EOF
 }
 
@@ -832,6 +916,7 @@ main() {
             --dry-run|-n) DRY_RUN=true ;;
             --verbose|-v) VERBOSE=true ;;
             --local|-l) LOCAL_ONLY=true ;;
+            --peer) PEER_RUN=true LOCAL_ONLY=true ;;
             --peers) LIST_PEERS=true ;;
             --host) [[ $# -ge 2 ]] || die "--host needs an ssh alias"; HOSTS+=("$2"); shift ;;
             --host=*) HOSTS+=("${1#--host=}") ;;
@@ -882,13 +967,16 @@ main() {
         sync_peers
     fi
 
-    # The dotfiles last, this machine only: each peer's own run did its own.
+    # The dotfiles last, this machine only: each peer's own run did its own. A run another
+    # machine started passes --peer on, so dotsync's pause and editing guard hold there.
     dotsync="$HOME/.local/bin/dotsync"
+    local dotsync_args=(--local)
+    if $PEER_RUN; then dotsync_args+=(--peer); fi
     if [[ "$CODESYNC_DOTSYNC" != 0 && -x "$dotsync" ]]; then
         echo ""
         if $DRY_RUN; then
-            log "would run dotsync --local"
-        elif "$dotsync" --local; then
+            log "would run dotsync ${dotsync_args[*]}"
+        elif "$dotsync" "${dotsync_args[@]}"; then
             log "${GREEN}dotfiles synced${NC}"
         else
             log "${RED}dotsync failed${NC}"

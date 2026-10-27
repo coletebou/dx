@@ -587,7 +587,7 @@ c_sync() {
     link_bins "$DOTFILES_DIR/scripts/dotsync" "$DOTFILES_DIR/scripts/dotsync-doctor" \
         "$DOTFILES_DIR/scripts/dotsync-commit-message" "$DOTFILES_DIR/scripts/codesync"
     need python3 "dotsync needs it for its lock and its checks"
-    need gitleaks "dotsync refuses to commit or push without it"
+    need gitleaks "dotsync and codesync refuse to commit or push without it"
     need ssh "dotsync and codesync update your other machines over ssh"
     [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/dotsync/peers" ] || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/codesync/peers" ] \
         || say "  note: list your other machines (one ssh alias per line) in ~/.config/dotsync/peers; codesync reads it too, unless ~/.config/codesync/peers exists (docs/dotsync.md, docs/codesync.md)"

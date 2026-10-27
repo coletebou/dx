@@ -8,14 +8,20 @@
 # It proves: uncommitted work on box-a becomes a WIP commit, is pushed, and box-b gets it (as the
 # real commit "sync: apply codesync changes"); a second run on one machine replaces its own WIP;
 # a peer of another identity is skipped and never written to; the guarded force-push refuses
-# when the remote moved; a dirty repository on box-b, a conflict and a refused commit are left
-# with the changes uncommitted; a hung peer is cut off at the timeout; plus the peers file, the
-# profile parser, the config file, dry runs and the dotsync step.
+# when the remote moved, a background fetch included; a dirty repository on box-b, a conflict and
+# a refused commit are left with the changes uncommitted; an unfinished merge (and the like) is
+# left alone; nothing passes the secret scan; URLs are printed without credentials; a hung peer
+# is cut off at the timeout; a paused peer's real dotsync defers; plus the peers file, the
+# profile parser, the config file and dry runs. Needs gitleaks (skips without it).
 #
 #   bash scripts/tests/codesync.test.sh
 set -uo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd -P)"
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "# SKIP gitleaks is not installed (codesync's secret scan needs it; CI installs it)"
+  exit 0
+fi
 codesync="$root/scripts/codesync"
 real_home="$HOME"
 tmp="$(mktemp -d)"
@@ -175,7 +181,7 @@ peer_run() { printf '%s\n' "$1" > "$ph/.df-profile"; env -i HOME="$ph" PATH="$cl
 for p in 'DF_IDENTITY=example' 'export DF_IDENTITY="example"' "DF_IDENTITY='example'" $'export DF_MACHINE=box-q\nexport DF_IDENTITY=example'; do
   equal "a peer accepts the profile [${p//$'\n'/\\n}]" 0 "$(peer_run "$p")"
 done
-equal "...and runs codesync --local there each time" "4 ran --local" "$(wc -l < "$ph/runs" | tr -d ' ') $(head -n 1 "$ph/runs")"
+equal "...and runs codesync --local --peer there each time" "4 ran --local --peer" "$(wc -l < "$ph/runs" | tr -d ' ') $(head -n 1 "$ph/runs")"
 # shellcheck disable=SC2016  # profiles a shell would execute, kept literal
 for p in 'export DF_IDENTITY=other' 'export DF_IDENTITY=$(touch "$HOME/executed")' \
          'DF_IDENTITY=example; touch "$HOME/executed"' 'DF_IDENTITY=`touch "$HOME/executed"`' \
@@ -395,6 +401,34 @@ equal "the next run succeeds" 0 "$rc"
 equal "...with box-a's WIP on top of the other machine's commit" "$racer" "$(git -C "$remotes/r6.git" rev-parse master~1)"
 equal "...and box-a has that commit" "racer" "$(cat "$tmp/box-a/code/r6/racer" 2>&1)"
 retire r6
+# The same race, plus a background fetch (an editor's) that moves origin/master to the other
+# machine's commit before the push: the lease must still hold codesync's own fetch.
+new_remote r6b
+clone_on box-a r6b
+base="$(tip r6b)"
+mkdir -p "$tmp/race-fetch-hooks"
+cat > "$tmp/race-fetch-hooks/pre-commit" <<EOF
+#!/bin/sh
+[ -e "$tmp/raced-fetch" ] && exit 0
+: > "$tmp/raced-fetch"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+(cd "$tmp/seed/r6b" && printf 'racer\n' > racer && HOME="$seed_home" git add racer \\
+  && HOME="$seed_home" git commit -qm "racer" && HOME="$seed_home" git push -q origin master) \\
+  && cd "$tmp/box-a/code/r6b" && git fetch -q origin
+EOF
+chmod +x "$tmp/race-fetch-hooks/pre-commit"
+at box-a r6b config core.hooksPath "$tmp/race-fetch-hooks" >/dev/null
+printf 'from box-a\n' >> "$tmp/box-a/code/r6b/f"
+run_on box-a --local
+racer="$(git -C "$tmp/seed/r6b" rev-parse HEAD)"
+equal "the race and the background fetch happened" "racer $racer" \
+  "$(git -C "$tmp/seed/r6b" log -1 --format=%s) $(at box-a r6b rev-parse origin/master)"
+equal "a push after a background fetch moved origin/master still fails" 1 "$rc"
+check "...refused by the lease on the fetched tip" "(stale info)" "$out"
+equal "...the other machine's commit stays the remote's tip" "$racer" "$(tip r6b)"
+equal "...and box-a's work is uncommitted again, on its base" "$base  M f" \
+  "$(at box-a r6b rev-parse HEAD) $(at box-a r6b status --porcelain)"
+retire r6b
 # The ancestry check on its own: a WIP whose base lacks a remote commit is never force-pushed.
 new_remote r7
 clone_on box-a r7
@@ -409,6 +443,53 @@ check "safe_force_push refuses when the remote has commits the WIP's base lacks"
 check "...saying so" "Remote has commits you don't have" "$guard_out"
 equal "...and the remote keeps them" "$remote_only" "$(tip r7)"
 retire r7
+
+echo "an unfinished operation"
+# conflict_on NAME: the seed pushes "seed side" to f; box-a commits "box-a side" to f.
+conflict_on() {
+  new_remote "$1"; clone_on box-a "$1"
+  printf 'seed side\n' > "$tmp/seed/$1/f"
+  sg -C "$tmp/seed/$1" commit -qam "seed side"; sg -C "$tmp/seed/$1" push -q origin master
+  printf 'box-a side\n' > "$tmp/box-a/code/$1/f"
+  at box-a "$1" commit -qam "box-a side" >/dev/null
+  at box-a "$1" fetch -q origin >/dev/null
+}
+conflict_on u-merge
+at box-a u-merge merge -q --no-edit origin/master >/dev/null
+conflict_on u-pick
+at box-a u-pick cherry-pick origin/master >/dev/null
+conflict_on u-am
+git -C "$tmp/seed/u-am" format-patch -q -1 --stdout > "$tmp/u-am.patch"
+at box-a u-am am -q "$tmp/u-am.patch" >/dev/null
+new_remote u-stash; clone_on box-a u-stash
+printf 'stashed side\n' > "$tmp/box-a/code/u-stash/f"
+at box-a u-stash stash -q >/dev/null
+printf 'committed side\n' > "$tmp/box-a/code/u-stash/f"
+at box-a u-stash commit -qam "committed side" >/dev/null
+at box-a u-stash stash pop -q >/dev/null
+new_remote u-bisect; clone_on box-a u-bisect
+at box-a u-bisect bisect start >/dev/null
+printf 'bisecting\n' >> "$tmp/box-a/code/u-bisect/f"
+u_repos=(u-merge u-pick u-am u-stash u-bisect)
+u_state() { printf '%s %s %s' "$(tip "$1")" "$(at box-a "$1" rev-parse HEAD)" "$(at box-a "$1" status --porcelain | tr '\n' ' ')"; }
+u_before=()
+for r in "${u_repos[@]}"; do u_before+=("$(u_state "$r")"); done
+equal "the states are set up" "MERGE_HEAD CHERRY_PICK_HEAD rebase-apply unmerged BISECT_LOG" \
+  "$(for p in u-merge/.git/MERGE_HEAD u-pick/.git/CHERRY_PICK_HEAD u-am/.git/rebase-apply; do [[ -e "$tmp/box-a/code/$p" ]] && printf '%s ' "${p##*/}"; done; [[ -n "$(at box-a u-stash ls-files -u)" ]] && printf 'unmerged '; [[ -e "$tmp/box-a/code/u-bisect/.git/BISECT_LOG" ]] && printf BISECT_LOG)"
+run_on box-a --local
+equal "a repository in the middle of an operation fails the run" 1 "$rc"
+check "...a merge is named" "u-merge: left alone: a merge is in progress" "$out"
+check "...a cherry-pick" "u-pick: left alone: a cherry-pick is in progress" "$out"
+check "...a git am" "u-am: left alone: a git am is in progress" "$out"
+check "...unmerged paths (a stash that did not apply)" "u-stash: left alone: unmerged paths" "$out"
+check "...a bisect" "u-bisect: left alone: a bisect is in progress" "$out"
+for i in "${!u_repos[@]}"; do
+  equal "...${u_repos[$i]}: nothing committed, staged or pushed" "${u_before[$i]}" "$(u_state "${u_repos[$i]}")"
+done
+equal "...and the merge is still there to finish" "present" "$(if [[ -e "$tmp/box-a/code/u-merge/.git/MERGE_HEAD" ]]; then echo present; else echo gone; fi)"
+run_on box-a --local --dry-run
+check "a dry run says it would leave it alone" "u-merge: left alone: a merge is in progress" "$out"
+for r in "${u_repos[@]}"; do retire "$r"; done
 
 echo "a hung peer"
 new_remote r8
@@ -468,7 +549,15 @@ HOME="$tmp/box-a" git clone -q "$tmp/elsewhere/x.git" "$tmp/box-a/code/not-githu
 printf 'stays\n' > "$tmp/box-a/code/not-github/file"
 HOME="$tmp/box-a" git clone -q "$remotes/r10.git" "$tmp/box-a/code/detached" 2>/dev/null
 at box-a detached switch -q --detach HEAD >/dev/null
+url_secret="tok$RANDOM$RANDOM$$"
+HOME="$tmp/box-a" git clone -q "$remotes/r10.git" "$tmp/box-a/code/with-token" 2>/dev/null
+at box-a with-token remote set-url origin "https://someone:$url_secret@example.com/someone/x.git" >/dev/null
 run_on box-a --local --verbose
+lacks "a skipped origin's credentials are never printed" "$url_secret" "$out"
+check "...its URL is shown without them" "with-token: origin does not match CODESYNC_REMOTE_MATCH (https://***@example.com/someone/x.git)" "$out"
+redacted="$(printf 'fatal: unable to access https://u:%s@example.com/x.git/\n' "$url_secret" | cs_fn codesync_redact)"
+equal "git output codesync prints is redacted the same way" "fatal: unable to access https://***@example.com/x.git/" "$redacted"
+rm -rf "$tmp/box-a/code/with-token"
 check "a repository whose origin does not match is skipped" "not-github: origin does not match" "$out"
 equal "...untouched" "?? file" "$(at box-a not-github status --porcelain)"
 check "a directory that is no repository is skipped" "plain-dir: not a git repo" "$out"
@@ -512,6 +601,54 @@ equal "...its changes stay uncommitted and unstaged" " M f" "$(at box-a r11 stat
 check "...and the run goes on to the next repository" "goes through" "$(git -C "$remotes/r12.git" show master:f 2>&1)"
 retire r11; retire r12
 
+echo "the secret scan"
+token="ghp_$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 36)"
+new_remote s1
+clone_on box-a s1
+# A repository-local hooks directory (husky, lefthook) with no secret hook: codesync scans anyway.
+mkdir -p "$tmp/empty-hooks"
+at box-a s1 config core.hooksPath "$tmp/empty-hooks" >/dev/null
+printf 'GITHUB_TOKEN=%s\n' "$token" > "$tmp/box-a/code/s1/.env"
+s1_before="$(tip s1)"
+run_on box-a --local
+equal "an untracked file holding a secret fails the run" 1 "$rc"
+check "...at codesync's own scan of the changes" "gitleaks found a potential secret in the changes" "$out"
+lacks "...before any commit is made" "committed WIP" "$out"
+lacks "...without printing the secret" "$token" "$out"
+equal "...the file stays untracked and unstaged" "?? .env" "$(at box-a s1 status --porcelain)"
+equal "...nothing was committed" "base" "$(at box-a s1 log -1 --format=%s)"
+equal "...or pushed" "$s1_before" "$(tip s1)"
+at box-a s1 add .env >/dev/null
+at box-a s1 commit -qm "by hand" --no-verify >/dev/null
+run_on box-a --local
+equal "a commit holding a secret, made by hand, is not pushed" "$s1_before" "$(tip s1)"
+check "...refused at the outgoing scan" "refusing to push" "$out"
+lacks "...without printing the secret" "$token" "$out"
+retire s1
+# Without gitleaks nothing is committed or pushed, but a clean repository still pulls.
+nogl="$tmp/no-gitleaks"
+mkdir -p "$nogl"
+IFS=: read -r -a _dirs <<<"$clean_path"
+for d in "${_dirs[@]}"; do
+  for f in "$d"/*; do
+    n="${f##*/}"
+    if [[ "$n" != gitleaks && -x "$f" && ! -d "$f" && ! -e "$nogl/$n" ]]; then ln -s "$f" "$nogl/$n"; fi
+  done
+done
+new_remote s2; clone_on box-a s2; new_remote s3; clone_on box-a s3
+printf 'pending\n' >> "$tmp/box-a/code/s2/f"
+printf 'seed edit\n' > "$tmp/seed/s3/f"
+sg -C "$tmp/seed/s3" commit -qam "seed edit"; sg -C "$tmp/seed/s3" push -q origin master
+s2_before="$(tip s2)"
+run_on box-a PATH="$nogl" --local
+equal "without gitleaks a repository with changes fails" 1 "$rc"
+check "...saying gitleaks is required to commit" "gitleaks is required to commit" "$out"
+lacks "...before any commit is made" "committed WIP" "$out"
+equal "...its changes stay uncommitted" " M f" "$(at box-a s2 status --porcelain)"
+equal "...and unpushed" "$s2_before" "$(tip s2)"
+equal "...while a clean repository behind its origin still pulls" "$(tip s3)" "$(at box-a s3 rev-parse HEAD)"
+retire s2; retire s3
+
 echo "dotsync at the end"
 cat > "$tmp/box-a/.local/bin/dotsync" <<EOF
 #!/bin/sh
@@ -522,6 +659,40 @@ run_on box-a --local
 equal "~/.local/bin/dotsync runs once with --local" "--local" "$(cat "$tmp/dotsync.calls" 2>&1)"
 run_on box-a CODESYNC_DOTSYNC=0 --local
 equal "CODESYNC_DOTSYNC=0 skips it" "1" "$(wc -l < "$tmp/dotsync.calls" | tr -d ' ')"
+run_on box-a --local --peer
+equal "a run another machine started passes --peer on" "--local --peer" "$(tail -n 1 "$tmp/dotsync.calls" 2>&1)"
+rm "$tmp/box-a/.local/bin/dotsync"
+
+echo "dotsync on a paused peer"
+# box-b gets this checkout's real dotsync, in a dotfiles clone of its own (never this checkout).
+dseed="$tmp/dotfiles-seed"
+mkdir -p "$dseed"
+if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  (cd "$root" && git ls-files -co --exclude-standard -z | xargs -0 tar -cf - 2>/dev/null) | tar -xf - -C "$dseed"
+else
+  (cd "$root" && tar --exclude=./.git -cf - .) | tar -xf - -C "$dseed"
+fi
+sg -C "$dseed" init -q
+sg -C "$dseed" add -A
+sg -C "$dseed" commit -qm "dotfiles"
+sg init -q --bare "$tmp/dotfiles.git"
+sg -C "$dseed" push -q "$tmp/dotfiles.git" master
+B="$tmp/box-b"
+HOME="$B" git clone -q "$tmp/dotfiles.git" "$B/.dotfiles" 2>/dev/null
+ln -s "$B/.dotfiles/scripts/dotsync" "$B/.local/bin/dotsync"
+dotsync_b() { env -i HOME="$B" PATH="$clean_path" GIT_CONFIG_NOSYSTEM=1 LC_ALL=C TMPDIR="$tmp/t" DOTSYNC_NOTIFY=0 "$B/.local/bin/dotsync" "$@" 2>&1; }
+check "box-b's dotsync pauses" "paused" "$(dotsync_b pause)"
+# An edit dotsync would commit and push if it ran: old enough that only the pause holds it back.
+printf '\npaused change\n' >> "$B/.dotfiles/README.md"
+touch -t 202001010000 "$B/.dotfiles/README.md"
+dot_before="$(git -C "$tmp/dotfiles.git" rev-parse master)"
+peers box-a box-b
+run_on box-a --verbose
+check "box-b's codesync runs its dotsync as a peer, which defers while paused" "deferred: paused" "$out"
+equal "...box-b's dotfiles edit stays uncommitted" " M README.md" "$(git -C "$B/.dotfiles" status --porcelain)"
+equal "...and nothing reached the dotfiles origin" "$dot_before" "$(git -C "$tmp/dotfiles.git" rev-parse master)"
+dotsync_b resume >/dev/null
+rm -rf "$B/.dotfiles" "$B/.local/bin/dotsync"
 
 echo "the checkout"
 equal "nothing was written into the repo" "$before_status" "$(git -C "$root" status --porcelain)"
