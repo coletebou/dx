@@ -286,6 +286,29 @@ else
   ok "# SKIP lsof not installed (the ps listing pairs with it)"
 fi
 
+# A process list the check cannot read whole must stop --prune, not shrink what it sees. Fake
+# lsofs: one prints more than node's default 1 MiB exec buffer before the line that matters (a
+# working directory inside the oldest install), one fails (exit 2, not lsof's partial-list 1).
+mkdir -p "$tmp/lsof-long" "$tmp/lsof-broken"
+cat > "$tmp/lsof-long/lsof" <<'EOF'
+#!/bin/sh
+awk 'BEGIN { for (i = 0; i < 40000; i++) printf "p%d\nn/elsewhere/a/path/long/enough/to/fill/a/buffer/%d\n", i, i }'
+printf 'p1\nn%s\n' "$FAKE_LSOF_CWD"
+EOF
+printf '#!/bin/sh\nprintf "p1\\nn/elsewhere\\n"\nexit 2\n' > "$tmp/lsof-broken/lsof"
+chmod +x "$tmp/lsof-long/lsof" "$tmp/lsof-broken/lsof"
+q="$tmp/pq-lsof"
+step "$q" 5.0.1
+oldest="$(readlink "$q/node-tools-current")"
+step "$q" 5.0.2
+step "$q" 5.0.3
+FAKE_LSOF_CWD="$q/$oldest" PATH="$tmp/lsof-long:$PATH" NODE_TOOLS_PROC_SOURCE="ps" run "$tmp/s-5.0.3" "$q" --prune
+equal "--prune reads a process list longer than 1 MiB to the end (a cwd there keeps the install)" "yes" \
+  "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
+PATH="$tmp/lsof-broken:$PATH" NODE_TOOLS_PROC_SOURCE="ps" run "$tmp/s-5.0.3" "$q" --prune
+equal "--prune deletes nothing when lsof fails" "yes" "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
+check "...saying why" "not pruning Node tool installs: could not list every running process" "$out"
+
 echo "usage"
 run "$tmp/src" "$p" --bogus
 equal "an unknown flag is a usage error" 2 "$rc"

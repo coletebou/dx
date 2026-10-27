@@ -234,13 +234,25 @@ const real = (p) => { try { return fs.realpathSync(p); } catch { return null; } 
 const installs = fs.readdirSync(root).filter((n) => !n.startsWith(".")).map((n) => path.join(root, n));
 const homes = installs.map((i) => [i, real(i) || i]);
 const argvs = [], lines = [], places = [];  // exact argv (Linux), whole command lines (ps), cwd/exe paths
+// Any gap in the listing throws, and the caller then deletes nothing: a list read in part would
+// only make installs look unused.
+const BIG = 1 << 30;  // node's default exec buffer is 1 MiB, past which output is cut short
+const gone = (e) => e.code === "ENOENT" || e.code === "ESRCH";  // the process exited meanwhile
 if (process.env.NT_PROCS !== "ps" && fs.existsSync("/proc/self/cmdline")) {  // Linux: exact argv, cwd and executable per process
+  const me = process.getuid();
   for (const pid of fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n))) {
-    try { argvs.push(fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0")); } catch {}
-    for (const link of ["cwd", "exe"]) { try { places.push(fs.readlinkSync(`/proc/${pid}/${link}`)); } catch {} }
+    let uid;
+    try { uid = fs.statSync(`/proc/${pid}`).uid; } catch (e) { if (gone(e)) continue; throw e; }
+    // An argv of our own we cannot read is a gap. Working directories and executables are only
+    // readable for our own dumpable processes: other users' are refused, and so are those of a
+    // process that made itself non-dumpable (systemd --user, ssh-agent), whose argv still counts.
+    try { argvs.push(fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0")); } catch (e) { if (!gone(e) && uid === me) throw e; }
+    for (const link of ["cwd", "exe"]) {
+      try { places.push(fs.readlinkSync(`/proc/${pid}/${link}`)); } catch (e) { if (!gone(e) && e.code !== "EACCES" && uid === me) throw e; }
+    }
   }
 } else {  // macOS: ps for command lines, lsof for working directories and executables
-  for (const line of execFileSync("ps", ["-A", "-ww", "-o", "command="], { encoding: "utf8" }).split("\n")) {
+  for (const line of execFileSync("ps", ["-A", "-ww", "-o", "command="], { encoding: "utf8", maxBuffer: BIG }).split("\n")) {
     // A ps line joins argv with spaces, so a path holding a space cannot be split back out of
     // it: whole paths are looked for in the line below, and its space-separated words are only
     // a best effort at the paths to follow through their symlinks.
@@ -249,10 +261,13 @@ if (process.env.NT_PROCS !== "ps" && fs.existsSync("/proc/self/cmdline")) {  // 
   }
   let out;
   try {
-    out = execFileSync("lsof", ["-nP", "-F", "n", "-d", "cwd,txt"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    out = execFileSync("lsof", ["-nP", "-F", "n", "-d", "cwd,txt"],
+      { encoding: "utf8", maxBuffer: BIG, stdio: ["ignore", "pipe", "ignore"] });
   } catch (e) {
-    if (!e.stdout) throw e;  // lsof exits 1 when some processes are unreadable, but still lists the rest
-    out = String(e.stdout);
+    // lsof exits 1 when it could not read some processes (other users') and still lists the rest;
+    // any other failure (a cut-short buffer, a signal, another status) leaves the list incomplete.
+    if (e.status !== 1 || e.code === "ENOBUFS" || typeof e.stdout !== "string") throw e;
+    out = e.stdout;
   }
   for (const line of out.split("\n")) if (line.startsWith("n")) places.push(line.slice(1));
 }
