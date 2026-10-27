@@ -97,8 +97,9 @@ or Tailscale's GitOps action, so every change is a reviewed diff. A template:
     {"src": ["group:collab"], "dst": ["tag:dev"], "ip": ["tcp:7681"]},
   ],
 
-  // Tailscale SSH rules. Separate from the grants: a network grant on port 22 does not
-  // let Tailscale SSH in, and an ssh rule does not open the port.
+  // Tailscale SSH rules, for machines started with `tailscale up --ssh`. Separate from the
+  // grants: a network grant on port 22 does not let Tailscale SSH in, and an ssh rule does not
+  // open the port.
   "ssh": [
     // Your own untagged devices, with a periodic browser check.
     {"action": "check", "src": ["autogroup:member"], "dst": ["autogroup:self"],
@@ -145,9 +146,14 @@ Rules that kept this tailnet working:
 | When the tailnet is down | unavailable | reachable through a public jump host, if you keep one |
 | Session recording, central revocation | yes | no |
 
-This setup uses **OpenSSH with keys for everything a script drives** (handoffs, deploys, syncs),
-with sshd reachable only on `tailscale0` ([vps.md](vps.md), SSH and the firewall), and keeps
-Tailscale SSH as a second alias per machine for the day a key is missing. For collaborators,
+**Pick one per port.** `tailscale up --ssh` makes tailscaled answer every tailnet connection to
+port 22 itself, so an sshd behind `tailscale0` never sees them: keys, `IdentityFile` and
+`authorized_keys` stop mattering there, and only the policy's `ssh` rules let anyone in (a caller
+with a port-22 grant but no `ssh` rule is refused). This setup uses **OpenSSH with keys for
+everything a script drives** (handoffs, deploys, syncs), with sshd reachable only on `tailscale0`
+([vps.md](vps.md), SSH and the firewall), and leaves Tailscale SSH off on those machines. To keep
+Tailscale SSH as a fallback on one of them, give sshd a port of its own first (`Port 2222` in
+sshd_config, `tcp:2222` in the grants and `Port 2222` in the key alias). For collaborators,
 Tailscale SSH is the better default: there is no key to hand out or take back.
 
 ## `~/.ssh/config`
@@ -176,8 +182,9 @@ Host box-a
   IdentitiesOnly yes
   StrictHostKeyChecking accept-new    # a new host is added silently; a changed key still fails
 
-# The same machine through Tailscale SSH: no key, so no IdentitiesOnly here (with it, a key
-# file this machine lacks makes ssh give up before Tailscale SSH can answer).
+# The same machine through Tailscale SSH, if it runs `tailscale up --ssh` (its OpenSSH then
+# needs a port of its own: see above). No key, so no IdentitiesOnly here (with it, a key file
+# this machine lacks makes ssh give up before Tailscale SSH can answer).
 Host box-a-ts
   HostName box-a
   User deploy

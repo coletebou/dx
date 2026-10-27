@@ -325,7 +325,6 @@ sudo -u postgres pg_dump -Fc appdb > "$stage/appdb.dump"
 # mongodump --archive="$stage/mongo.archive" --oplog              # a replica set
 
 restic backup --tag daily "$stage" /etc /srv /var/lib --exclude /var/lib/docker
-restic forget --tag daily --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --prune
 restic check --read-data-subset=5%
 rm -rf "$stage"
 date -u +%FT%TZ > /var/lib/backup/last-success
@@ -340,6 +339,8 @@ OnFailure=alert@%n.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/backup
+# /var/lib/backup, where the receipt goes
+StateDirectory=backup
 Nice=10
 IOSchedulingClass=idle
 ```
@@ -350,8 +351,10 @@ target, e.g. `sftp:backup@backup.example.com:/backups/box-a`) and `RESTIC_PASSWO
 - **Keep the repository password somewhere off the box too** (your password manager). Without it
   the backup cannot be read, and the box that held it is the one you lost.
 - **Make the target refuse deletes from the box** (an append-only server such as restic's
-  `rest-server --append-only`, or object lock on a bucket), and prune from another machine, so a
-  compromised box cannot destroy its own history.
+  `rest-server --append-only`, or object lock on a bucket), so a compromised box cannot destroy
+  its own history. Retention then runs from a machine that may delete (the backup host itself,
+  or yours), weekly:
+  `restic -r <repository> forget --tag daily --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --prune`.
 - **Alert on silence, not only on failure.** A daily check that `last-success` is less than 26
   hours old catches the timer that stopped running, which `OnFailure=` never sees.
 
