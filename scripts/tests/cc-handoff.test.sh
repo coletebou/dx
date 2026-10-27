@@ -660,6 +660,7 @@ check "the brief records the goal" "Active /goal: Finish the widget; done when C
 fill_brief "$briefF" goal
 out="$(IS_SANDBOX=1 FSH_KILL=0 FSH_DEFAULT_LAUNCHER=yu as_session sess-F "$pF" "$CCH" launch --go --notify lead-session "$briefF" 2>&1)"; code=$?
 equal "exit 0" 0 "$code"
+[[ "$code" -eq 0 ]] || printf '%s\n' "$out" | tail -n 20 | sed 's/^/       | /'   # why, when it is not
 p="$(cat "$chainF/gen-02/prompt.txt")"
 check "the prompt starts with the passer's /goal" "/goal Finish the widget; done when CI is green" "$(head -n 1 <<<"$p")"
 check "--go authorizes the whole brief" "do all of it without asking which item to start" "$p"
