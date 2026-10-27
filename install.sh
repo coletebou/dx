@@ -38,7 +38,7 @@ describe() {
         codex)     echo "Codex: AGENTS.md rules and hooks.json, a config.toml seeded once, the codex-subagents and codex-transcripts skills" ;;
         session)   echo "cc-park and cc-handoff, with their skills" ;;
         worktrees) echo "wt-helper, pw, stack-branches and stack-claude, with their skills" ;;
-        memory)    echo "reflections, dream, session-analyzer and claude-consolidate, with their skills" ;;
+        memory)    echo "reflections, dream, session-analyzer, claude-consolidate, memory-canary and codex-memory-bridge, with their skills" ;;
         review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
         toolbox)   echo "the disk-reclaim and shipped-but-open skills" ;;
         ghostty)   echo "the Ghostty config, and the xterm-ghostty terminfo where it is missing" ;;
@@ -450,7 +450,8 @@ c_worktrees() {
 
 c_memory() {
     local s
-    for s in reflections dream dream-prep dream-held-nights session-analyzer claude-consolidate; do
+    for s in reflections dream dream-prep dream-held-nights session-analyzer claude-consolidate \
+        memory-canary codex-memory-bridge; do
         link_bins "$DOTFILES_DIR/scripts/$s"
     done
     link_skills memory

@@ -100,7 +100,8 @@ equal "git resolves the hooks path under ~/.dotfiles" "$HOME/.dotfiles/base/git/
   "$(git config --global --path --get core.hooksPath 2>&1)"
 # The way git reads it for a commit: all config files, includes followed (--global alone skips them).
 equal "the old git identity was kept" "sam@example.com" "$(cd "$tmp" && git config --get user.email 2>&1)"
-for b in pw pw-append stack-branches stack-claude wt-helper cc-park cc-handoff reflections dream tmux-archive autoreview-pair; do
+for b in pw pw-append stack-branches stack-claude wt-helper cc-park cc-handoff reflections dream memory-canary \
+    codex-memory-bridge tmux-archive autoreview-pair; do
   [[ -L "$HOME/.local/bin/$b" && -x "$HOME/.local/bin/$b" ]] || bad "~/.local/bin/$b is a working link" "a link" "$(ls -l "$HOME/.local/bin/$b" 2>&1)"
 done
 ok "the CLIs are linked into ~/.local/bin"
