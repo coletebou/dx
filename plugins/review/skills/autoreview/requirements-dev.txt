@@ -1,0 +1,2 @@
+# Optional, for the tests only: the image tests decode with Pillow (the helper needs it only to review images).
+Pillow==12.3.0
