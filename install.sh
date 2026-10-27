@@ -41,7 +41,7 @@ describe() {
         shell)     echo "zsh entry points (zshenv, zshrc, aliases, zprofile, profile), the starship prompt, ~/.df-profile" ;;
         git)       echo "global git config with identity routing, the global ignore file, gitleaks pre-commit and pre-push hooks" ;;
         tmux)      echo "tmux.conf and its status helpers, Claude/Codex resume after tmux-resurrect, tmux-archive and tmux-organize" ;;
-        claude)    echo "Claude Code: generated settings.json (hooks, statusline), a CLAUDE.md rules stub, MCP servers" ;;
+        claude)    echo "Claude Code: generated settings.json (hooks, statusline), a CLAUDE.md rules stub, MCP servers, claude-backup and agent-skills-sync" ;;
         codex)     echo "Codex: AGENTS.md rules and hooks.json, a config.toml seeded once, the codex-subagents and codex-transcripts skills" ;;
         session)   echo "cc-park and cc-handoff, with their skills" ;;
         worktrees) echo "wt-helper, pw, stack-branches and stack-claude, with their skills" ;;
@@ -374,6 +374,8 @@ $l"; done
 
 c_claude() {
     local tmp
+    # Linked only: neither runs unless you run it.
+    link_bins "$DOTFILES_DIR/scripts/claude-backup" "$DOTFILES_DIR/scripts/agent-skills-sync"
     if ! command -v jq >/dev/null 2>&1; then
         warn "jq not found: skipping the generated Claude Code settings (install jq and rerun)"
         return 0

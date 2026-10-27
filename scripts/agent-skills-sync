@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# Keep a fleet-managed skill-source checkout on its declared deployment branch.
+# Defaults target ~/code/agent-skills; the AGENT_SKILLS_SYNC_* settings point it at any other.
+
+set -euo pipefail
+
+REPO_DIR="${AGENT_SKILLS_SYNC_DIR:-$HOME/code/agent-skills}"
+REPO_URL="${AGENT_SKILLS_SYNC_URL:-https://github.com/coletebou/agent-skills.git}"
+DEPLOY_BRANCH="${AGENT_SKILLS_SYNC_BRANCH:-main}"
+LABEL="${AGENT_SKILLS_SYNC_LABEL:-agent-skills}"
+FETCH_REMOTE="${AGENT_SKILLS_SYNC_FETCH_REMOTE:-0}"
+
+# Never block on a credential or host-key prompt: a timer or a sync hook may run it unattended.
+export GIT_TERMINAL_PROMPT=0
+if [[ -z "${GIT_SSH_COMMAND:-}" ]]; then
+  export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage: agent-skills-sync [--one-line]
+
+Clones or fast-forwards a fleet-managed skill-source deployment branch.
+Dirty, detached, branch-mismatched, locally-ahead, and rewritten checkouts
+are reported and left untouched. It runs only when you run it.
+
+Exit status: 0 cloned, current or updated; 1 an error; 2 blocked (the
+checkout needs a look by hand). The report is always one line.
+
+Environment:
+  AGENT_SKILLS_SYNC_DIR     Checkout path (default: ~/code/agent-skills)
+  AGENT_SKILLS_SYNC_URL     Managed repository URL
+                            (default: https://github.com/coletebou/agent-skills.git)
+  AGENT_SKILLS_SYNC_BRANCH  Managed deployment branch (default: main)
+  AGENT_SKILLS_SYNC_LABEL   Report prefix and private-ref namespace
+                            (default: agent-skills; [a-z0-9-] only)
+  AGENT_SKILLS_SYNC_FETCH_REMOTE=1
+                            Fetch through the checkout's own upstream remote
+                            (after verifying it is the managed repository)
+                            instead of AGENT_SKILLS_SYNC_URL. Use for private
+                            repos whose credentials live in that remote's URL
+                            scheme (e.g. SSH). Clones still use the URL.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --one-line)
+      # Output is already exactly one line. Kept as an explicit compatibility
+      # flag for callers that collect one-line reports.
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '%s error: unknown argument %s\n' "$LABEL" "$1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+report() {
+  printf '%s %s\n' "$LABEL" "$1"
+}
+
+blocked() {
+  report "blocked: $1"
+  exit 2
+}
+
+failed() {
+  report "error: $1"
+  exit 1
+}
+
+short_sha() {
+  git -C "$REPO_DIR" rev-parse --short=8 "$1" 2>/dev/null || printf 'unknown'
+}
+
+repo_identity() {
+  local value="$1"
+  value="${value%/}"
+  value="${value%.git}"
+  case "$value" in
+    git@github.com:*)
+      printf 'github.com/%s' "${value#git@github.com:}"
+      ;;
+    ssh://git@github.com/*)
+      printf 'github.com/%s' "${value#ssh://git@github.com/}"
+      ;;
+    https://github.com/*)
+      printf 'github.com/%s' "${value#https://github.com/}"
+      ;;
+    http://github.com/*)
+      printf 'github.com/%s' "${value#http://github.com/}"
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+if [[ ! "$LABEL" =~ ^[a-z0-9-]+$ ]]; then
+  LABEL="agent-skills"
+  failed "invalid label"
+fi
+
+if ! git check-ref-format "refs/heads/$DEPLOY_BRANCH" >/dev/null 2>&1; then
+  failed "invalid deployment branch"
+fi
+
+if [[ ! -e "$REPO_DIR" ]]; then
+  mkdir -p "$(dirname "$REPO_DIR")"
+  if ! git clone --quiet --single-branch --branch "$DEPLOY_BRANCH" \
+      "$REPO_URL" "$REPO_DIR" >/dev/null 2>&1; then
+    failed "clone failed"
+  fi
+  report "cloned ${DEPLOY_BRANCH}@$(short_sha HEAD)"
+  exit 0
+fi
+
+if ! git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  blocked "$REPO_DIR is not a Git checkout"
+fi
+
+for operation_ref in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+  if git -C "$REPO_DIR" rev-parse -q --verify "$operation_ref" >/dev/null 2>&1; then
+    blocked "Git operation in progress"
+  fi
+done
+git_dir="$(git -C "$REPO_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
+if [[ -z "$git_dir" ]]; then
+  blocked "Git metadata is unavailable"
+fi
+for operation_dir in rebase-merge rebase-apply; do
+  if [[ -d "$git_dir/$operation_dir" ]]; then
+    blocked "Git operation in progress"
+  fi
+done
+
+# Nested worktrees under .claude/worktrees/ (wt, parallel-worktrees, Claude Code) are separate checkouts, not
+# edits to this one, and a fast-forward never touches untracked paths. Counting them as dirt kept every box
+# that had one on old code.
+if [[ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal -- . ':(exclude).claude/worktrees' 2>/dev/null)" ]]; then
+  blocked "dirty checkout at $REPO_DIR"
+fi
+
+current_branch="$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if [[ -z "$current_branch" ]]; then
+  blocked "detached HEAD at $REPO_DIR"
+fi
+if [[ "$current_branch" != "$DEPLOY_BRANCH" ]]; then
+  blocked "expected branch $DEPLOY_BRANCH, found $current_branch"
+fi
+
+upstream="$(git -C "$REPO_DIR" rev-parse --abbrev-ref \
+  --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+if [[ -z "$upstream" || "$upstream" == '@{upstream}' || "$upstream" != */* ]]; then
+  blocked "branch $DEPLOY_BRANCH has no usable upstream"
+fi
+
+remote="${upstream%%/*}"
+upstream_branch="${upstream#*/}"
+if [[ "$upstream_branch" != "$DEPLOY_BRANCH" ]]; then
+  blocked "upstream branch is $upstream_branch, expected $DEPLOY_BRANCH"
+fi
+
+remote_url="$(git -C "$REPO_DIR" remote get-url "$remote" 2>/dev/null || true)"
+if [[ -z "$remote_url" ]]; then
+  blocked "upstream remote is unavailable"
+fi
+if [[ "$(repo_identity "$remote_url")" != "$(repo_identity "$REPO_URL")" ]]; then
+  blocked "upstream remote does not match the managed repository"
+fi
+
+head_before="$(git -C "$REPO_DIR" rev-parse HEAD)"
+upstream_ref="$(git -C "$REPO_DIR" rev-parse --symbolic-full-name \
+  '@{upstream}' 2>/dev/null || true)"
+upstream_before="$(git -C "$REPO_DIR" rev-parse "$upstream_ref" 2>/dev/null || true)"
+target_ref="refs/dotsync/$LABEL/$DEPLOY_BRANCH"
+fetch_source="$REPO_URL"
+if [[ "$FETCH_REMOTE" == "1" ]]; then
+  fetch_source="$remote"
+fi
+
+# Force applies only to our private discovery ref. The checked-out branch and
+# its configured remote-tracking ref are updated below only when ancestry proves
+# the operation is a fast-forward. --refmap= stops a fetch by remote NAME
+# (FETCH_REMOTE mode) from also moving that tracking ref behind our back, which
+# would make the compare-and-swap update-ref below fail.
+if ! fetch_err="$(git -C "$REPO_DIR" fetch --quiet --no-tags --refmap= \
+    "$fetch_source" "+refs/heads/$DEPLOY_BRANCH:$target_ref" 2>&1 >/dev/null)"; then
+  # Name git's own reason (last line, credentials in URLs masked) so a
+  # transient network error is distinguishable from an auth or ref problem.
+  fetch_err="$(printf '%s\n' "$fetch_err" | sed '/^[[:space:]]*$/d' | tail -n 1 |
+    sed -e 's/^fatal: //' -e 's#://[^/@]*@#://***@#' | cut -c1-160)"
+  failed "fetch failed${fetch_err:+ ($fetch_err)}"
+fi
+target="$(git -C "$REPO_DIR" rev-parse "$target_ref" 2>/dev/null || true)"
+if [[ -z "$target" ]]; then
+  failed "deployment ref was not fetched"
+fi
+
+if [[ "$head_before" == "$target" ]]; then
+  if [[ "$upstream_before" != "$target" ]]; then
+    if ! git -C "$REPO_DIR" update-ref "$upstream_ref" "$target" "$upstream_before"; then
+      blocked "upstream changed concurrently"
+    fi
+  fi
+  report "current ${DEPLOY_BRANCH}@$(short_sha "$target")"
+  exit 0
+fi
+
+if git -C "$REPO_DIR" merge-base --is-ancestor "$head_before" "$target" 2>/dev/null; then
+  if ! git -C "$REPO_DIR" merge --ff-only --quiet "$target_ref" >/dev/null 2>&1; then
+    blocked "checkout changed while updating"
+  fi
+  if ! git -C "$REPO_DIR" update-ref "$upstream_ref" "$target" "$upstream_before"; then
+    failed "updated checkout but could not refresh upstream tracking"
+  fi
+  report "updated $(short_sha "$head_before")->$(short_sha "$target")"
+  exit 0
+fi
+
+if git -C "$REPO_DIR" merge-base --is-ancestor "$target" "$head_before" 2>/dev/null; then
+  blocked "local commits are ahead of the deployment branch"
+fi
+
+if [[ "$head_before" == "$upstream_before" ]]; then
+  blocked "deployment branch history was rewritten; manual realignment required"
+fi
+blocked "local and deployment histories diverged"
