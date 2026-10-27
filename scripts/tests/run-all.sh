@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-all.sh: every test suite in the repo, one after another, then a summary. A failing suite
-# prints the end of its output. Exit 1 if any failed.
+# prints its failing checks and the end of its output. Exit 1 if any failed.
 #
 #   bash scripts/tests/run-all.sh [PATTERN...]     (only suites whose path contains a PATTERN)
 #
@@ -29,7 +29,10 @@ run() {  # run NAME COMMAND...
     printf 'ok    %3ss\n' "$((SECONDS - start))"; passed=$((passed + 1))
   else
     printf 'FAIL  %3ss\n' "$((SECONDS - start))"; failed=$((failed + 1)); failures="$failures $name"
-    tail -n 40 "$log" | sed 's/^/    /'
+    # Every failing check with its want/got lines (the suites' formats: FAIL, not ok, unittest),
+    # then the end of the output.
+    grep -E -A3 '^[[:space:]]*FAIL|^not ok|^(FAIL|ERROR):|^Traceback' "$log" | head -n 80 | sed 's/^/  ! /'
+    tail -n 25 "$log" | sed 's/^/    /'
   fi
 }
 

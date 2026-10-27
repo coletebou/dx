@@ -78,7 +78,17 @@ check "...given the ref lines" "refs/heads/master $(git -C "$r" rev-parse HEAD)"
 PATH="$tmp/lfsbin:$PATH" git -C "$r" switch -q -c other 2>/dev/null
 check "post-checkout reaches git lfs too" "git-lfs post-checkout" "$(cat "$tmp/lfs.log" 2>&1)"
 git -C "$r" commit -q --allow-empty -m more 2>/dev/null
-out="$(git -C "$r" push origin other 2>&1)"; rc=$?
+# This PATH minus git-lfs, which CI images ship: links to every other command on it.
+mkdir -p "$tmp/nolfs"
+IFS=: read -ra path_dirs <<<"$PATH"
+for d in "${path_dirs[@]}"; do
+  for f in "$d"/*; do
+    n="${f##*/}"
+    [[ "$n" == git-lfs || -e "$tmp/nolfs/$n" || ! -x "$f" || -d "$f" ]] && continue
+    ln -s "$f" "$tmp/nolfs/$n"
+  done
+done
+out="$(PATH="$tmp/nolfs" git -C "$r" push origin other 2>&1)"; rc=$?
 equal "without git-lfs the push is blocked, as Git LFS's own hook does" 2 "$([[ $rc -ne 0 ]] && echo 2 || echo "$rc")"
 check "...saying why" "configured for Git LFS but 'git-lfs' was not found" "$out"
 
