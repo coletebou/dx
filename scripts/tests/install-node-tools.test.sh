@@ -253,6 +253,21 @@ equal "--prune keeps an install a tool reached through another symlink runs" "ye
   "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
 stop_consumers
 
+# An alias of a published command (~/.local/bin/tool -> PREFIX/bin/tool): after the upgrade the
+# alias resolves to the NEW install, so only the link it passes through can tell.
+q="$tmp/pq-alias"
+step "$q" 3.0.1
+oldest="$(readlink "$q/node-tools-current")"
+mkdir -p "$tmp/alias-bin"
+ln -s "$q/bin/beta" "$tmp/alias-bin/beta"
+consume "$tmp/alias-bin/beta"
+step "$q" 3.0.2
+step "$q" 3.0.3
+run "$tmp/s-3.0.3" "$q" --prune
+equal "--prune keeps an install a tool started through an alias of a published command may run" "yes" \
+  "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
+stop_consumers
+
 echo "usage"
 run "$tmp/src" "$p" --bogus
 equal "an unknown flag is a usage error" 2 "$rc"

@@ -253,15 +253,30 @@ if (fs.existsSync("/proc/self/cmdline")) {  // Linux: exact argv, cwd and execut
   for (const line of out.split("\n")) if (line.startsWith("n")) places.push(line.slice(1));
 }
 const inside = (p, dir) => p === dir || p.startsWith(dir + "/");
+const binReal = real(binDir) || binDir, targetReal = real(target) || target;
+const published = (p) => inside(p, binDir) || inside(p, target) || inside(p, binReal) || inside(p, targetReal);
 const used = new Set();
 let all = false;
+// Follow a path's symlinks one link at a time: an alias such as ~/.local/bin/tool -> PREFIX/bin/tool
+// passes through a published link on the way, though its realpath now ends in the new install.
+function walk(start) {
+  let p = start;
+  for (let hop = 0; hop < 40 && p; hop++) {
+    const dir = real(path.dirname(p));
+    const here = dir ? path.join(dir, path.basename(p)) : p;  // the link's own physical place
+    if (published(p) || published(here)) all = true;
+    for (const [i, ir] of homes) if (inside(p, i) || inside(here, ir)) used.add(i);
+    let next;
+    try { next = fs.readlinkSync(p); } catch { break; }  // not a symlink (or gone): the chain ends
+    p = path.resolve(dir || path.dirname(p), next);
+  }
+  const r = real(start);
+  for (const [i, ir] of homes) if (r && inside(r, ir)) used.add(i);
+}
 for (const argv of argvs) {
   for (const arg of argv) {
     for (const tok of arg.split("=")) {  // --require=/path and the like
-      if (!tok.startsWith("/")) continue;
-      if (inside(tok, binDir) || inside(tok, target)) all = true;
-      const r = real(tok);
-      for (const [i, ir] of homes) if (inside(tok, i) || inside(tok, ir) || (r && inside(r, ir))) used.add(i);
+      if (tok.startsWith("/")) walk(tok);
     }
   }
 }
