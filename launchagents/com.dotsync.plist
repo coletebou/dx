@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dotsync</string>
+    <!-- macOS twin of systemd/user/dotsync.timer: every 30 minutes, sync this checkout with
+         its upstream. The scheduled flag skips while `dotsync pause` is on, or while you or an
+         agent is editing the checkout; the local flag leaves the other machines to their own
+         schedules. Settings go in ~/.config/dotsync/config. install.sh installs this only with
+         the sync component, and renders __HOME__ (launchd expands neither ~ nor $HOME). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.dotfiles/scripts/dotsync</string>
+        <string>--local</string>
+        <string>--scheduled</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- launchd does NOT inherit the shell's environment: git, python3 and gitleaks live in
+         Homebrew. A commit-message provider's key is not here either: name a file holding only
+         that key in DOTSYNC_COMMIT_MESSAGE_ENV_FILE (in ~/.config/dotsync/config). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/logs/dotsync.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/logs/dotsync.log</string>
+</dict>
+</plist>

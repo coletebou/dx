@@ -1,0 +1,20 @@
+[Unit]
+Description=Sync this dotfiles checkout with its upstream (dotsync --local --scheduled)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# --scheduled skips while `dotsync pause` is on, or while you or an agent is editing the
+# checkout; --local leaves the other machines to their own timers. Settings go in
+# ~/.config/dotsync/config, or a drop-in (`systemctl --user edit dotsync`):
+#   Environment=DOTSYNC_QUIET_MINUTES=20
+# A commit-message provider's key is not in a service's environment: name a file holding only
+# that key (plain KEY=value lines) in DOTSYNC_COMMIT_MESSAGE_ENV_FILE. Never point
+# EnvironmentFile= at a file of `export K=V` lines: systemd cannot parse them and logs the whole
+# line, value included, to the journal.
+ExecStart=%h/.dotfiles/scripts/dotsync --local --scheduled
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# A oneshot without a ceiling can hang in `activating` and block every later trigger.
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run dotsync every hour
+
+[Timer]
+# Wall-clock anchored: a monotonic-only timer can be stranded at NextElapse=infinity by a
+# daemon-reexec. Persistent catches a run missed while the machine slept.
+OnCalendar=hourly
+OnBootSec=10min
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

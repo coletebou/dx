@@ -7,9 +7,11 @@
 #   ./install.sh --all --dry-run              every change it would make, making none
 #   ./install.sh --all                        every component except schedules, music-video, node-tools, github-kit and manager
 #   ./install.sh --with shell,git,claude      just these
-#   ./install.sh --with schedules             the background jobs (cc-park, dream, tmux autosave)
+#   ./install.sh --with schedules             the background jobs (cc-park, dream, tmux autosave,
+#                                             and the dotsync timer when sync is installed)
 #   ./install.sh --with github-kit --target ~/code/repo   the GitHub repo kit into that repo's .github/
 #   ./install.sh --with manager               point Drover's fleet manager at this identity's overlay
+#   ./install.sh --installed                  again, the components earlier runs installed here
 #
 # Options:
 #   --identity ID   identities/<ID>/ supplies your git identity, host labels, Claude rules and
@@ -17,6 +19,8 @@
 #   --role ROLE     local (a workstation) or server (default: ~/.df-profile's, else local)
 #   --replace-dotfiles  move an existing ~/.dotfiles that is not this checkout into the backup
 #   --target DIR    github-kit: the git repository whose .github/ gets the kit (github-kit/README.md)
+#   --installed     add the components earlier runs installed on this machine (each real run
+#                   records them in ~/.local/state/dx/components); dotsync reruns this after a pull
 #
 # The shell, hooks and schedules find everything through ~/.dotfiles, so a checkout anywhere
 # else gets ~/.dotfiles linked to it. Re-running is safe: what is already in place is left
@@ -26,8 +30,11 @@
 set -euo pipefail
 
 DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review toolbox ghostty vscode brew music-video node-tools schedules github-kit manager"
-DEFAULT_ALL="shell git tmux claude codex session worktrees memory review toolbox ghostty vscode brew"
+ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review sync toolbox ghostty vscode brew music-video node-tools schedules github-kit manager"
+DEFAULT_ALL="shell git tmux claude codex session worktrees memory review sync toolbox ghostty vscode brew"
+# Which components this machine installed, so `--installed` (what dotsync runs after a pull)
+# reinstalls exactly those.
+RECORD_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/dx/components"
 
 describe() {
     case "$1" in
@@ -40,13 +47,14 @@ describe() {
         worktrees) echo "wt-helper, pw, stack-branches and stack-claude, with their skills" ;;
         memory)    echo "reflections, dream, session-analyzer, claude-consolidate, memory-canary and codex-memory-bridge, with their skills" ;;
         review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
+        sync)      echo "dotsync, dotsync-doctor and dotsync-commit-message: this checkout in sync across your machines" ;;
         toolbox)   echo "the disk-reclaim and shipped-but-open skills" ;;
         ghostty)   echo "the Ghostty config, and the xterm-ghostty terminfo where it is missing" ;;
         vscode)    echo "VS Code user settings (Prettier off), and how to install the recommended extensions" ;;
         brew)      echo "~/.Brewfile, for brew bundle --global (installs nothing itself)" ;;
         music-video) echo "the music-video skill (song and video pipeline; paid API keys; not in --all)" ;;
         node-tools) echo "the pinned global Node CLIs (codex, pnpm, tsx, ...) from node-tools/'s lock, via npm ci (Node 24; not in --all)" ;;
-        schedules) echo "launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, nightly dream, tmux autosave (not in --all)" ;;
+        schedules) echo "launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, nightly dream, tmux autosave, hourly dotsync (not in --all)" ;;
         github-kit) echo "issue forms, a PR template, labels and workflows, copied into the .github/ of the repo --target names (not in --all)" ;;
         manager)   echo "a Drover setting naming identities/<id>/openclaw-manager as its fleet manager's overlay (not in --all)" ;;
     esac
@@ -61,7 +69,7 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 say()  { printf '%s\n' "$*"; }
 
 # ── arguments ────────────────────────────────────────────────────────────
-WITH="" DRY_RUN=0 LIST=0 IDENTITY="" ROLE="" REPLACE_DOTFILES=0 TARGET=""
+WITH="" DRY_RUN=0 LIST=0 IDENTITY="" ROLE="" REPLACE_DOTFILES=0 TARGET="" INSTALLED=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --with)       [ $# -ge 2 ] || die "--with needs a list"; WITH="$WITH,$2"; shift 2 ;;
@@ -76,6 +84,7 @@ while [ $# -gt 0 ]; do
         --replace-dotfiles) REPLACE_DOTFILES=1; shift ;;
         --target)     [ $# -ge 2 ] || die "--target needs a directory"; TARGET="$2"; shift 2 ;;
         --target=*)   TARGET="${1#--target=}"; shift ;;
+        --installed)  INSTALLED=1; shift ;;
         -h|--help)    usage; exit 0 ;;
         *)            die "unknown argument: $1 (see --help)" ;;
     esac
@@ -84,6 +93,13 @@ done
 if [ "$LIST" -eq 1 ]; then
     for c in $ALL_COMPONENTS; do printf '  %-11s %s\n' "$c" "$(describe "$c")"; done
     exit 0
+fi
+
+if [ "$INSTALLED" -eq 1 ]; then
+    recorded="$( [ -r "$RECORD_FILE" ] && tr -cs 'a-z-' ',' < "$RECORD_FILE" || true)"
+    [ -n "$(printf '%s' "$recorded" | tr -d ',')" ] \
+        || die "--installed: no components recorded on this machine yet; run ./install.sh --with <components> once"
+    WITH="$WITH,$recorded"
 fi
 
 # The components asked for, deduplicated, in the canonical order.
@@ -545,13 +561,34 @@ c_node_tools() {
     fi
 }
 
+c_sync() {
+    link_bins "$DOTFILES_DIR/scripts/dotsync" "$DOTFILES_DIR/scripts/dotsync-doctor" \
+        "$DOTFILES_DIR/scripts/dotsync-commit-message"
+    need python3 "dotsync needs it for its lock and its checks"
+    need gitleaks "dotsync refuses to commit or push without it"
+    need ssh "dotsync updates your other machines over ssh"
+    [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/dotsync/peers" ] \
+        || say "  note: list your other machines (one ssh alias per line) in ~/.config/dotsync/peers (docs/dotsync.md)"
+}
+
+# The dotsync timer belongs to the sync component: --with schedules alone never starts
+# automatic commits on a machine that did not install dotsync.
+schedule_wanted() {  # schedule_wanted FILE
+    case "$(basename "$1")" in
+        dotsync.*|com.dotsync.plist)
+            selected sync || [ "$HOME/.local/bin/dotsync" -ef "$DOTFILES_DIR/scripts/dotsync" ] ;;
+        *) return 0 ;;
+    esac
+}
+
 # The schedule templates name their binaries under __HOME__/.dotfiles (launchd) or
 # $HOME/.dotfiles (systemd), which is why ~/.dotfiles must point at this checkout.
 c_schedules() {
-    local f tmp label dest unit
+    local f tmp label dest unit timers=""
     case "$(uname -s)" in
         Darwin)
             for f in "$DOTFILES_DIR"/launchagents/*.plist; do
+                schedule_wanted "$f" || continue
                 label="$(basename "$f" .plist)"
                 dest="$HOME/Library/LaunchAgents/$label.plist"
                 tmp="$(mktemp)"
@@ -572,14 +609,16 @@ c_schedules() {
             ;;
         Linux)
             for f in "$DOTFILES_DIR"/systemd/user/*; do
+                schedule_wanted "$f" || continue
                 link "$f" "$HOME/.config/systemd/user/$(basename "$f")"
+                case "$f" in *.timer) timers="$timers $(basename "$f")" ;; esac
             done
             if [ "$DRY_RUN" -eq 1 ]; then
-                say "  [dry-run] would enable the timers: $(cd "$DOTFILES_DIR/systemd/user" && ls ./*.timer | tr '\n' ' ')"
+                say "  [dry-run] would enable the timers:$timers"
             elif systemctl --user daemon-reload 2>/dev/null; then
-                for unit in "$DOTFILES_DIR"/systemd/user/*.timer; do
-                    systemctl --user enable --now "$(basename "$unit")" >/dev/null 2>&1 \
-                        && say "  enabled $(basename "$unit")" || warn "could not enable $(basename "$unit")"
+                for unit in $timers; do
+                    systemctl --user enable --now "$unit" >/dev/null 2>&1 \
+                        && say "  enabled $unit" || warn "could not enable $unit"
                 done
             else
                 warn "no systemd user session here: link the units and enable the timers once one exists"
@@ -661,6 +700,19 @@ for c in $SELECTED; do
     say "[$c] $(describe "$c")"
     "c_$(printf '%s' "$c" | tr - _)"
 done
+
+# Remember what this machine installed (the union of every real run), in the canonical order.
+if [ "$DRY_RUN" -eq 0 ]; then
+    recorded=" $( [ -r "$RECORD_FILE" ] && tr -cs 'a-z-' ' ' < "$RECORD_FILE" || true) $SELECTED "
+    union=""
+    for c in $ALL_COMPONENTS; do
+        case "$recorded" in *" $c "*) union="$union $c" ;; esac
+    done
+    if [ "$(cat "$RECORD_FILE" 2>/dev/null || true)" != "${union# }" ]; then
+        mkdir -p "$(dirname "$RECORD_FILE")"
+        printf '%s\n' "${union# }" > "$RECORD_FILE.tmp" && mv "$RECORD_FILE.tmp" "$RECORD_FILE"
+    fi
+fi
 
 if [ "$CHANGES" -eq 0 ]; then
     say "Everything was already in place."
