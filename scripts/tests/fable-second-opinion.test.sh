@@ -36,20 +36,31 @@ until_true() { local d=$((SECONDS + $1)); shift; while (( SECONDS < d )); do "$@
 export HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache"
 mkdir -p "$HOME"
 # The fake TUI: a banner, then a "❯ " composer; each submitted line is logged and a fresh,
-# empty composer drawn, which is what the helpers wait for.
+# empty composer drawn, which is what the helpers wait for. It reads keys the way a real TUI
+# does, not lines: in canonical mode a tty caps a line at MAX_CANON (1024 bytes on macOS), and
+# the long-running prompt is longer, so it would never arrive.
 cat > "$tmp/fake_tui.py" <<'EOF'
-import sys
-log = sys.argv[1]
-print("Claude Code v0.0.0 (fake)", flush=True)
+import os, sys, tty
+log, fd = sys.argv[1], sys.stdin.fileno()
+tty.setcbreak(fd)
+os.write(1, "Claude Code v0.0.0 (fake)\n❯ ".encode())
+line = b""
 while True:
-    sys.stdout.write("❯ ")
-    sys.stdout.flush()
-    try:
-        line = input()
-    except EOFError:
+    data = os.read(fd, 4096)
+    if not data:
         break
-    with open(log, "a") as f:
-        f.write(line + "\n")
+    for b in data:
+        if b in (10, 13):
+            with open(log, "ab") as f:
+                f.write(line + b"\n")
+            line = b""
+            os.write(1, "\n❯ ".encode())
+        elif b == 127:
+            line = line[:-1]
+            os.write(1, b"\b \b")
+        else:
+            line += bytes([b])
+            os.write(1, bytes([b]))
 EOF
 # Run through a stand-in named claude, so tmux reports "claude" on Linux and macOS alike.
 stand_in_build "$tmp/bin" claude || { printf 'could not build the claude stand-in\n' >&2; exit 1; }
