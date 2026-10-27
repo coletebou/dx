@@ -99,6 +99,17 @@ rm -f "$tmp/lfs.log"
 PATH="$tmp/lfsbin:$PATH" git -C "$r" push -q origin master 2>/dev/null
 check "the push still runs git lfs pre-push" "git-lfs pre-push origin $tmp/lfs-history.git" "$(cat "$tmp/lfs.log" 2>&1)"
 
+echo "a repo whose LFS store lfs.storage moved"
+for store in "$tmp/lfs-elsewhere" lfs-moved; do
+  r="$(newrepo "lfs-store-${store##*/}")"
+  git -C "$r" config lfs.storage "$store"
+  if [[ "$store" == /* ]]; then mkdir -p "$store/objects"; else mkdir -p "$r/.git/$store/objects"; fi
+  rm -f "$tmp/lfs.log"
+  PATH="$tmp/lfsbin:$PATH" git -C "$r" push -q origin master 2>/dev/null
+  label="absolute"; [[ "$store" == /* ]] || label="relative, inside .git"
+  check "the push runs git lfs pre-push ($label)" "git-lfs pre-push origin $tmp/lfs-store-${store##*/}.git" "$(cat "$tmp/lfs.log" 2>&1)"
+done
+
 echo "a repo without LFS"
 r="$(newrepo plain)"
 rm -f "$tmp/lfs.log"
