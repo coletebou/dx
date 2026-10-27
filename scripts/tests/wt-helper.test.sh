@@ -95,6 +95,24 @@ assert_eq "$RC" "0" "a valid cached branch works"
 assert_eq "$(git -C "$TMP/clone" rev-parse --verify -q feat-b)" "$c2" "the valid cached dev is used, not origin/HEAD"
 assert_eq "$(cat "$(cache_file "$TMP/clone")")" "dev" "a valid cache is left alone"
 
+# "recreate" on a branch already in a worktree promises a clean worktree from the branch's tip, so a
+# local commit that was never pushed must survive it. The menu prompts on /dev/tty: a pseudo-terminal.
+if command -v python3 >/dev/null 2>&1; then
+  printf 'local\n' > "$TMP/clone/.claude/worktrees/feat-a/g"
+  G -C "$TMP/clone/.claude/worktrees/feat-a" add g
+  G -C "$TMP/clone/.claude/worktrees/feat-a" commit -qm unpushed
+  c3="$(git -C "$TMP/clone" rev-parse feat-a)"
+  printf '3\nyes\n' | (cd "$TMP/clone" && python3 -c 'import pty, sys; sys.exit(pty.spawn(sys.argv[1:]) >> 8)' \
+    "$WT" feat-a --no-cd) > "$TMP/tty.out" 2>&1
+  RC=$?
+  assert_eq "$RC" "0" "recreate succeeds"
+  assert_eq "$(git -C "$TMP/clone" rev-parse --verify -q feat-a)" "$c3" "recreate keeps the branch's unpushed commit"
+  assert_eq "$(git -C "$TMP/clone/.claude/worktrees/feat-a" rev-parse HEAD 2>&1)" "$c3" "...and the new worktree starts at that tip"
+  assert_eq "$(git -C "$TMP/clone/.claude/worktrees/feat-a" status --porcelain 2>&1)" "" "...clean"
+else
+  skip "python3 not installed (drives the recreate prompt on a pseudo-terminal)"
+fi
+
 # No origin: the cached name must be a local branch.
 G init -q "$TMP/local"
 : > "$TMP/local/f"

@@ -586,20 +586,17 @@ elif [[ -n "$EXISTING_WT" ]]; then
       TARGET="$(wt_resolve_target "$new_slug")"
       ;;
     3|recreate)
+      # A clean worktree on the same branch: the branch, its commits and its
+      # reflog stay; only the worktree (and what is uncommitted in it) goes.
+      tip="$(git rev-parse --short "refs/heads/$BRANCH" 2>/dev/null || echo '?')"
       say ""
       warn "This will:"
-      warn "  • git worktree remove --force $EXISTING_WT"
-      warn "  • git branch -D $BRANCH"
-      warn "  • recreate worktree at $TARGET from origin/$DEFAULT_BRANCH"
+      warn "  • git worktree remove --force $EXISTING_WT (its uncommitted changes are lost)"
+      warn "  • recreate the worktree at $TARGET from $BRANCH's tip ($tip); the branch and its commits stay"
       confirm=$(ask "Type 'yes' to proceed: ") || exit $?
       [[ "$confirm" == "yes" ]] || { err "Cancelled."; exit 1; }
       git worktree remove --force "$EXISTING_WT" >/dev/null 2>&1 || { err "Failed to remove existing worktree."; exit 1; }
-      git branch -D "$BRANCH" >/dev/null 2>&1 || true
-      if [[ $NO_FETCH -eq 0 ]]; then
-        git fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
-      fi
-      mode="create"
-      src_ref="origin/$DEFAULT_BRANCH"
+      mode="attach"
       ;;
     4|cancel|c|q) err "Cancelled."; exit 1 ;;
     *) err "Unknown choice."; exit 1 ;;
