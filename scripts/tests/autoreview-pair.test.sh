@@ -110,5 +110,23 @@ rc=0; (cd "$TMP" && "$PAIR" --mode local) > "$TMP/out" 2>&1 || rc=$?
 check "outside a git checkout is a usage error" '[[ "$rc" -eq 64 ]]'
 check "--help prints the header, usage included" '"$PAIR" --help | grep -q "^  autoreview-pair \[--out DIR\] \[--engines codex,claude\]"' "$("$PAIR" --help | head -5)"
 
+# Without AUTOREVIEW the helper is the installed skill: ~/.claude/skills first, then ~/.agents/skills, never a
+# repository path. The ~/.agents and checkout copies here would crash a review if they ran.
+unset AUTOREVIEW
+for p in .claude/skills .agents/skills code/agent-skills/skills; do
+    mkdir -p "$HOME/$p/autoreview/scripts" && cp "$TMP/fake-autoreview" "$HOME/$p/autoreview/scripts/autoreview"
+done
+printf 'import sys\nprint("fake: the wrong helper ran"); sys.exit(3)\n' > "$HOME/.agents/skills/autoreview/scripts/autoreview"
+printf 'import sys\nprint("fake: the wrong helper ran"); sys.exit(3)\n' > "$HOME/code/agent-skills/skills/autoreview/scripts/autoreview"
+rc=0; run --mode commit --commit HEAD || rc=$?
+check "without AUTOREVIEW, ~/.claude/skills/autoreview wins over ~/.agents and any checkout" '[[ "$rc" -eq 0 ]] && ! grep -q "wrong helper" "$TMP/out"' "rc=$rc; $(cat "$TMP/out")"
+cp "$TMP/fake-autoreview" "$HOME/.agents/skills/autoreview/scripts/autoreview"
+rm -rf "$HOME/.claude/skills/autoreview"
+rc=0; run --mode commit --commit HEAD || rc=$?
+check "then the shared ~/.agents/skills install" '[[ "$rc" -eq 0 ]]' "rc=$rc; $(cat "$TMP/out")"
+rm -rf "$HOME/.agents/skills/autoreview"
+rc=0; run --mode commit --commit HEAD || rc=$?
+check "only a repository copy left: helper not found (exit 2), the copy never ran" '[[ "$rc" -eq 2 ]] && grep -q "helper not found" "$TMP/out" && ! grep -q "wrong helper" "$TMP/out"' "rc=$rc; $(cat "$TMP/out")"
+
 printf '# %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

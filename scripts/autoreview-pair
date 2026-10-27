@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # autoreview-pair: the paired-review rule (base/claude/CLAUDE.base.md) as one command: Codex and Claude
-# as two independent runs of the autoreview skill's helper (openclaw/agent-skills), in parallel, over the
-# same scope.
+# as two independent runs of the autoreview skill's helper (plugins/review/skills/autoreview), in parallel,
+# over the same scope.
 #
 #   autoreview-pair [--out DIR] [--engines codex,claude] <helper arguments>
 #   autoreview-pair --mode branch --base origin/master --prompt "what to look for"
@@ -47,7 +47,10 @@ done
 
 helper="${AUTOREVIEW:-}"
 if [[ -z "$helper" ]]; then
-    for c in "$HOME/.agents/skills/autoreview/scripts/autoreview" "$HOME/.claude/skills/autoreview/scripts/autoreview"; do
+    # The installed skill, never a repository path: ~/.claude/skills/autoreview (install.sh --with review links
+    # it there), then the shared ~/.agents/skills/autoreview. ~/.claude goes first, so another install under
+    # ~/.agents (a different autoreview, for one) cannot win over the one linked for Claude Code.
+    for c in "$HOME/.claude/skills/autoreview/scripts/autoreview" "$HOME/.agents/skills/autoreview/scripts/autoreview"; do
         if [[ -f "$c" ]]; then helper="$c"; break; fi
     done
 fi
