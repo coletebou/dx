@@ -19,6 +19,10 @@ from unittest.mock import patch
 import warnings
 
 sys.dont_write_bytecode = True  # keep __pycache__ out of the skill directory
+try:
+    from PIL import Image
+except ImportError:  # the contact-sheet checks need Pillow, as the script does
+    Image = None
 SKILL = Path(__file__).resolve().parents[2] / "plugins/music-video/skills/music-video"
 SCRIPTS = SKILL / "scripts"
 
@@ -134,6 +138,23 @@ class MusicVideoTests(unittest.TestCase):
         self.assertEqual(load("gen_images", self.project, IMAGE_MODEL="img-x").MODEL, "img-x")
         self.assertEqual(load("gen_videos", self.project, VIDEO_MODEL="vid-x").MODEL, "vid-x")
         self.assertEqual(load("watch", self.project, WATCH_MODEL="watch-x", GOOGLE_API_KEY="k").MODEL, "watch-x")
+
+    @unittest.skipUnless(Image, "Pillow not installed")
+    def test_a_contact_sheet_renders_wherever_the_script_runs(self):
+        work = Path(self.temp.name) / "sheet"
+        (work / "out/frames").mkdir(parents=True)
+        for n in (1, 31):
+            Image.new("RGB", (64, 36), "navy").save(work / f"out/frames/f{n:05d}.jpg")
+        out = subprocess.run([sys.executable, "-B", str(SCRIPTS / "sheet_frames.py"), "0", "1", "1", "sheet.jpg", "2", "120"],
+                             cwd=work, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr[-400:])
+        self.assertEqual(Image.open(work / "sheet.jpg").size, (240, 67))
+
+    @unittest.skipUnless(Image, "Pillow not installed")
+    def test_the_sheet_labels_fall_back_to_a_built_in_font(self):
+        sheet = load("sheet_frames", self.project)
+        font = sheet.label_font([str(Path(self.temp.name) / "no-such-font.ttf")])
+        self.assertTrue(hasattr(font, "getbbox"), font)
 
     def test_documented_defaults_match_the_scripts(self):
         table = (SKILL / "references/pipeline.md").read_text()
