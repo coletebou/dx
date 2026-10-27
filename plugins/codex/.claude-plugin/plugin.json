@@ -1,0 +1,10 @@
+{
+  "name": "codex",
+  "description": "Work with OpenAI Codex CLI agents from Claude Code: fan out Codex subagents as interactive tmux panes or one-shot codex exec runs, with buffer-pasted briefings and a Claude fallback when Codex is unavailable (codex-subagents), and read what a Codex agent is really doing from its session transcript instead of its truncated pane (codex-transcripts)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cole Tebou"
+  },
+  "license": "MIT",
+  "keywords": ["claude-code", "codex", "tmux", "subagents", "transcripts"]
+}

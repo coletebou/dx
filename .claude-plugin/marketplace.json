@@ -36,6 +36,13 @@
       "version": "1.0.0",
       "source": "./plugins/memory",
       "category": "workflow"
+    },
+    {
+      "name": "codex",
+      "description": "Fan out Codex CLI subagents through tmux (codex-subagents) and read a Codex agent's real transcript instead of its truncated pane (codex-transcripts)",
+      "version": "1.0.0",
+      "source": "./plugins/codex",
+      "category": "workflow"
     }
   ]
 }
