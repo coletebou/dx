@@ -157,7 +157,9 @@ With a provider configured, `dotsync-commit-message` asks a model to describe th
 rewords this machine's unpublished commits that still carry a generic subject. Published history
 is never rewritten. A slow, failing or missing provider never blocks a sync: the generic subject
 stays (the timeout is `DOTSYNC_COMMIT_MESSAGE_TIMEOUT`, 20 s), and a transport failure pauses
-model calls for ten minutes.
+model calls for ten minutes. A command provider runs in a process group of its own: on its
+timeout, or when dotsync stops the helper, that whole group goes (TERM, then KILL two seconds
+later), so an agent it started never keeps working, or billing, after the call.
 
 | `DOTSYNC_COMMIT_MESSAGE_PROVIDER` | What it calls | Credential |
 |---|---|---|

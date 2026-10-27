@@ -17,7 +17,8 @@ Off by default. Providers (DOTSYNC_COMMIT_MESSAGE_PROVIDER):
   off        the default: generic subjects only
   command    DOTSYNC_COMMIT_MESSAGE_CMD runs through sh with the prompt (instructions, then the
              change summary) on stdin, and prints {"subject": ..., "details": [...]} or a plain
-             subject line (detail lines may follow, each starting with "- ")
+             subject line (detail lines may follow, each starting with "- "); on a timeout or a
+             cancellation its whole process group is stopped, whatever it started included
   anthropic  the Anthropic Messages API with ANTHROPIC_API_KEY
   bedrock    Amazon Bedrock Runtime with AWS_BEARER_TOKEN_BEDROCK (a Bedrock API key)
 Setting only DOTSYNC_COMMIT_MESSAGE_CMD selects `command`.
@@ -46,6 +47,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -445,21 +447,68 @@ def parse_text(text, plain=True):
     return lines[0], [line.strip()[2:] for line in lines[1:] if line.strip().startswith("- ")]
 
 
+class Cancelled(Exception):
+    """The helper was told to stop (dotsync's own timeout, or an interrupt)."""
+
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def stop_group(process):
+    """TERM the provider's process group, then KILL whatever is left of it, and reap the leader.
+
+    A provider is a shell that may start an agent, which may start more: all of them share the
+    group, and none may outlive the call (paid work included)."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def ask_command(summary, timeout):
     command = os.environ.get("DOTSYNC_COMMIT_MESSAGE_CMD", "").strip()
     if not command:
         raise ModelError("no DOTSYNC_COMMIT_MESSAGE_CMD")
     prompt = SYSTEM_PROMPT + "\n\n---\n\n" + summary + "\n"
     try:
-        result = subprocess.run(["/bin/sh", "-c", command], input=prompt.encode(), capture_output=True,
-                                timeout=timeout, start_new_session=True)
-    except subprocess.TimeoutExpired:
-        raise ModelError("command timed out", transient=True)
+        # Its own session, so the whole provider tree can be stopped without stopping this helper.
+        process = subprocess.Popen(["/bin/sh", "-c", command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as error:
         raise ModelError(type(error).__name__)
-    if result.returncode != 0:
-        raise ModelError("command exited %d" % result.returncode)
-    return parse_text(result.stdout.decode("utf-8", "replace")[:8192])
+
+    def cancelled(signum, _frame):
+        raise Cancelled(signum)
+    previous = {signum: signal.signal(signum, cancelled) for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        output, _ = process.communicate(input=prompt.encode(), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_group(process)
+        raise ModelError("command timed out", transient=True)
+    except Cancelled:
+        stop_group(process)
+        raise
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    # The leader exited; anything it left behind in its group goes too.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if process.returncode != 0:
+        raise ModelError("command exited %d" % process.returncode)
+    return parse_text(output.decode("utf-8", "replace")[:8192])
 
 
 def ask(summary, secret, timeout, retries=0):
@@ -745,6 +794,9 @@ def main(argv):
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
+    except Cancelled as stop:
+        log_event("cancelled by signal %d; the provider was stopped" % stop.signum)
+        sys.exit(128 + stop.signum)
     except RuntimeError as error:
         print("dotsync-commit-message: %s" % error, file=sys.stderr)
         sys.exit(1)

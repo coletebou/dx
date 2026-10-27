@@ -301,6 +301,55 @@ class CommitMessageTest(unittest.TestCase):
         self.assertEqual(slow.stdout, "chore(sync): box-a update scripts\n", slow.stderr)
         self.assertLess(time.monotonic() - started, 10)
 
+    # ── a command provider that outlives its welcome ──
+    def slow_provider(self):
+        """A provider that starts a TERM-ignoring child (an agent, say) and waits on it."""
+        pidfile = self.root / "provider-child.pid"
+        script = self.root / "provider.sh"
+        script.write_text("#!/bin/sh\ncat >/dev/null\n( trap '' TERM; exec sleep 120 ) &\necho $! > %s\nwait\n" % pidfile)
+        script.chmod(0o755)
+        env = dict(self.env, DOTSYNC_COMMIT_MESSAGE_PROVIDER="command", DOTSYNC_COMMIT_MESSAGE_CMD=str(script))
+        return pidfile, env
+
+    def child_pid(self, pidfile, seconds=60):
+        deadline = time.monotonic() + seconds
+        while not (pidfile.exists() and pidfile.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        pid = int(pidfile.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(pid)], capture_output=True))
+        return pid
+
+    def gone_within(self, pid, seconds=20):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+            if state == "" or state.startswith("Z"):
+                return True
+            time.sleep(0.2)
+        return False
+
+    def test_a_provider_that_times_out_is_stopped_with_everything_it_started(self):
+        self.write("scripts/tool", "change\n")
+        self.git("add", "-A")
+        pidfile, env = self.slow_provider()
+        result = self.helper("describe", "--host", "box-a", "--staged", "--timeout", "3", env=env)
+        self.assertEqual((result.returncode, result.stdout), (3, ""))
+        self.assertTrue(self.gone_within(self.child_pid(pidfile)), "the provider's child outlived the timeout")
+        self.assertIn("command timed out", (self.state / "commit-message.log").read_text())
+
+    def test_a_cancelled_helper_stops_its_provider(self):
+        self.write("scripts/tool", "change\n")
+        self.git("add", "-A")
+        pidfile, env = self.slow_provider()
+        helper = subprocess.Popen([sys.executable, str(HELPER), "describe", "--host", "box-a", "--staged", "--timeout", "100"],
+                                  cwd=self.repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pid = self.child_pid(pidfile)
+        helper.terminate()  # what dotsync's own timeout sends
+        out, _ = helper.communicate(timeout=30)
+        self.assertNotEqual(helper.returncode, 0)
+        self.assertEqual(out, b"")
+        self.assertTrue(self.gone_within(pid), "the provider's child outlived the cancelled helper")
+
     # ── composing and redaction ──
     def test_generic_subjects_and_hosts(self):
         self.assertTrue(cm.is_generic("chore(sync): box-a update base, scripts"))
