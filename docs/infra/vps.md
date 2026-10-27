@@ -51,6 +51,11 @@ rule into full root. The journal group covers reading logs.
 Then join the tailnet ([tailscale.md](tailscale.md), Joining a machine) and confirm
 `ssh box-a true` works over it from another machine before you touch sshd or the firewall.
 
+For the rest of the box (packages, system limits, Docker, the pinned tools, this repo's dotfiles,
+and the tailnet join itself), the provisioner does it in one run as `admin`:
+`bootstrap.sh --provision` ([../bootstrap.md](../bootstrap.md)). It leaves accounts, sshd and the
+firewall to this page.
+
 ## SSH and the firewall
 
 ```text

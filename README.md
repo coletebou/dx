@@ -21,15 +21,34 @@ Plugins bring their own CLIs: Claude Code puts a plugin's `bin/` on the Bash too
 the plugin is enabled. A few skills drive CLIs that live in the dotfiles part of this repo; each
 plugin's README says which.
 
-**The whole setup.** On macOS or Linux:
+**The whole setup.** On macOS, Debian or Ubuntu, one line installs git if it is missing, clones
+this repo to `~/.dotfiles` and shows every change the installer would make, making none:
 
 ```bash
-git clone https://github.com/coletebou/dx ~/.dotfiles
-cd ~/.dotfiles
-./install.sh --list                  # what each component installs
-./install.sh --all --dry-run         # every change it would make, making none
-./install.sh --all                   # or --with shell,git,tmux,claude,...
+curl -fsSL https://raw.githubusercontent.com/coletebou/dx/master/bootstrap.sh | bash
 ```
+
+Then apply it, all of it or some components:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/coletebou/dx/master/bootstrap.sh | bash -s -- --install
+bash ~/.dotfiles/bootstrap.sh --with shell,git,tmux     # the same, from the checkout
+~/.dotfiles/install.sh --list                           # what each component installs
+```
+
+**A server.** On a fresh Debian or Ubuntu box, `--provision` first sets the box up (packages,
+system limits, Docker, pinned and checksum-verified tools, optional AWS CLI, Terraform and
+Tailscale, local NVMe when there is some), then installs:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/coletebou/dx/master/bootstrap.sh \
+  | bash -s -- --provision --install -- --hostname box-a
+```
+
+It also runs from cloud-init user-data, and takes an overlay of your own private hooks.
+[docs/bootstrap.md](docs/bootstrap.md) has every option; [docs/infra/vps.md](docs/infra/vps.md)
+covers the accounts, SSH and firewall around it. Prefer to read before you run?
+`git clone https://github.com/coletebou/dx ~/.dotfiles`, then `./install.sh --all --dry-run`.
 
 The installer links files into your home directory. Anything it would replace is moved to
 `~/.dotfiles-backup/<time>/` first, with a log of every change, and a second run changes nothing.
@@ -128,12 +147,15 @@ node-tools/                       the pinned global Node CLIs (package.json and 
 launchagents/, systemd/user/      schedule templates
 docs/                             handoff chains, hooks, memory, workflow, infrastructure
 install.sh                        the installer
+bootstrap.sh                      the one-line bootstrap (clone, then install.sh)
+scripts/bootstrap/                the server provisioner, its modules and pinned versions
 ```
 
 ## Docs
 
 | Doc | What it covers |
 |---|---|
+| [Bootstrapping a machine](docs/bootstrap.md) | the one-line install, provisioning a server (phases, pinned tools, modules, instance-store NVMe), cloud-init, overlays |
 | [dotsync](docs/dotsync.md) | keeping one dotfiles checkout in sync across machines: setup for two machines, the peers file, hooks, commit-message providers, status and doctor, safety properties |
 | [Running fleets of agents](docs/workflow/README.md) | coordinator and worker roles, briefs and handoffs, lane terms, parallel worktrees, review before ship, publishing through a scrub gate |
 | [Handoff chains](docs/handoff.md) | how `cc-handoff` moves a long session into a fresh one, on this machine or another |
