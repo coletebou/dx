@@ -268,6 +268,24 @@ equal "--prune keeps an install a tool started through an alias of a published c
   "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
 stop_consumers
 
+# macOS lists processes with ps, whose command lines arrive as single strings: a prefix with a
+# space in it (~/Library/Application Support/...) must still match. NODE_TOOLS_PROC_SOURCE=ps
+# makes Linux read processes the macOS way.
+if command -v lsof >/dev/null 2>&1; then
+  q="$tmp/with space/pq"
+  step "$q" 4.0.1
+  oldest="$(readlink "$q/node-tools-current")"
+  consume "$q/$oldest/node_modules/@scope/beta/cli.js"
+  step "$q" 4.0.2
+  step "$q" 4.0.3
+  NODE_TOOLS_PROC_SOURCE="ps" run "$tmp/s-4.0.3" "$q" --prune
+  equal "with ps, --prune keeps an install under a prefix with a space that a tool runs from" "yes" \
+    "$([[ -e "$q/$oldest" ]] && echo yes || echo no)"
+  stop_consumers
+else
+  ok "# SKIP lsof not installed (the ps listing pairs with it)"
+fi
+
 echo "usage"
 run "$tmp/src" "$p" --bogus
 equal "an unknown flag is a usage error" 2 "$rc"

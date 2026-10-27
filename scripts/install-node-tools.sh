@@ -225,7 +225,7 @@ delete_owned_path() {
 # Fails when the processes cannot be listed.
 installs_in_use() {
     # The paths go in the environment: in argv, this helper would count as a process using them.
-    NT_ROOT="$INSTALL_ROOT" NT_BIN="$BIN_DIR" NT_TARGET="$TARGET" node - <<'NODE'
+    NT_ROOT="$INSTALL_ROOT" NT_BIN="$BIN_DIR" NT_TARGET="$TARGET" NT_PROCS="${NODE_TOOLS_PROC_SOURCE:-}" node - <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
@@ -233,14 +233,18 @@ const { NT_ROOT: root, NT_BIN: binDir, NT_TARGET: target } = process.env;
 const real = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
 const installs = fs.readdirSync(root).filter((n) => !n.startsWith(".")).map((n) => path.join(root, n));
 const homes = installs.map((i) => [i, real(i) || i]);
-const argvs = [], places = [];
-if (fs.existsSync("/proc/self/cmdline")) {  // Linux: exact argv, cwd and executable per process
+const argvs = [], lines = [], places = [];  // exact argv (Linux), whole command lines (ps), cwd/exe paths
+if (process.env.NT_PROCS !== "ps" && fs.existsSync("/proc/self/cmdline")) {  // Linux: exact argv, cwd and executable per process
   for (const pid of fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n))) {
     try { argvs.push(fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0")); } catch {}
     for (const link of ["cwd", "exe"]) { try { places.push(fs.readlinkSync(`/proc/${pid}/${link}`)); } catch {} }
   }
-} else {  // macOS: ps for argv (split on spaces), lsof for working directories and executables
+} else {  // macOS: ps for command lines, lsof for working directories and executables
   for (const line of execFileSync("ps", ["-A", "-ww", "-o", "command="], { encoding: "utf8" }).split("\n")) {
+    // A ps line joins argv with spaces, so a path holding a space cannot be split back out of
+    // it: whole paths are looked for in the line below, and its space-separated words are only
+    // a best effort at the paths to follow through their symlinks.
+    lines.push(line);
     argvs.push(line.trim().split(/\s+/));
   }
   let out;
@@ -279,6 +283,13 @@ for (const argv of argvs) {
       if (tok.startsWith("/")) walk(tok);
     }
   }
+}
+// Whole paths anywhere in a command line: a prefix such as ~/Library/Application Support/... holds
+// a space, which splits it across two of the line's words.
+const mentions = (text, dir) => text.includes(dir + "/") || text.endsWith(dir) || text.includes(dir + " ");
+for (const text of lines.concat(argvs.flat())) {
+  if ([binDir, target, binReal, targetReal].some((d) => mentions(text, d))) all = true;
+  for (const [i, ir] of homes) if (mentions(text, i) || mentions(text, ir)) used.add(i);
 }
 for (const p of places) for (const [i, ir] of homes) if (inside(p, i) || inside(p, ir)) used.add(i);
 process.stdout.write(all ? "*\n" : [...used].map((i) => i + "\n").join(""));
