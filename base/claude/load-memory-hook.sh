@@ -16,9 +16,11 @@ set -euo pipefail
 # Resolve the same auto-memory dir Claude Code reads/writes.
 # Precedence mirrors the CLI: an `autoMemoryDirectory` override in
 # local/user settings wins (used LITERALLY — no per-cwd slug appended);
-# otherwise fall back to the default ~/.claude/projects/<sanitized-cwd>/memory
-# (worktrees map to the main worktree's dir).
-sanitize() { echo "$1" | sed 's|^/||' | tr '/' '-'; }
+# otherwise fall back to the default ~/.claude/projects/<encoded-cwd>/memory
+# (worktrees map to the main worktree's dir). Claude Code encodes the path by
+# turning every character that is not a letter or digit into "-", so
+# /home/me/.dotfiles is -home-me--dotfiles.
+encode() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
 
 # Read autoMemoryDirectory from local then project then user settings (jq if available).
 AUTO_MEM_DIR=""
@@ -48,9 +50,9 @@ else
   if [ -n "$GIT_COMMON" ] && [ "$GIT_COMMON" != ".git" ]; then
     # Worktree: resolve main repo root from the shared .git dir
     MAIN_ROOT=$(cd "$(dirname "$GIT_COMMON")" 2>/dev/null && pwd)
-    MEMORY_DIR="$HOME/.claude/projects/-$(sanitize "$MAIN_ROOT")/memory"
+    MEMORY_DIR="$HOME/.claude/projects/$(encode "$MAIN_ROOT")/memory"
   else
-    MEMORY_DIR="$HOME/.claude/projects/-$(sanitize "$PWD")/memory"
+    MEMORY_DIR="$HOME/.claude/projects/$(encode "$PWD")/memory"
   fi
 fi
 
