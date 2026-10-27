@@ -1,0 +1,94 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A superseded pull request run is cancelled; a push run never is, so every pushed range is scanned.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Ubuntu's apt ShellCheck is 0.9; the sum is the v0.11.0 release asset's digest.
+      - name: Install ShellCheck 0.11.0, zsh, jq and ruff
+        run: |
+          dir="$RUNNER_TEMP/shellcheck"
+          curl -fsSL --retry 3 -o "$dir.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $dir.tar.xz" | sha256sum -c -
+          mkdir -p "$dir"
+          tar -xJf "$dir.tar.xz" -C "$dir" --strip-components=1 shellcheck-v0.11.0/shellcheck
+          echo "$dir" >> "$GITHUB_PATH"
+          sudo apt-get update && sudo apt-get install -y zsh jq
+          python -m pip install ruff==0.17.2
+      - name: Lint (ShellCheck, zsh -n, ruff, jq)
+        run: bash scripts/tests/lint.sh
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The sum is the one in the v8.30.1 release's checksums file.
+      - name: Install gitleaks 8.30.1
+        run: |
+          tgz="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL --retry 3 -o "$tgz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Scan every commit
+        run: gitleaks git . --redact --no-banner
+
+  suites:
+    name: suites (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install tmux, zsh and jq
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            brew install tmux jq
+          else
+            sudo apt-get update && sudo apt-get install -y tmux zsh jq
+          fi
+          # Suites that commit set their own identity; this covers any that rely on the global one.
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          git config --global init.defaultBranch master
+      - name: Versions
+        run: |
+          bash --version | head -n 1
+          tmux -V
+          zsh --version
+          jq --version
+          git --version
+          python3 --version
+          node --version
+      # Includes install.test.sh: a dry run, then a real install into a throwaway HOME.
+      - name: Every suite
+        run: bash scripts/tests/run-all.sh
