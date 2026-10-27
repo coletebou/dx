@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: send-to-primary --pane TARGET [--tmux-host HOST]
+                       [--client claude|codex]
+
+Read a message from stdin and relay it to an active Claude/Codex tmux pane.
+Refuses targets that look like ordinary shell panes.
+EOF
+}
+
+pane=""
+tmux_host=""
+requested_client=""
+while (($#)); do
+  case "$1" in
+    --pane)
+      pane="${2:?missing value for --pane}"
+      shift 2
+      ;;
+    --tmux-host)
+      tmux_host="${2:?missing value for --tmux-host}"
+      shift 2
+      ;;
+    --client)
+      requested_client="${2:?missing value for --client}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$requested_client" && "$requested_client" != "claude" && "$requested_client" != "codex" ]]; then
+  echo "--client must be claude or codex" >&2
+  exit 2
+fi
+
+message="$(cat)"
+[[ -n "$message" ]] || {
+  echo "Provide a non-empty message on stdin" >&2
+  exit 1
+}
+
+[[ -n "$pane" ]] || {
+  echo "--pane is required" >&2
+  exit 1
+}
+
+remote_command() {
+  local command=""
+  local arg
+  for arg in "$@"; do
+    printf -v command '%s %q' "$command" "$arg"
+  done
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$tmux_host" "${command# }"
+}
+
+tmux_run() {
+  if [[ -z "$tmux_host" || "$tmux_host" == "local" || "$tmux_host" == "localhost" ]]; then
+    tmux "$@"
+  else
+    remote_command tmux "$@"
+  fi
+}
+
+target_kind=""
+guard_agent_target() {
+  local command_name
+  local visible
+  local last_nonblank
+  command_name="$(tmux_run display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null || true)"
+  [[ -n "$command_name" ]] || {
+    echo "Target pane is unavailable: $pane" >&2
+    return 1
+  }
+
+  case "$command_name" in
+    sh|bash|zsh|fish|dash|ksh)
+      echo "Refusing relay: pane $pane is at a $command_name shell" >&2
+      return 1
+      ;;
+    claude)
+      if [[ -n "$requested_client" && "$requested_client" != "claude" ]]; then
+        echo "Refusing relay: pane $pane runs Claude but --client=$requested_client" >&2
+        return 1
+      fi
+      target_kind="claude"
+      return 0
+      ;;
+    codex)
+      if [[ -n "$requested_client" && "$requested_client" != "codex" ]]; then
+        echo "Refusing relay: pane $pane runs Codex but --client=$requested_client" >&2
+        return 1
+      fi
+      target_kind="codex"
+      return 0
+      ;;
+  esac
+
+  if [[ -z "$requested_client" ]]; then
+    echo "Refusing relay: pane $pane runs $command_name; pass --client claude or --client codex for a wrapped/SSH agent" >&2
+    return 1
+  fi
+
+  target_kind="$requested_client"
+  visible="$(tmux_run capture-pane -p -t "$pane" 2>/dev/null || true)"
+  last_nonblank="$(sed '/^[[:space:]]*$/d' <<<"$visible" | tail -n 1 || true)"
+  if [[ "$target_kind" == "claude" ]]; then
+    if grep -Eq '^[[:space:]│]*❯|Ebbing|esc to interrupt' <<<"$visible" \
+      && grep -Eq '⏸ plan mode|shift\+tab to cycle|· /effort' <<<"$last_nonblank"; then
+      return 0
+    fi
+  elif grep -Eq '^[[:space:]]*›|Working \(' <<<"$visible" \
+    && grep -Eq '^[[:space:]]*gpt-[^[:space:]]+ .* · .* · gpt-' <<<"$last_nonblank"; then
+      return 0
+  fi
+
+  echo "Refusing relay: pane $pane runs $command_name but its current live composer/status does not match --client=$target_kind" >&2
+  return 1
+}
+
+guard_agent_target || exit 1
+
+buffer="fable-to-primary-$$-$RANDOM"
+printf '[Fable advisor] %s' "$message" | tmux_run load-buffer -b "$buffer" -
+if ! guard_agent_target; then
+  tmux_run delete-buffer -b "$buffer" 2>/dev/null || true
+  exit 1
+fi
+tmux_run paste-buffer -p -d -b "$buffer" -t "$pane"
+
+# Let the target TUI ingest the paste before submitting. Sending Enter
+# immediately after paste-buffer races the ingest — especially for a multi-KB
+# message while the agent is mid-turn — and the composer keeps the text unsent
+# (Codex parks it under a "tab to queue message" hint).
+sleep 0.5
+if ! guard_agent_target; then
+  # Bracketed paste keeps multiline relay text queued if the TUI has exited.
+  # C-c also travels through SSH, clearing it at a remote shell prompt.
+  tmux_run send-keys -t "$pane" C-c
+  echo "Relay aborted after target changed; any queued relay input was cancelled" >&2
+  exit 1
+fi
+tmux_run send-keys -t "$pane" Enter
+
+# Verify the composer actually submitted, and retry Enter only while the pane
+# still passes the agent guard. Codex shows "tab to queue message" while unsent
+# text sits in the composer. Claude submission is confirmed only when its last
+# `❯` composer line is empty.
+submitted="unconfirmed"
+for _ in 1 2 3 4; do
+  sleep 0.5
+  tail_text="$(tmux_run capture-pane -p -t "$pane" -S -20 2>/dev/null || true)"
+  if [[ "$target_kind" == "codex" ]]; then
+    if ! grep -q 'tab to queue message' <<<"$tail_text"; then
+      submitted="yes"
+      break
+    fi
+  else
+    composer_prompt="$(grep -E '^[[:space:]│]*❯' <<<"$tail_text" | tail -n 1 || true)"
+    if [[ -n "$composer_prompt" ]] && grep -Eq '^[[:space:]│]*❯([[:space:]]| )*[│]?$' <<<"$composer_prompt"; then
+      submitted="yes"
+      break
+    fi
+  fi
+  guard_agent_target || break
+  tmux_run send-keys -t "$pane" Enter
+done
+
+printf 'relayed_to=%s\n' "$pane"
+printf 'submitted=%s\n' "$submitted"

@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ask-fable start [--long-running] [--session NAME] [--source-pane TARGET]
+                  [--source-client claude|codex] [--tmux-host HOST]
+                  [--cwd DIR] [--window NAME]
+  ask-fable ask [--advisor-pane TARGET]
+  ask-fable check [--advisor-pane TARGET]
+  ask-fable capture [--advisor-pane TARGET]
+  ask-fable status
+  ask-fable stop
+
+`start` and `ask` read their prompt from stdin. With --long-running, the helper
+records the Fable advisor and primary source pane for later ask/capture calls.
+
+Environment:
+  FABLE_LAUNCH_CMD  what to type in the new window to start the advisor
+                    (default: claude), e.g. 'claude --model <model>' or a
+                    launcher function from your shell
+  FABLE_RELAY       the send-to-primary command the advisor runs (default:
+                    the one next to this script; with --tmux-host, the
+                    install.sh location ~/.claude/skills/fable-second-opinion/
+                    scripts/send-to-primary on that host)
+EOF
+}
+
+action="start"
+if (($#)) && [[ "$1" =~ ^(start|ask|check|capture|status|stop)$ ]]; then
+  action="$1"
+  shift
+fi
+
+session=""
+tmux_host=""
+cwd="$PWD"
+cwd_explicit=0
+window="fable-opinion-$(date +%H%M%S)"
+source_pane=""
+source_client=""
+advisor_pane=""
+long_running=0
+state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/fable-second-opinion"
+state_file="$state_dir/current"
+launch_cmd="${FABLE_LAUNCH_CMD:-claude}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+while (($#)); do
+  case "$1" in
+    --session)
+      session="${2:?missing value for --session}"
+      shift 2
+      ;;
+    --source-pane)
+      source_pane="${2:?missing value for --source-pane}"
+      shift 2
+      ;;
+    --source-client)
+      source_client="${2:?missing value for --source-client}"
+      shift 2
+      ;;
+    --tmux-host)
+      tmux_host="${2:?missing value for --tmux-host}"
+      shift 2
+      ;;
+    --advisor-pane)
+      advisor_pane="${2:?missing value for --advisor-pane}"
+      shift 2
+      ;;
+    --cwd)
+      cwd="${2:?missing value for --cwd}"
+      cwd_explicit=1
+      shift 2
+      ;;
+    --window)
+      window="${2:?missing value for --window}"
+      shift 2
+      ;;
+    --long-running)
+      long_running=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$source_client" && "$source_client" != "claude" && "$source_client" != "codex" ]]; then
+  echo "--source-client must be claude or codex" >&2
+  exit 2
+fi
+
+# The relay command the advisor types. It runs where the advisor runs: on this
+# machine, the send-to-primary next to this script; on a --tmux-host, the
+# install.sh location there (left unquoted so its ~ expands on that host).
+relay_cmd() {
+  if [[ -n "${FABLE_RELAY:-}" ]]; then
+    printf '%q' "$FABLE_RELAY"
+  elif [[ -z "$tmux_host" || "$tmux_host" == "local" || "$tmux_host" == "localhost" ]]; then
+    printf '%q' "$here/send-to-primary"
+  else
+    # shellcheck disable=SC2088  # the ~ is for the advisor's shell on that host
+    printf '%s' '~/.claude/skills/fable-second-opinion/scripts/send-to-primary'
+  fi
+}
+
+input_prompt=""
+if [[ "$action" == "start" || "$action" == "ask" ]]; then
+  input_prompt="$(cat)"
+fi
+
+remote_command() {
+  local command=""
+  local arg
+  for arg in "$@"; do
+    printf -v command '%s %q' "$command" "$arg"
+  done
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$tmux_host" "${command# }"
+}
+
+tmux_run() {
+  if [[ -z "$tmux_host" || "$tmux_host" == "local" || "$tmux_host" == "localhost" ]]; then
+    tmux "$@"
+  else
+    remote_command tmux "$@"
+  fi
+}
+
+if [[ -z "$tmux_host" || "$tmux_host" == "local" || "$tmux_host" == "localhost" ]]; then
+  command -v tmux >/dev/null 2>&1 || {
+    echo "tmux is required" >&2
+    exit 1
+  }
+else
+  remote_command command -v tmux >/dev/null 2>&1 || {
+    echo "tmux is unavailable on host: $tmux_host" >&2
+    exit 1
+  }
+fi
+
+# tmux 3.4's display-message exits 0 with empty output for a pane that is gone,
+# so a pane counts as alive only when it prints its own id back.
+pane_alive() {
+  [[ "$(tmux_run display-message -p -t "$1" '#{pane_id}' 2>/dev/null || true)" == "$1" ]]
+}
+
+state_value() {
+  local key="$1"
+  [[ -f "$state_file" ]] || return 1
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$state_file"
+}
+
+load_advisor() {
+  if [[ -z "$tmux_host" ]]; then
+    tmux_host="$(state_value tmux_host || true)"
+  fi
+  if [[ -z "$advisor_pane" ]]; then
+    advisor_pane="$(state_value advisor_pane || true)"
+  fi
+  [[ -n "$advisor_pane" ]] || {
+    echo "No long-running Fable advisor is recorded" >&2
+    exit 1
+  }
+  pane_alive "$advisor_pane" || {
+    echo "Recorded Fable pane is no longer available: $advisor_pane" >&2
+    exit 1
+  }
+}
+
+send_prompt() {
+  local pane="$1"
+  local text="$2"
+  local buffer="fable-second-opinion-$$-$RANDOM"
+  printf '%s' "$text" | tmux_run load-buffer -b "$buffer" -
+  tmux_run paste-buffer -p -d -b "$buffer" -t "$pane"
+
+  # Give Claude Code time to ingest the tmux paste before submitting. Without
+  # this delay, Enter can race the paste expansion and leave one or more
+  # "[Pasted text #N]" chips sitting unsent in the composer.
+  sleep 0.5
+
+  local submitted="unconfirmed"
+  local snapshot
+  local composer_prompt
+  for _ in 1 2 3 4; do
+    tmux_run send-keys -t "$pane" Enter
+    sleep 0.5
+    snapshot="$(tmux_run capture-pane -p -t "$pane" -S -20 2>/dev/null || true)"
+    composer_prompt="$(grep -E '^[[:space:]│]*❯' <<<"$snapshot" | tail -n 1 || true)"
+
+    # Inspect the LAST prompt glyph, which is Claude Code's current composer.
+    # A submitted paste remains visible above it in the transcript, including
+    # its "[Pasted text #N]" marker and "paste again to expand" hint, so
+    # searching the whole pane for those strings produces false negatives.
+    # Submission is confirmed only when the current composer prompt is empty.
+    if [[ -n "$composer_prompt" ]] && grep -Eq '^[[:space:]│]*❯([[:space:]]| )*[│]?$' <<<"$composer_prompt"; then
+      submitted="yes"
+      break
+    fi
+  done
+
+  printf 'submitted=%s\n' "$submitted"
+  if [[ "$submitted" != "yes" ]]; then
+    echo "Fable prompt remained in the composer after four submit attempts: $pane" >&2
+    return 1
+  fi
+}
+
+case "$action" in
+  ask|check)
+    load_advisor
+    if [[ "$action" == "check" ]]; then
+      prompt="Review the current primary-pane progress now. Send back only material risks, corrections, a useful next probe if stuck, or a concise confirmation if the approach remains sound."
+    else
+      prompt="$input_prompt"
+      [[ -n "$prompt" ]] || {
+        echo "Provide a non-empty prompt on stdin" >&2
+        exit 1
+      }
+    fi
+    recorded_source_pane="$(state_value source_pane || true)"
+    recorded_source_target="$(state_value source_target || true)"
+    recorded_source_client="$(state_value source_client || true)"
+    relay_client_option=""
+    if [[ -n "$recorded_source_client" ]]; then
+      relay_client_option=" --client '${recorded_source_client}'"
+    fi
+    reminder="Before answering, refresh the primary session context with: tmux capture-pane -p -t '${recorded_source_pane}' -S -500. The primary target is ${recorded_source_target}. Answer by sending a concise prefixed message through: printf '%s\\n' '<your advice>' | $(relay_cmd) --pane '${recorded_source_pane}'${relay_client_option}. Use only that guarded relay; it prints submitted=yes when the message left the composer. If delivery is unconfirmed or refused, capture the pane and report the failure instead of using raw tmux send-keys—the target may have returned to a shell. Do not mutate files, Git, services, or external state. Follow-up question: ${prompt}"
+    send_prompt "$advisor_pane" "$reminder"
+    printf 'advisor_pane=%s\n' "$advisor_pane"
+    exit 0
+    ;;
+  capture)
+    load_advisor
+    tmux_run capture-pane -p -t "$advisor_pane" -S -320
+    exit 0
+    ;;
+  status)
+    if [[ ! -f "$state_file" ]]; then
+      echo "No long-running Fable advisor is recorded"
+      exit 1
+    fi
+    cat "$state_file"
+    if [[ -z "$tmux_host" ]]; then
+      tmux_host="$(state_value tmux_host || true)"
+    fi
+    recorded_advisor="$(state_value advisor_pane || true)"
+    if [[ -n "$recorded_advisor" ]] && pane_alive "$recorded_advisor"; then
+      echo "alive=true"
+    else
+      echo "alive=false"
+    fi
+    exit 0
+    ;;
+  stop)
+    load_advisor
+    advisor_target="$(state_value advisor_target || true)"
+    if [[ -n "$advisor_target" ]]; then
+      tmux_run kill-window -t "$advisor_target"
+    else
+      tmux_run kill-pane -t "$advisor_pane"
+    fi
+    rm -f "$state_file"
+    echo "Stopped Fable advisor"
+    exit 0
+    ;;
+esac
+
+prompt="$input_prompt"
+if [[ -z "$prompt" && "$long_running" -ne 1 ]]; then
+  echo "Provide a non-empty prompt on stdin" >&2
+  exit 1
+fi
+
+if [[ -z "$session" && ( -z "$tmux_host" || "$tmux_host" == "local" || "$tmux_host" == "localhost" ) && -n "${TMUX:-}" ]]; then
+  session="$(tmux display-message -p '#{session_name}')"
+fi
+
+if [[ -z "$session" ]]; then
+  session="$(tmux_run list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null | awk '$2 > 0 { print $1; exit }')"
+fi
+
+if [[ -z "$session" ]]; then
+  session="$(tmux_run list-sessions -F '#{session_name}' 2>/dev/null | head -n 1 || true)"
+fi
+
+if [[ -n "$session" ]] && ! tmux_run has-session -t "$session" 2>/dev/null; then
+  echo "tmux session not found: $session" >&2
+  exit 1
+fi
+
+if [[ -z "$source_pane" && ( -z "$tmux_host" || "$tmux_host" == "local" || "$tmux_host" == "localhost" ) && -n "${TMUX_PANE:-}" ]]; then
+  source_pane="$TMUX_PANE"
+fi
+
+if [[ -z "$source_pane" && -n "$session" ]]; then
+  source_pane="$(tmux_run display-message -p -t "$session" '#{pane_id}' 2>/dev/null || true)"
+fi
+
+if [[ "$long_running" -eq 1 && -z "$source_pane" ]]; then
+  echo "Long-running mode requires a primary tmux pane; pass --source-pane TARGET" >&2
+  exit 1
+fi
+
+if [[ "$long_running" -eq 1 ]]; then
+  source_command="$(tmux_run display-message -p -t "$source_pane" '#{pane_current_command}' 2>/dev/null || true)"
+  if [[ -z "$source_client" ]]; then
+    case "$source_command" in
+      claude|codex)
+        source_client="$source_command"
+        ;;
+      *)
+        echo "Cannot infer the primary client through $source_command; pass --source-client claude or --source-client codex" >&2
+        exit 1
+        ;;
+    esac
+  elif [[ "$source_command" == "claude" || "$source_command" == "codex" ]] && [[ "$source_command" != "$source_client" ]]; then
+    echo "Primary pane runs $source_command but --source-client=$source_client" >&2
+    exit 1
+  fi
+fi
+
+source_target=""
+if [[ -n "$source_pane" ]]; then
+  source_target="$(tmux_run display-message -p -t "$source_pane" '#{session_name}:#{window_index}' 2>/dev/null || true)"
+fi
+
+if [[ "$cwd_explicit" -eq 0 && -n "$source_pane" && -n "$tmux_host" && "$tmux_host" != "local" && "$tmux_host" != "localhost" ]]; then
+  cwd="$(tmux_run display-message -p -t "$source_pane" '#{pane_current_path}' 2>/dev/null || true)"
+fi
+
+if [[ -z "$cwd" ]]; then
+  echo "Could not determine a working directory on tmux host ${tmux_host:-local}; pass --cwd DIR" >&2
+  exit 1
+fi
+
+if [[ -z "$tmux_host" || "$tmux_host" == "local" || "$tmux_host" == "localhost" ]]; then
+  [[ -d "$cwd" ]] || {
+    echo "Working directory not found: $cwd" >&2
+    exit 1
+  }
+elif ! remote_command test -d "$cwd"; then
+  echo "Working directory not found on $tmux_host: $cwd" >&2
+  exit 1
+fi
+
+if [[ -z "$session" ]]; then
+  session="fable-review"
+  created="$(tmux_run new-session -d -P -F '#{window_index} #{pane_id}' -s "$session" -n "$window" -c "$cwd")"
+else
+  created="$(tmux_run new-window -d -P -F '#{window_index} #{pane_id}' -t "$session:" -n "$window" -c "$cwd")"
+fi
+
+read -r window_index advisor_pane <<<"$created"
+advisor_target="$session:$window_index"
+
+tmux_run send-keys -t "$advisor_pane" "$launch_cmd" Enter
+
+ready=0
+for _ in {1..60}; do
+  # Avoid `grep -q` directly on the remote tmux stream: with `pipefail`, grep's
+  # early exit can SIGPIPE ssh and make a successful match look like failure.
+  startup_snapshot="$(tmux_run capture-pane -p -t "$advisor_pane" -S -80 2>/dev/null || true)"
+  if grep -q 'Claude Code v' <<<"$startup_snapshot"; then
+    ready=1
+    break
+  fi
+  sleep 0.5
+done
+
+if [[ "$ready" -ne 1 ]]; then
+  echo "Fable did not become ready within 30 seconds; inspect $advisor_target ($advisor_pane)" >&2
+  exit 1
+fi
+
+if [[ "$long_running" -eq 1 ]]; then
+  initial="${prompt:-Stand by as a session-long advisor. Read the primary pane and proactively relay material findings while remaining available for follow-up questions.}"
+  submitted="You are a long-running independent Fable advisor. The primary work is in tmux pane ${source_pane:-unknown}, target ${source_target:-unknown}. Keep an eye on the primary agent during active reviews: refresh context before every answer and re-check it when useful with: tmux capture-pane -p -t '${source_pane:-unknown}' -S -500. You may inspect that pane and relevant read-only files. You are explicitly authorized and encouraged to send unsolicited advice back to the primary agent without waiting for a follow-up when you find a material error, risk, missing check, useful next probe, or completed answer. Send it with: printf '%s\\n' '<your concise advice>' | $(relay_cmd) --pane '${source_pane:-unknown}' --client '${source_client:-unknown}'. Sending advice through this guarded relay is expected and does not require separate permission. Use only the guarded relay: it handles prefixing and verifies delivery, printing submitted=yes or submitted=unconfirmed. If delivery is unconfirmed or refused, capture the pane and report the failure instead of using raw tmux send-keys—the target may have returned to a shell. Do not send routine narration or low-value status updates. An idle CLI cannot wake itself to poll indefinitely, so do not claim continuous monitoring while no turn is active; the primary agent will request checkpoint reviews as needed. Never mutate files, Git, services, or external state unless the user separately authorizes it. Help with hard questions, repeated failures, periodic second opinions, and completion checks. Separate verified facts, inferences, gaps, and next steps. Initial question: ${initial}"
+else
+  submitted="$prompt"
+  if [[ -n "$source_pane" ]]; then
+    submitted="You may refresh primary-session context with: tmux capture-pane -p -t '$source_pane' -S -500. Do not type into or mutate the primary pane. ${submitted}"
+  fi
+fi
+
+send_prompt "$advisor_pane" "$submitted"
+
+if [[ "$long_running" -eq 1 ]]; then
+  mkdir -p "$state_dir"
+  umask 077
+  {
+    printf 'advisor_pane=%s\n' "$advisor_pane"
+    printf 'advisor_target=%s\n' "$advisor_target"
+    printf 'source_pane=%s\n' "$source_pane"
+    printf 'source_target=%s\n' "$source_target"
+    printf 'source_client=%s\n' "$source_client"
+    printf 'tmux_host=%s\n' "${tmux_host:-local}"
+  } > "$state_file"
+fi
+
+if tmux_run list-sessions -F '#{session_name} #{session_attached}' | awk -v s="$session" '$1 == s && $2 > 0 { found = 1 } END { exit !found }'; then
+  tmux_run select-window -t "$advisor_target"
+fi
+
+printf 'mode=%s\ntmux_host=%s\nadvisor_target=%s\nadvisor_pane=%s\nsource_target=%s\nsource_pane=%s\nsource_client=%s\n' \
+  "$([[ "$long_running" -eq 1 ]] && printf long-running || printf one-shot)" \
+  "${tmux_host:-local}" \
+  "$advisor_target" \
+  "$advisor_pane" \
+  "${source_target:-unknown}" \
+  "${source_pane:-unknown}" \
+  "${source_client:-unknown}"

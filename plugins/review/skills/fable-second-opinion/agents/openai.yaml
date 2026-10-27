@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fable Second Opinion"
+  short_description: "Keep Fable available as a tmux advisor"
+  default_prompt: "Use $fable-second-opinion to open a long-running Fable advisor for this session."

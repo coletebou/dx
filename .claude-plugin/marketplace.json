@@ -43,6 +43,13 @@
       "version": "1.0.0",
       "source": "./plugins/codex",
       "category": "workflow"
+    },
+    {
+      "name": "review",
+      "description": "Multi-lens review with three refuters per finding (adversarial-review), a canary harness for MCP servers that touch secrets (mcp-agent-safety), and a tmux-side second-opinion advisor (fable-second-opinion)",
+      "version": "1.0.0",
+      "source": "./plugins/review",
+      "category": "review"
     }
   ]
 }
