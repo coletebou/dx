@@ -89,17 +89,38 @@ equal "an unknown --session fails" 1 "$?"
 check "...by name" "Session not found: nope" "$out"
 
 echo "tmux-apply-plan"
+# It needs bash 4 or newer (mapfile, associative arrays), as the plugin README says, and macOS
+# ships 3.2. Run it under the first bash 4+ found (PATH's, then Homebrew's); under an older bash
+# it must refuse with that advice.
+bash4=""
+for b in bash /opt/homebrew/bin/bash /usr/local/bin/bash; do
+  if [[ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ]] 2>/dev/null; then
+    bash4="$(command -v "$b")"; break
+  fi
+done
+if [[ "$(bash -c 'echo "${BASH_VERSINFO[0]}"')" -lt 4 ]]; then
+  out="$("$bin/tmux-apply-plan" --dry-run /dev/null 2>&1)"
+  equal "under bash 3 it refuses" 1 "$?"
+  check "...saying what it needs" "needs bash 4 or newer" "$out"
+fi
+if [[ -z "$bash4" ]]; then
+  echo "  # SKIP the rest of tmux-apply-plan: no bash 4 or newer on this machine"
+  printf '\n%d passed, %d failed\n' "$pass" "$fail"
+  [[ "$fail" -eq 0 ]]
+  exit
+fi
+ap() { "$bash4" "$bin/tmux-apply-plan" "$@"; }
 before="$(tsb list-panes -a -F '#{pane_id} #{pane_pid}' | sort)"
 cat > "$tmp/plan.json" <<EOF
 {"sessions": [{"current_name": "beta", "new_name": "gamma"}],
  "windows": [{"target": "$p_build", "new_name": "ci-build"},
              {"target": "$p_docs", "new_name": "docs-site", "new_session": "gamma", "new_index": 5}]}
 EOF
-out="$("$bin/tmux-apply-plan" --dry-run "$tmp/plan.json" 2>&1)"
+out="$(ap --dry-run "$tmp/plan.json" 2>&1)"
 equal "a dry run succeeds" 0 "$?"
 check "...and says nothing changed" "DRY RUN" "$out"
 equal "...leaving the names alone" "build" "$(tsb display-message -p -t "$p_build" '#{window_name}')"
-out="$("$bin/tmux-apply-plan" "$tmp/plan.json" 2>&1)"
+out="$(ap "$tmp/plan.json" 2>&1)"
 equal "applying the plan succeeds" 0 "$?"
 equal "the session is renamed" "gamma" "$(tsb display-message -p -t "$p_solo" '#{session_name}')"
 equal "a window is renamed" "ci-build" "$(tsb display-message -p -t "$p_build" '#{window_name}')"
@@ -110,23 +131,23 @@ equal "no pane or process was lost" "$before" "$(tsb list-panes -a -F '#{pane_id
 cat > "$tmp/drain.json" <<EOF
 {"windows": [{"target": "$p_build", "new_session": "gamma"}]}
 EOF
-out="$("$bin/tmux-apply-plan" "$tmp/drain.json" 2>&1)"
+out="$(ap "$tmp/drain.json" 2>&1)"
 equal "draining a session needs --allow-empty-sessions" 1 "$?"
 check "...which it asks for" "Pass --allow-empty-sessions" "$out"
 equal "...leaving the window where it was" "alpha" "$(tsb display-message -p -t "$p_build" '#{session_name}')"
-out="$("$bin/tmux-apply-plan" --allow-empty-sessions "$tmp/drain.json" 2>&1)"
+out="$(ap --allow-empty-sessions "$tmp/drain.json" 2>&1)"
 equal "with it the move succeeds" 0 "$?"
 equal "...the window is in its new session" "gamma" "$(tsb display-message -p -t "$p_build" '#{session_name}')"
 equal "...at its next free index, not a scratch one" "1" "$(tsb display-message -p -t "$p_build" '#{window_index}')"
 equal "...the drained session is gone" "gone" "$(tsb has-session -t '=alpha' 2>/dev/null && echo present || echo gone)"
 equal "...and still no pane was lost" "$before" "$(tsb list-panes -a -F '#{pane_id} #{pane_pid}' | sort)"
 printf '{"windows": [{"target": "%s", "new_index": 7}]}\n' "$p_solo" > "$tmp/reorder.json"
-out="$("$bin/tmux-apply-plan" "$tmp/reorder.json" 2>&1)"
+out="$(ap "$tmp/reorder.json" 2>&1)"
 equal "a reorder within the session (no new_session) succeeds" 0 "$?"
 equal "...moving the window to that index of its own session" "gamma:7" \
   "$(tsb display-message -p -t "$p_solo" '#{session_name}:#{window_index}')"
 printf '{"windows": [{"target": "%%999", "new_name": "x"}]}\n' > "$tmp/missing.json"
-out="$("$bin/tmux-apply-plan" "$tmp/missing.json" 2>&1)"
+out="$(ap "$tmp/missing.json" 2>&1)"
 equal "a plan naming a missing pane fails" 1 "$?"
 check "...before changing anything" "Plan references missing panes: %999" "$out"
 

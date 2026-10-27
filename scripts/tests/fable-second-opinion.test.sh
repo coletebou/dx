@@ -11,6 +11,8 @@ set -uo pipefail
 
 # shellcheck source=lib/tmux-sandbox.sh
 . "$(cd "$(dirname "$0")" && pwd -P)/lib/tmux-sandbox.sh"
+# shellcheck source=lib/stand-in.sh
+. "$(cd "$(dirname "$0")" && pwd -P)/lib/stand-in.sh"
 tsb_require_private_tmp || exit 1
 for t in tmux python3; do
   command -v "$t" >/dev/null 2>&1 || { printf 'fable-second-opinion.test.sh needs %s\n' "$t" >&2; exit 1; }
@@ -49,7 +51,9 @@ while True:
     with open(log, "a") as f:
         f.write(line + "\n")
 EOF
-tui() { printf "bash -c 'exec -a claude python3 %s %s'" "$tmp/fake_tui.py" "$1"; }
+# Run through a stand-in named claude, so tmux reports "claude" on Linux and macOS alike.
+stand_in_build "$tmp/bin" claude || { printf 'could not build the claude stand-in\n' >&2; exit 1; }
+tui() { printf 'exec %q python3 %q %q' "$tmp/bin/claude" "$tmp/fake_tui.py" "$1"; }
 # The same TUI stopped at a permission prompt: Enter here would answer it.
 cat > "$tmp/fake_dialog.py" <<'EOF'
 import sys
@@ -64,7 +68,7 @@ while True:
     with open(log, "a") as f:
         f.write(line + "\n")
 EOF
-dialog_tui() { printf "bash -c 'exec -a claude python3 %s %s'" "$tmp/fake_dialog.py" "$1"; }
+dialog_tui() { printf 'exec %q python3 %q %q' "$tmp/bin/claude" "$tmp/fake_dialog.py" "$1"; }
 
 tsb new-session -d -s work -n primary -c "$tmp" "$(tui "$tmp/primary.log")"
 # New windows (the advisor's) start /bin/sh: no user rc file slows or changes them.
@@ -107,11 +111,12 @@ until_true 5 grep -q 'run the tests first' "$tmp/primary.log"
 equal "...arriving prefixed" "[Fable advisor] run the tests first" "$(tail -n 1 "$tmp/primary.log" 2>&1)"
 out="$(printf '%s\n' 'rm -rf /' | "$skill/send-to-primary" --pane "$plain" 2>&1)"
 equal "a shell pane is refused" 1 "$?"
-check "...saying why" "Refusing relay: pane $plain is at a sh shell" "$out"
+# sh is bash on macOS: the refusal names whatever shell tmux sees there.
+check "...saying why" "Refusing relay: pane $plain is at a $(tsb display-message -p -t "$plain" '#{pane_current_command}') shell" "$out"
 equal "...and nothing was typed there" "" "$(tsb capture-pane -p -t "$plain" | grep -F 'Fable advisor')"
 # exec: windows made after default-shell /bin/sh run their command under `sh -c`, and the
 # pane would read as sh, not claude.
-tsb new-window -t work -n asking -c "$tmp" "exec $(dialog_tui "$tmp/asking.log")"
+tsb new-window -t work -n asking -c "$tmp" "$(dialog_tui "$tmp/asking.log")"
 asking="$(tsb display-message -p -t work:asking '#{pane_id}')"
 until_true 10 grep -q 'Esc to cancel' <(tsb capture-pane -p -t "$asking")
 equal "the dialog pane reads as claude" "claude" "$(tsb display-message -p -t "$asking" '#{pane_current_command}')"
@@ -120,8 +125,8 @@ equal "a Claude pane at a permission prompt is refused" 1 "$?"
 check "...saying why" "shows a dialog or permission prompt waiting for a human" "$out"
 sleep 1
 equal "...and the prompt got no keys" "" "$(cat "$tmp/asking.log" 2>/dev/null)"
-tsb new-window -t work -n synced -c "$tmp" "exec $(tui "$tmp/synced-a.log")"
-tsb split-window -t work:synced -c "$tmp" "exec $(tui "$tmp/synced-b.log")"
+tsb new-window -t work -n synced -c "$tmp" "$(tui "$tmp/synced-a.log")"
+tsb split-window -t work:synced -c "$tmp" "$(tui "$tmp/synced-b.log")"
 synced="$(tsb list-panes -t work:synced -F '#{pane_id}' | head -n 1)"
 until_true 10 grep -q 'Claude Code v' <(tsb capture-pane -p -t "$synced")
 tsb set-window-option -t work:synced synchronize-panes on
@@ -149,7 +154,7 @@ old_target="$(sed -n 's/^advisor_target=//p' <<<"$out")"
 # What renumber-windows or a move-window does: the advisor leaves its index and another
 # agent's window takes it, so the recorded session:index now names that window.
 tsb move-window -s "$advisor3" -t work:90
-tsb new-window -t "$old_target" -n victim -c "$tmp" "exec $(tui "$tmp/victim.log")"
+tsb new-window -t "$old_target" -n victim -c "$tmp" "$(tui "$tmp/victim.log")"
 victim="$(tsb display-message -p -t work:victim '#{pane_id}')"
 out="$("$skill/ask-fable" stop 2>&1)"
 equal "stop succeeds" 0 "$?"

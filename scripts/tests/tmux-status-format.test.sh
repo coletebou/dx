@@ -58,7 +58,10 @@ printf 'chooser\n'
 # its color.
 tmux set-option -g status-right ''
 pane=$(tmux display-message -p -t "$w" '#{pane_id}')
-tmux -L outer -f /dev/null new-session -d -x 156 -y 38 'env -u TMUX tmux attach -t t'
+# TERM is pinned: with -f /dev/null the outer server's default-terminal falls back to "screen"
+# where tmux-256color is not in the system terminfo (macOS), and the client then draws colour 178
+# as an 8-colour approximation. xterm-256color exists everywhere.
+tmux -L outer -f /dev/null new-session -d -x 156 -y 38 'env -u TMUX TERM=xterm-256color tmux attach -t t'
 for i in $(seq 1 50); do [[ -n "$(tmux list-clients)" ]] && break; sleep 0.1; done
 tmux choose-tree -w -t "$pane" -F '#{E:@tree-fmt}' \; send-keys -t "$pane" Up
 for i in $(seq 1 50); do  # the client draws the mode on its next redraw
@@ -67,6 +70,7 @@ for i in $(seq 1 50); do  # the client draws the mode on its next redraw
   sleep 0.1
 done
 equal "window row uses the published color" 1 "$(grep -c $'\e\[38;5;178msleep' <<<"$row")"
+grep -q $'\e\[38;5;178msleep' <<<"$row" || printf '       row:  %q\n' "$row"
 tmux send-keys -t "$pane" q
 tmux -L outer kill-server
 
