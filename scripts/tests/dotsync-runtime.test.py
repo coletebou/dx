@@ -465,13 +465,13 @@ class RuntimeTest(unittest.TestCase):
     # ── the lock ──
     def test_the_lock_waits_then_releases_without_removing_the_file(self):
         holder = subprocess.Popen([sys.executable, str(LOCK), "--acquire", str(self.lock), "1", sys.executable,
-                                   "-c", 'import time; print("held", flush=True); time.sleep(.6)'],
+                                   "-c", 'import time; print("held", flush=True); time.sleep(4)'],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(lambda: holder.poll() is None and holder.kill())
         self.assertEqual(holder.stdout.readline().strip(), "held")
         busy = subprocess.run([sys.executable, str(LOCK), "--acquire", str(self.lock), ".1", "true"], capture_output=True, text=True)
         self.assertEqual(busy.returncode, 75, busy.stderr)
-        waited = subprocess.run([sys.executable, str(LOCK), "--acquire", str(self.lock), "5", "true"], capture_output=True, text=True)
+        waited = subprocess.run([sys.executable, str(LOCK), "--acquire", str(self.lock), "60", "true"], capture_output=True, text=True)
         self.assertEqual(waited.returncode, 0, waited.stderr)
         holder.communicate(timeout=5)
         self.assertEqual(self.lock.stat().st_mode & 0o777, 0o600)
