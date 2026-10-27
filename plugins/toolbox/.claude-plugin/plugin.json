@@ -1,0 +1,10 @@
+{
+  "name": "toolbox",
+  "description": "Everyday upkeep for a machine that runs agents: a bounded, read-only disk survey that finds reclaimable caches without touching active work, then frees space in small verified batches (disk-reclaim), and a read-only sweep for open GitLab issues whose work already merged, split into strong and weak matches (shipped-but-open)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cole Tebou"
+  },
+  "license": "MIT",
+  "keywords": ["claude-code", "codex", "disk-space", "gitlab", "backlog"]
+}
