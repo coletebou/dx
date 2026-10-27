@@ -150,5 +150,64 @@ equal "...debug/ is gone" "no" "$(if [[ -e "$c/debug" ]]; then echo yes; else ec
 equal "...and nothing else changed" "$(printf '%s\n' "$claude_before" | grep -v '^./debug')" "$(snap "$c")"
 equal "nothing outside ~/.claude and BACKUP_DIR changed" "$outside_before" "$(outside)"
 
+echo "permissions (the caller's umask is 022)"
+mode() { ls -ld "$1" 2>&1 | cut -c1-10; }
+umask 022
+export HOME="$tmp/home2"
+mkdir -p "$HOME/.claude"
+printf '{"claudeAiOauth":"not-a-real-token"}\n' > "$HOME/.claude/.credentials.json"
+run
+dir2="$HOME/Archives/claude-history"
+equal "a new backup directory is the owner's alone" "drwx------" "$(mode "$dir2")"
+equal "...and so is the archive" "-rw-------" "$(mode "$(tars "$dir2")")"
+chmod 755 "$dir2"
+chmod 644 "$(tars "$dir2")"
+sleep 1
+run
+equal "an existing default directory others can read is closed" "drwx------" "$(mode "$dir2")"
+equal "...and every archive in it, the older one too" "-rw-------
+-rw-------" "$(for f in $(tars "$dir2"); do mode "$f"; done)"
+mkdir -p "$tmp/shared"
+chmod 755 "$tmp/shared"
+run BACKUP_DIR="$tmp/shared"
+check "a BACKUP_DIR of your choosing that others can read gets a warning" "open to other users" "$out"
+equal "...is left as it is" "drwxr-xr-x" "$(mode "$tmp/shared")"
+equal "...and the archive in it is still the owner's alone" "-rw-------" "$(mode "$(tars "$tmp/shared")")"
+
+echo "a symlinked ~/.claude"
+gone() { if [[ -e "$1" ]]; then echo present; else echo absent; fi; }
+export HOME="$tmp/home3"
+real="$HOME/dotfiles/claude-data"
+mkdir -p "$real/projects/-p/$OLD" "$real/file-history/$OLD" "$real/debug"
+printf '{"display":"old","timestamp":%s,"project":"/p","sessionId":"%s"}\n' "$old_ms" "$OLD" > "$real/history.jsonl"
+printf 'sub\n' > "$real/projects/-p/$OLD/agent.jsonl"
+printf 'v1\n' > "$real/file-history/$OLD/f@v1"
+printf 'log\n' > "$real/debug/latest.txt"
+ln -s "$real" "$HOME/.claude"
+# A tar that archives the link itself (drops the rename): the prune must refuse, deleting nothing.
+mkdir -p "$tmp/linktar"
+cat > "$tmp/linktar/tar" <<EOF
+#!/bin/sh
+[ "\$1" = -czf ] && exec "$(command -v tar)" -czf "\$2" -C "\$HOME" .claude
+exec "$(command -v tar)" "\$@"
+EOF
+chmod +x "$tmp/linktar/tar"
+run PATH="$tmp/linktar:$PATH" BACKUP_DIR="$tmp/backups-link" --prune-days 30
+equal "with an archive that holds only the link, a prune refuses" 1 "$rc"
+check "...saying why" "refusing to prune" "$out"
+equal "...deleting nothing" "present present" "$(gone "$real/projects/-p/$OLD") $(gone "$real/file-history/$OLD")"
+run BACKUP_DIR="$tmp/backups3"
+listing="$(tar -tzf "$(tars "$tmp/backups3")" 2>&1)"
+check "the archive holds the real directory's files, not the link" ".claude/history.jsonl" "$listing"
+check "...under .claude/" ".claude/projects/-p/$OLD/agent.jsonl" "$listing"
+lacks "...still without debug/" "debug" "$listing"
+run BACKUP_DIR="$tmp/backups3" --prune-days 30
+equal "a prune through the link succeeds" 0 "$rc"
+newest="$(tars "$tmp/backups3" | tail -n 1)"
+check "...after a backup that holds what it deletes" ".claude/file-history/$OLD/f@v1" "$(tar -tzf "$newest" 2>&1)"
+equal "...deleting the old session in the real directory" "absent absent" \
+  "$(gone "$real/projects/-p/$OLD") $(gone "$real/file-history/$OLD")"
+equal "...and the link is still a link" "link" "$(if [[ -L "$HOME/.claude" ]]; then echo link; else echo gone; fi)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

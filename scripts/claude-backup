@@ -44,6 +44,10 @@ Options:
 
 Environment:
   BACKUP_DIR       where backups go (default: ~/Archives/claude-history; never inside ~/.claude)
+
+Archives hold your sessions and credentials, so they are readable by you only (0600), and so
+is the default directory (0700); a BACKUP_DIR of yours that others can read gets a warning.
+A ~/.claude that is a symlink is backed up (and pruned) as the directory it points to.
 EOF
             exit 0
             ;;
@@ -54,10 +58,18 @@ EOF
     esac
 done
 
+# Everything this run writes is the owner's alone: sessions, credentials.
+umask 077
+
+if ! CLAUDE_REAL="$(cd "$CLAUDE_DIR" 2>/dev/null && pwd -P)"; then
+    echo "No $CLAUDE_DIR to back up"
+    exit 1
+fi
+
 # A backup inside ~/.claude would end up in every later backup.
 case "$BACKUP_DIR/" in /*) ;; *) BACKUP_DIR="$PWD/$BACKUP_DIR" ;; esac
 case "$BACKUP_DIR/" in
-    "$CLAUDE_DIR"/*)
+    "$CLAUDE_DIR"/*|"$CLAUDE_REAL"/*)
         echo "BACKUP_DIR must be outside $CLAUDE_DIR: $BACKUP_DIR"
         exit 1
         ;;
@@ -66,15 +78,27 @@ esac
 # Ensure backup directory exists
 mkdir -p "$BACKUP_DIR"
 case "$(cd "$BACKUP_DIR" && pwd -P)/" in
-    "$(cd "$CLAUDE_DIR" 2>/dev/null && pwd -P)/"*)
+    "$CLAUDE_REAL/"*)
         echo "BACKUP_DIR must be outside $CLAUDE_DIR: $BACKUP_DIR"
         exit 1
         ;;
 esac
+# A directory others can enter: the default one is closed, one of yours is named. Archives an
+# earlier version left readable are closed either way.
+if [[ "$(ls -ld "$BACKUP_DIR" | cut -c5-10)" != "------" ]]; then
+    if [[ "$BACKUP_DIR" == "$HOME/Archives/claude-history" && -O "$BACKUP_DIR" ]]; then
+        chmod 700 "$BACKUP_DIR"
+    else
+        echo "Warning: $BACKUP_DIR is open to other users (chmod 700 it); the archives in it are not"
+    fi
+fi
+for f in "$BACKUP_DIR"/claude-backup-*.tar.gz; do
+    if [[ -f "$f" && -O "$f" ]]; then chmod 600 "$f"; fi
+done
 
 # Show current state
 echo "=== Current ~/.claude state ==="
-du -sh "$CLAUDE_DIR"
+du -sh "$CLAUDE_REAL"
 echo ""
 
 # Create timestamped backup
@@ -85,13 +109,32 @@ echo "=== Creating backup ==="
 echo "Destination: $BACKUP_FILE"
 
 # Backup everything except debug/ (it's just logs)
-tar -czf "$BACKUP_FILE" \
-    --exclude='debug' \
-    -C "$HOME" .claude
+if [[ -L "$CLAUDE_DIR" && "$(basename "$CLAUDE_REAL")" != .claude ]]; then
+    # tar stores a symlink as a link: archive the directory it points to, named .claude.
+    base="$(basename "$CLAUDE_REAL")"
+    case "$base" in *'|'*) echo "Cannot back up through a link to a name with '|': $CLAUDE_REAL"; exit 1 ;; esac
+    pattern="$(printf '%s' "$base" | sed 's/[\\.[*^$]/\\&/g')"
+    if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+        rename=(--transform "s|^$pattern|.claude|S")
+    else
+        rename=(-s "|^$pattern|.claude|S")
+    fi
+    tar -czf "$BACKUP_FILE" \
+        --exclude='debug' \
+        "${rename[@]}" \
+        -C "$(dirname "$CLAUDE_REAL")" "$base"
+else
+    tar -czf "$BACKUP_FILE" \
+        --exclude='debug' \
+        -C "$(dirname "$CLAUDE_REAL")" .claude
+fi
 
 BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
 echo "Backup complete: $BACKUP_SIZE"
 echo ""
+
+# From here on, the directory itself (through a symlink, the one it points to).
+CLAUDE_DIR="$CLAUDE_REAL"
 
 # Clear debug if requested
 if $CLEAR_DEBUG; then
@@ -113,6 +156,11 @@ if [[ -n "$PRUNE_DAYS" ]]; then
 
     if [[ ! -f "$HISTORY_FILE" ]]; then
         echo "No history.jsonl found, skipping prune"
+    elif ! tar -tzf "$BACKUP_FILE" 2>/dev/null | grep -x '\.claude/history\.jsonl' >/dev/null; then
+        # Nothing is deleted that the backup just made does not hold. (grep reads the whole
+        # listing: an early exit would end tar with SIGPIPE, a failure under pipefail.)
+        echo "The backup does not hold .claude/history.jsonl; refusing to prune"
+        exit 1
     else
         # Get old session IDs
         OLD_SESSIONS=$(jq -r --argjson cutoff "$CUTOFF_TS" \
