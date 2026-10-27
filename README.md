@@ -86,7 +86,7 @@ installer stops and tells you your options.
 | `vscode` | VS Code user settings (Prettier off); `vscode/extensions.json` lists the recommended extensions |
 | `brew` | `~/.Brewfile`, a commented developer Brewfile for `brew bundle --global` |
 | `music-video` | the `music-video` skill. Not part of `--all`: it drives paid APIs. |
-| `node-tools` | the pinned global Node CLIs (Codex, pnpm, tsx, language servers, ...) from `node-tools/`'s lock, with `npm ci` into `~/.npm-global`. Needs Node 24. Not part of `--all`. |
+| `node-tools` | the pinned global Node CLIs (Codex, pnpm, tsx, language servers, ...) from `node-tools/`'s lock, with `npm ci` into `~/.npm-global`. Needs Node 24. Not part of `--all`. Older installs are never deleted on their own: `scripts/install-node-tools.sh --prune` removes those no running process uses. |
 | `schedules` | launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, the nightly dream sweep, tmux autosave, and the hourly `dotsync` where `sync` is installed. Not part of `--all`. |
 | `github-kit` | the [GitHub repo kit](github-kit/README.md) (issue forms, a PR template and its rules, a label set with a sync script, PR-labeling, secret-scan, Claude Code and CI-lane workflows), copied into the `.github/` of the repository `--target` names. Not part of `--all`. |
 | `manager` | a Drover setting that points its OpenClaw fleet manager at your identity's overlay (below). Not part of `--all`. |
