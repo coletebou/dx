@@ -143,19 +143,39 @@ dotsync_scratch_dir() {
 }
 
 # dotsync_timeout SECONDS COMMAND...: never an unbounded command, even on a stock macOS
-# without GNU timeout. GNU timeout kills the command's whole process group; the Python
-# fallback does the same.
+# without GNU timeout, and never a survivor: on expiry the command's whole process tree goes.
 dotsync_timeout() {
-  local seconds="$1"
+  local seconds="$1" bin="" pid rc=0
   shift
   if [[ ! "$seconds" =~ ^[0-9]+([.][0-9]+)?$ || "$seconds" =~ ^0+([.]0+)?$ ]]; then
     printf 'dotsync: invalid timeout: %s\n' "$seconds" >&2
     return 2
   fi
   if command -v timeout >/dev/null 2>&1; then
-    command timeout --kill-after=5 "$seconds" "$@"
+    bin=timeout
   elif command -v gtimeout >/dev/null 2>&1; then
-    command gtimeout --kill-after=5 "$seconds" "$@"
+    bin=gtimeout
+  fi
+  if [[ -n "$bin" ]]; then
+    # GNU timeout leads a process group of its own and signals all of it on expiry, but it
+    # returns as soon as the command itself exits, so a descendant that ignores TERM would
+    # live on, holding the caller's pipes and the lock. Started in the background (stdin kept)
+    # only to learn its pid, which is that group's id: on expiry, whatever is left of the group
+    # gets the same five seconds, then KILL.
+    command "$bin" --kill-after=5 "$seconds" "$@" <&0 &
+    pid=$!
+    # A run interrupted while it waits here stops this group too (dotsync_timeout_cleanup).
+    DOTSYNC_TIMEOUT_PGID="$pid"
+    wait "$pid" || rc=$?
+    DOTSYNC_TIMEOUT_PGID=""
+    if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+      for _ in 1 2 3 4 5; do
+        kill -0 -- "-$pid" 2>/dev/null || break
+        sleep 1
+      done
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+    return "$rc"
   elif command -v python3 >/dev/null 2>&1; then
     python3 -c '
 import os, signal, subprocess, sys
@@ -195,6 +215,17 @@ sys.exit(rc if rc >= 0 else 128 - rc)
     printf 'dotsync: cannot enforce timeout; install coreutils or Python 3\n' >&2
     return 127
   fi
+}
+
+# A signal ends a run while dotsync_timeout waits; its command must not outlive the run.
+DOTSYNC_TIMEOUT_PGID=""
+dotsync_timeout_cleanup() {
+  local pgid="${DOTSYNC_TIMEOUT_PGID:-}"
+  [[ -n "$pgid" ]] || return 0
+  DOTSYNC_TIMEOUT_PGID=""
+  kill -TERM -- "-$pgid" 2>/dev/null || return 0
+  # What ignores TERM gets KILL five seconds later, from a detached helper (the run is ending).
+  ( sleep 5; kill -KILL -- "-$pgid" 2>/dev/null ) </dev/null >/dev/null 2>&1 3>&- 9>&- &
 }
 
 # ── staging and the secret gate ──────────────────────────────────────────

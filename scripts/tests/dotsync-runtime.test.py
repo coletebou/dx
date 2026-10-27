@@ -253,22 +253,74 @@ class RuntimeTest(unittest.TestCase):
             "(d / (role + '.pid')).write_text(str(os.getpid()))\n"
             "if role != 'grandchild':\n"
             "    subprocess.Popen([sys.executable, __file__, 'child' if role == 'parent' else 'grandchild', str(d)])\n"
-            "time.sleep(30)\n")
+            "time.sleep(120)\n")
+        # The budget leaves a loaded machine time to start all three; the TERM-resistant grandchild
+        # holds the pipes, so if it survived the timeout the harness would wait out its sleep.
+        budget = 8
         for env in (self.env, self.fallback_env()):
             with self.subTest(fallback=env is not self.env):
                 for path in pids.glob("*.pid"):
                     path.unlink()
+                self.addCleanup(self.kill_recorded, pids)
                 started = time.monotonic()
-                result = subprocess.run([BASH, "--noprofile", "--norc", "-c", 'source "$1"; dotsync_timeout 1 "$2" "$3" parent "$4"',
-                                         "x", str(RUNTIME), sys.executable, str(worker), str(pids)], env=env,
-                                        capture_output=True, timeout=30)
+                try:
+                    result = subprocess.run([BASH, "--noprofile", "--norc", "-c", 'source "$1"; dotsync_timeout "$5" "$2" "$3" parent "$4"',
+                                             "x", str(RUNTIME), sys.executable, str(worker), str(pids), str(budget)],
+                                            env=env, capture_output=True, timeout=budget + 40)
+                except subprocess.TimeoutExpired:
+                    self.fail("dotsync_timeout returned, but a descendant it should have killed kept running")
                 self.assertEqual(result.returncode, 124, result.stderr)
-                self.assertLess(time.monotonic() - started, 12)
-                time.sleep(0.5)
+                self.assertLess(time.monotonic() - started, budget + 15)
+                self.assertEqual(sorted(p.stem for p in pids.glob("*.pid")), ["child", "grandchild", "parent"],
+                                 "the whole tree must have started for this check to mean anything")
                 for path in pids.glob("*.pid"):
                     pid = int(path.read_text())
                     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
                     self.assertTrue(state == "" or state.startswith("Z"), "%s survived the timeout" % path.stem)
+
+    def test_an_interrupted_run_stops_the_command_it_was_waiting_on(self):
+        pids = self.root / "pids"
+        pids.mkdir()
+        self.addCleanup(self.kill_recorded, pids)
+        worker = self.root / "tree.py"
+        worker.write_text(
+            "import os, signal, subprocess, sys, time\nfrom pathlib import Path\n"
+            "role, d = sys.argv[1], Path(sys.argv[2])\n"
+            "if role == 'grandchild': signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "(d / (role + '.pid')).write_text(str(os.getpid()))\n"
+            "if role != 'grandchild':\n"
+            "    subprocess.Popen([sys.executable, __file__, 'child' if role == 'parent' else 'grandchild', str(d)])\n"
+            "time.sleep(120)\n")
+        shell = subprocess.Popen([BASH, "--noprofile", "--norc", "-c",
+                                  'source "$1"; trap "dotsync_timeout_cleanup; exit 143" TERM; dotsync_timeout 100 "$2" "$3" parent "$4"',
+                                  "x", str(RUNTIME), sys.executable, str(worker), str(pids)], env=self.env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 60
+        while len(list(pids.glob("*.pid"))) < 3 and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertEqual(len(list(pids.glob("*.pid"))), 3, "the tree never started")
+        shell.terminate()
+        self.assertEqual(shell.wait(timeout=30), 143)
+        deadline = time.monotonic() + 20
+        alive = None
+        while time.monotonic() < deadline:
+            alive = [p.stem for p in pids.glob("*.pid") if self.running(int(p.read_text()))]
+            if not alive:
+                break
+            time.sleep(0.5)
+        self.assertEqual(alive, [], "the interrupted run left its command running")
+
+    @staticmethod
+    def running(pid):
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return state != "" and not state.startswith("Z")
+
+    def kill_recorded(self, pids):
+        for path in pids.glob("*.pid"):
+            try:
+                os.kill(int(path.read_text()), 9)
+            except (OSError, ValueError):
+                pass
 
     # ── staging and the secret gate ──
     def staging(self, command, env=None):

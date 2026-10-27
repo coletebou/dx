@@ -434,6 +434,7 @@ dotsync_finish() {
   # Background peer workers inherit the shell; only the coordinator finishes the run.
   [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || return "$rc"
   trap - EXIT INT TERM HUP
+  dotsync_timeout_cleanup
   [[ "$rc" -ne 0 ]] || rc="${EXIT_CODE:-0}"
   DOTSYNC_RESULT="$(dotsync_result "$rc")"
   DOTSYNC_PHASE="${DOTSYNC_FAILED_PHASE:-$DOTSYNC_PHASE}"
