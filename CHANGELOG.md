@@ -17,4 +17,5 @@ The first public release.
   dreaming sweep, behind a pluggable data boundary.
 - **Session tools:** cc-handoff chains, and Claude Code and Codex resume after a tmux-resurrect
   restore.
-- Test suites for the scripts, hooks and installer.
+- Test suites for the scripts, hooks and installer, and CI that runs them on Linux and macOS
+  alongside ShellCheck, `zsh -n`, ruff and a secret scan of every commit.
