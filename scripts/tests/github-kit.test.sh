@@ -522,6 +522,146 @@ else
   ok "# SKIP no Node 18 or newer: pr-labels.mjs not checked"
 fi
 
+echo "the full-lane workflows' steps"
+# A step's run: block, as Actions runs it (bash -eo pipefail), against a second fake gh that answers
+# from a fixture of workflow runs and records what it is asked to do. No YAML library: steps are
+# found by name, the way they are written in the kit.
+cat > "$tmp/step.py" <<'PY'
+"""Print the run: block of the first step named argv[2] in the YAML file argv[1]."""
+import re
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+for i, line in enumerate(lines):
+    m = re.match(r"^(\s*)- name: (.*)$", line)
+    if not m or m.group(2).strip().strip("'\"") != sys.argv[2]:
+        continue
+    keys = len(m.group(1)) + 2
+    for j in range(i + 1, len(lines)):
+        if lines[j].strip() and len(lines[j]) - len(lines[j].lstrip()) < keys:
+            break
+        r = re.match(r"^(\s*)run: \|\s*$", lines[j])
+        if r:
+            body, indent = [], None
+            for b in lines[j + 1:]:
+                if b.strip() and len(b) - len(b.lstrip()) <= len(r.group(1)):
+                    break
+                if b.strip() and indent is None:
+                    indent = len(b) - len(b.lstrip())
+                body.append(b[indent:] if b.strip() else "")
+            print("\n".join(body).rstrip())
+            sys.exit(0)
+sys.exit("no run: | block in a step named %r" % sys.argv[2])
+PY
+mkdir -p "$tmp/wfbin"
+cat > "$tmp/wfbin/gh" <<'PY'
+#!/usr/bin/env python3
+"""A fake gh for workflow steps. $FAKE_RUNS holds {"tip": SHA, "runs": [...]}, newest first, each
+run {databaseId, headSha, status, conclusion, event, headBranch, jobs}. `api .../pulls/N`, `run
+list` and `run view` answer from it (--jq through the real jq); `run rerun` and `workflow run`
+only succeed. Every call's argv goes to $FAKE_GH_LOG as a JSON line."""
+import json
+import os
+import subprocess
+import sys
+
+argv = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(argv) + "\n")
+data = json.load(open(os.environ["FAKE_RUNS"], encoding="utf-8"))
+
+
+def opt(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def answer(value):
+    expr = opt("--jq")
+    if expr is None:
+        print(json.dumps(value))
+        sys.exit(0)
+    done = subprocess.run(["jq", "-r", expr], input=json.dumps(value), capture_output=True, text=True)
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr)
+    sys.exit(done.returncode)
+
+
+if argv[:1] == ["api"] and "/pulls/" in argv[1]:
+    answer({"head": {"sha": data["tip"]}})
+if argv[:2] == ["run", "list"]:
+    if opt("--workflow") != os.environ["WORKFLOW"]:
+        sys.exit("fake gh: run list for another workflow")
+    answer([{"databaseId": r["databaseId"]} for r in data["runs"] if r["headSha"] == opt("--commit")])
+if argv[:2] == ["run", "view"]:
+    run = next(r for r in data["runs"] if str(r["databaseId"]) == argv[2])
+    answer({k: run[k] for k in opt("--json").split(",")})
+if argv[:2] in (["run", "rerun"], ["workflow", "run"]):
+    sys.exit(0)
+sys.exit("fake gh: unexpected call: " + " ".join(argv))
+PY
+chmod +x "$tmp/wfbin/gh"
+head_sha=1111111111111111111111111111111111111111
+run_step() {  # run_step WORKFLOW_FILE STEP_NAME [VAR=VALUE...]: its exit status; output in $tmp/step.out
+  local file="$1" name="$2"; shift 2
+  : > "$tmp/wf.log"; : > "$tmp/summary"
+  python3 "$tmp/step.py" "$file" "$name" > "$tmp/step.sh" 2> "$tmp/step.out" || return 99
+  env PATH="$tmp/wfbin:$PATH" FAKE_GH_LOG="$tmp/wf.log" FAKE_RUNS="$tmp/runs.json" GITHUB_STEP_SUMMARY="$tmp/summary" \
+    GH_TOKEN=x GH_REPO=example/widgets WORKFLOW=ci.yml PR_NUMBER=7 HEAD_REF=feature HEAD_SHA="$head_sha" "$@" \
+    bash -eo pipefail "$tmp/step.sh" > "$tmp/step.out" 2>&1
+}
+# The calls that act (a rerun or a dispatch), one per line, without gh's other arguments' quoting.
+acts() { python3 -c '
+import json, sys
+for line in open(sys.argv[1]):
+    a = json.loads(line)
+    if a[:2] in (["run", "rerun"], ["workflow", "run"]):
+        print(" ".join(a))' "$tmp/wf.log"; }
+runs() {  # runs TIP RUN_JSON...: the fixture, newest run first
+  local tip="$1"; shift
+  printf '{"tip": "%s", "runs": [%s]}\n' "$tip" "$(IFS=,; printf '%s' "$*")" > "$tmp/runs.json"
+}
+prun() {  # prun ID EVENT BRANCH STATUS CONCLUSION [FULL_STATUS FULL_CONCLUSION]: one run
+  local jobs='[{"name": "fast", "status": "completed", "conclusion": "success"}'
+  if [[ $# -ge 7 ]]; then jobs="$jobs"', {"name": "full", "status": "'"$6"'", "conclusion": "'"$7"'"}]'
+  elif [[ "$4" == completed && "$5" == cancelled ]]; then jobs='[]'
+  else jobs="$jobs]"; fi
+  printf '{"databaseId": %s, "headSha": "%s", "event": "%s", "headBranch": "%s", "status": "%s", "conclusion": "%s", "jobs": %s}' \
+    "$1" "$head_sha" "$2" "$3" "$4" "$5" "$jobs"
+}
+approval="$kit/workflows/ci-full-on-approval.yml"
+approve() { run_step "$approval" "Rerun the PR's full CI lane for the approved head" FULL_JOB=full; }
+if command -v jq >/dev/null 2>&1; then
+  runs "$head_sha" "$(prun 30 workflow_dispatch feature completed success completed success)" \
+    "$(prun 20 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: a failed full lane on the PR is rerun, though a dispatched run passed (it is not a PR check)" \
+    "0 run rerun 20" "$rc $(acts)"
+  runs "$head_sha" "$(prun 23 pull_request feature completed cancelled)"
+  approve; rc=$?
+  equal "approval: a PR run cancelled before its jobs started is rerun" "0 run rerun 23" "$rc $(acts)"
+  runs "$head_sha" "$(prun 21 pull_request feature in_progress "" in_progress "")"
+  approve; rc=$?
+  equal "approval: a full lane in flight is left to finish" "0 " "$rc $(acts)"
+  runs "$head_sha" "$(prun 22 pull_request feature completed success completed success)"
+  approve; rc=$?
+  equal "approval: a passed full lane on the PR is left alone" "0 " "$rc $(acts)"
+  check "...saying so" "already" "$(cat "$tmp/summary")"
+  runs "$head_sha" "$(prun 24 pull_request feature completed success completed skipped)"
+  approve; rc=$?
+  equal "approval: a draft's fast-lane run is not rerun (a rerun keeps its draft payload)" "0 " "$rc $(acts)"
+  check "...and the summary says how to get a full run" "mark it ready for review again" "$(cat "$tmp/summary")"
+  runs "$head_sha" "$(prun 25 pull_request other completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: another PR's run of the same commit is not rerun" "0 " "$rc $(acts)"
+  runs 2222222222222222222222222222222222222222 "$(prun 26 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: nothing is rerun once the tip has moved past the approved head" "0 " "$rc $(acts)"
+  grep -q 'gh workflow run' "$approval" && bad "ci-full-on-approval.yml never dispatches" "no gh workflow run" "found" \
+    || ok "ci-full-on-approval.yml never dispatches"
+else
+  ok "# SKIP no jq: the approval step not run"
+fi
+
 echo "this repository's .github"
 for f in workflows/pr-labels.yml scripts/pr-labels.mjs docs/pull-requests.md; do
   if cmp -s "$kit/$f" "$root/.github/$f"; then ok ".github/$f is the kit's"; else bad ".github/$f is the kit's" "identical" "differs"; fi

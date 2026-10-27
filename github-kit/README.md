@@ -24,7 +24,7 @@ why) until it is set, so the whole kit can go in at once and be turned on piece 
 | `workflows/claude.yml` | `.github/workflows/` | `@claude` in an issue or a comment runs Claude Code on it, for collaborators. |
 | `workflows/claude-code-review.yml` | `.github/workflows/` | A Claude Code review when a PR is opened or marked ready, or by hand for a given PR. |
 | `workflows/ci-full-label.yml` | `.github/workflows/` | `ci:full` on a draft PR dispatches the full CI lane for its head. |
-| `workflows/ci-full-on-approval.yml` | `.github/workflows/` | An approval of a head with no full run in flight or passed dispatches one. |
+| `workflows/ci-full-on-approval.yml` | `.github/workflows/` | An approval of a head whose full lane failed or was cancelled reruns the PR's own run. |
 | `workflows/stacked-pr-retarget.yml` | `.github/workflows/` | When a stacked PR is retargeted (its parent merged), dispatches a full run against the new base. |
 | `actionlint.yaml` | `.github/actionlint.yaml` | actionlint's configuration: self-hosted runner labels and the variables the workflows read. |
 
@@ -138,9 +138,14 @@ before it); the kit wires only the two direct credentials.
 
 ### The full CI lane
 
-`ci-full-label.yml`, `ci-full-on-approval.yml` and `stacked-pr-retarget.yml` dispatch the
-repository's full CI workflow, the one `CI_FULL_WORKFLOW` names, and stay off until it is set.
-That workflow keeps this contract:
+`ci-full-label.yml` and `stacked-pr-retarget.yml` dispatch the repository's full CI workflow,
+the one `CI_FULL_WORKFLOW` names, and `ci-full-on-approval.yml` reruns that workflow's run of the
+PR; all three stay off until it is set. A dispatched run's checks attach to the head commit and
+show in the Actions tab, but never among the PR's checks, which are its pull_request runs and
+what its required checks are judged on. So a dispatch is a signal (for a draft, or a retargeted
+PR), and a failed or cancelled full lane on a ready PR is repaired by rerunning the PR's own run,
+which keeps that run's commit and event: a run started while the PR was a draft stays a fast
+lane. That workflow keeps this contract:
 
 - it accepts `workflow_dispatch` with a string input `pr` (the dispatching workflows set it to
   the PR number) and does not listen to `pull_request` `edited` or `labeled`;

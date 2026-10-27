@@ -110,9 +110,11 @@ comment asks for an on-demand run (`.github/workflows/claude.yml`).
 In a repository that splits CI into a fast lane and a full lane (the kit's
 README describes the contract), a ready PR runs the full lane on every push,
 and a draft runs the fast lane only. Add `ci:full` to a draft to run the full
-lane on its head (`.github/workflows/ci-full-label.yml`). Approving a ready PR
-whose head has no full run in flight or passed dispatches one
-(`.github/workflows/ci-full-on-approval.yml`).
+lane on its head (`.github/workflows/ci-full-label.yml`); that run shows on the
+head commit and in the Actions tab, not among the PR's checks. Approving a ready
+PR whose full lane failed or was cancelled on its head reruns the PR's own run
+(`.github/workflows/ci-full-on-approval.yml`), which is what its required checks
+read.
 
 ## Stacked PRs
 
