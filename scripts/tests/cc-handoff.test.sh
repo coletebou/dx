@@ -424,6 +424,18 @@ equal "nothing opened" "2" "$(tsb list-windows -t '=origin:' | wc -l | xargs)"
 out="$(cd "$HOME/repo" && as_session sess-A "$pA" "$CCH" init 2>&1)"
 check "a second init keeps the brief" "already exists (kept as is" "$out"
 
+printf 'init: independent sessions on one day get a chain each, and never take one over\n'
+q1="$(cd "$HOME/repo" && as_session sess-Q1 "$pA" "$CCH" init 2>/dev/null | head -n 1)"
+q2="$(cd "$HOME/repo" && as_session sess-Q2 "$pA" "$CCH" init 2>/dev/null | head -n 1)"
+chainQ1="$(dirname "$(dirname "$q1")")" chainQ2="$(dirname "$(dirname "$q2")")"
+lacks "a second session in the same minute gets its own chain" "$chainQ1|" "$chainQ2|$chainA|"
+equal "...each generation 1 keeps its own session" "sess-Q1 sess-Q2 sess-A" \
+  "$(jq -r .session_id "$chainQ1/gen-01/session.json" "$chainQ2/gen-01/session.json" "$chainA/gen-01/session.json" | xargs)"
+out="$(cd "$HOME/repo" && as_session sess-Q3 "$pA" "$CCH" init --chain "$chainQ1" --force 2>&1)"; code=$?
+equal "init refuses another session's generation, even with --force" 2 "$code"
+check "...saying whose it is" "belongs to session sess-Q1" "$out"
+equal "...and leaves its record alone" "sess-Q1" "$(jq -r .session_id "$chainQ1/gen-01/session.json")"
+
 printf 'launch: generation 2, local, adjacent window, inline prompt, linear history\n'
 fill_brief "$brief1" gen1
 pidx="$(tsb display-message -p -t "$pA" '#{window_index}')"

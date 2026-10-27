@@ -808,6 +808,12 @@ def cmd_brief_init(a):
             chain = {"version": VERSION, "name": chain_dir.name, "root": a.root, "created": iso(),
                      "origin_host": a.host}
             write_json(chain_dir / "chain.json", chain)
+    # A generation belongs to one session: another one's record is never taken over (an
+    # explicit --chain to someone else's chain, say), even with --force.
+    owner = load_session(chain_dir, a.gen).get("session_id")
+    if owner and owner != a.sid:
+        print(f"generation {a.gen} of {chain_dir} belongs to session {owner}; not taking it over", file=sys.stderr)
+        return 2
     info = transcript_info(a.transcript) if a.transcript and os.path.exists(a.transcript) else Info()
     jobs = scan_jobs(a.claude_pid, a.transcript, a.exclude_ancestors_of) if a.claude_pid else []
     update_session(chain_dir, a.gen, {

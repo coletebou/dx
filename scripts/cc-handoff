@@ -350,8 +350,19 @@ cmd_init() {
   elif [[ -z "$chain_dir" ]]; then
     cname="${cname:-$repo-handoff-$(date -u +%Y%m%d)}"
     [[ "$cname" =~ ^[A-Za-z0-9_.-]+$ ]] || die 2 "chain name may only use [A-Za-z0-9_.-] (got '$cname')"
+    # Claimed with a plain mkdir, which fails when the directory exists: another session
+    # started a chain of this name today, or in this minute too.
+    mkdir -p "$briefs_root"
     chain_dir="$briefs_root/$cname"
-    [[ ! -e "$chain_dir" ]] || chain_dir="$briefs_root/$cname-$(date -u +%H%M)"
+    if ! mkdir "$chain_dir" 2>/dev/null; then
+      local base n=1
+      base="$briefs_root/$cname-$(date -u +%H%M)"
+      chain_dir="$base"
+      until mkdir "$chain_dir" 2>/dev/null; do
+        n=$((n + 1)); chain_dir="$base-$n"
+        (( n < 100 )) || die 1 "init: could not create a chain directory under $briefs_root"
+      done
+    fi
   fi
   mkdir -p "$chain_dir"
   # Owner-only: the records hold the successor's environment and the user's goal, and other
