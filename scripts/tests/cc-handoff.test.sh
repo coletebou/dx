@@ -56,6 +56,9 @@ export HOME="$tmp/home" DF_MACHINE=test-box DF_IDENTITY=personal
 export FSH_POLL=0.2 FSH_WATCH_POLL=0.3 FSH_QUIET_SECS=1 FSH_QUIET_MAX=20 FSH_ENGAGE_TIMEOUT=20
 mkdir -p "$HOME/.claude" "$HOME/repo" "$HOME/code/.briefs"
 : > "$HOME/.zshrc"   # every real host has one; without it zsh -i stops in its first-run wizard
+# Debian's and Ubuntu's global zshrc runs compinit, which stops at a y/n question when an fpath
+# directory is writable by others: a launcher's `zsh -lic` would wait there, not start claude.
+printf 'skip_global_compinit=1\n' > "$HOME/.zshenv"
 printf '{"env":{"CLAUDE_CODE_USE_BEDROCK":"","CLAUDE_CODE_USE_MANTLE":"","AWS_REGION":"us-east-1"}}\n' \
   > "$HOME/.claude/settings.json"
 # A known secret: the renderer must redact its literal value wherever it shows up.
@@ -181,6 +184,7 @@ chmod +x "$tmp/bin/uname"
 export FSH_TEST_LOG="$tmp/log" REMOTE_HOME="$tmp/remote-home" REMOTE_SOCK
 mkdir -p "$FSH_TEST_LOG" "$REMOTE_HOME/.claude" "$REMOTE_HOME/repo" "$REMOTE_HOME/.dotfiles"
 : > "$REMOTE_HOME/.zshrc"
+cp "$HOME/.zshenv" "$REMOTE_HOME/.zshenv"
 ln -s "$scripts" "$REMOTE_HOME/.dotfiles/scripts"
 mkdir -p "$HOME/.dotfiles" && ln -s "$scripts" "$HOME/.dotfiles/scripts"   # for the self-box alias
 printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$HOME/repo" > "$HOME/.claude.json"   # a passer runs somewhere trusted
@@ -660,7 +664,11 @@ check "the brief records the goal" "Active /goal: Finish the widget; done when C
 fill_brief "$briefF" goal
 out="$(IS_SANDBOX=1 FSH_KILL=0 FSH_DEFAULT_LAUNCHER=yu as_session sess-F "$pF" "$CCH" launch --go --notify lead-session "$briefF" 2>&1)"; code=$?
 equal "exit 0" 0 "$code"
-[[ "$code" -eq 0 ]] || printf '%s\n' "$out" | tail -n 20 | sed 's/^/       | /'   # why, when it is not
+if [[ "$code" -ne 0 ]]; then   # why: what cc-handoff said, and the successor's screen
+  printf '%s\n' "$out" | tail -n 20 | sed 's/^/       | /'
+  paneF2="$(python3 "$LIB" get "$chainF" 2 tmux.pane 2>/dev/null)"
+  [[ -n "$paneF2" ]] && tsb capture-pane -p -t "$paneF2" 2>&1 | grep -v '^$' | tail -n 15 | sed 's/^/       > /'
+fi
 p="$(cat "$chainF/gen-02/prompt.txt")"
 check "the prompt starts with the passer's /goal" "/goal Finish the widget; done when CI is green" "$(head -n 1 <<<"$p")"
 check "--go authorizes the whole brief" "do all of it without asking which item to start" "$p"
