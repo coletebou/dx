@@ -23,6 +23,7 @@ def style_for(item):
 
 
 def generate(item):
+    """Generate one still; returns (written, message)."""
     out = os.path.join(IMG, item["id"] + ".png")
     prompt = item["prompt"] + " " + style_for(item)
     size = item.get("size", SPEC["size"])
@@ -49,9 +50,9 @@ def generate(item):
             os.remove(req)
     data = json.loads(r.stdout or "{}")
     if not data.get("data"):
-        return f"{item['id']}: FAILED {json.dumps(data)[:300]}"
+        return False, f"{item['id']}: FAILED {json.dumps(data)[:300]}"
     open(out, "wb").write(base64.b64decode(data["data"][0]["b64_json"]))
-    return f"{item['id']}: ok ({data.get('usage', {}).get('output_tokens')} out tokens)"
+    return True, f"{item['id']}: ok ({data.get('usage', {}).get('output_tokens')} out tokens)"
 
 
 def main():
@@ -75,20 +76,27 @@ def main():
         want.add(x); stack += [r for r in by_id[x].get("refs", []) if not have(r)]
     todo = [i for i in SPEC["images"] if i["id"] in want and (force or not have(i["id"]))]
     print(f"{len(todo)} images to generate with {MODEL}", flush=True)
-    # phases in dependency order: an item runs once every still it references exists on disk
+    # Phases in dependency order: an item runs once every still it references exists on disk and is
+    # final. A reference this run regenerates (--force) counts only after its new version is written,
+    # and one that fails to regenerate blocks its dependents, which would otherwise be conditioned
+    # (and paid for) on the old design.
+    pending, failed = {i["id"] for i in todo}, set()
     while todo:
-        ready = [i for i in todo if all(have(r) for r in i.get("refs", []))]
+        ready = [i for i in todo if all(have(r) and r not in pending and r not in failed for r in i.get("refs", []))]
         if not ready:
             raise SystemExit(f"cannot generate {[i['id'] for i in todo]}: their refs failed or form a cycle")
-        run_phase(ready, workers)
-        failed = [i["id"] for i in ready if not have(i["id"])]
-        if failed:
-            print(f"not generated: {failed}", flush=True)   # anything that references them stops at the check above
+        written = run_phase(ready, workers)
+        pending -= {i["id"] for i in ready}
+        now_failed = [i["id"] for i in ready if i["id"] not in written]
+        failed.update(now_failed)
+        if now_failed:
+            print(f"not generated: {now_failed}", flush=True)   # anything that references them stops at the check above
         todo = [i for i in todo if i not in ready]
 
 
 def run_phase(items, workers):
-    lock, queue = threading.Lock(), list(items)
+    """Generate items on parallel workers; returns the ids that were written."""
+    lock, queue, written = threading.Lock(), list(items), set()
 
     def worker():
         while True:
@@ -98,14 +106,18 @@ def run_phase(items, workers):
                 item = queue.pop(0)
             t0 = time.time()
             try:
-                msg = generate(item)
+                ok, msg = generate(item)
             except Exception as e:  # noqa: BLE001 - keep the batch going, report failures
-                msg = f"{item['id']}: ERROR {e}"
+                ok, msg = False, f"{item['id']}: ERROR {e}"
+            if ok:
+                with lock:
+                    written.add(item["id"])
             print(f"[{time.time() - t0:4.0f}s] {msg}", flush=True)
 
     threads = [threading.Thread(target=worker) for _ in range(min(workers, len(items)))]
     [t.start() for t in threads]
     [t.join() for t in threads]
+    return written
 
 
 if __name__ == "__main__":

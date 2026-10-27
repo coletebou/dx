@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import warnings
@@ -138,6 +139,52 @@ class MusicVideoTests(unittest.TestCase):
         self.assertEqual(load("gen_images", self.project, IMAGE_MODEL="img-x").MODEL, "img-x")
         self.assertEqual(load("gen_videos", self.project, VIDEO_MODEL="vid-x").MODEL, "vid-x")
         self.assertEqual(load("watch", self.project, WATCH_MODEL="watch-x", GOOGLE_API_KEY="k").MODEL, "watch-x")
+
+    def image_project(self, name):
+        """A project with an existing hero.png (the old design) and a scene that references it."""
+        proj = Path(self.temp.name) / name
+        (proj / "images").mkdir(parents=True)
+        spec = {"style": "s", "night_style": "n", "surreal_style": "u", "size": "1024x1024",
+                "images": [{"id": "hero", "prompt": "the hero"},
+                           {"id": "scene", "prompt": "the hero on a lawn", "refs": ["hero"]}]}
+        (proj / "images/prompts.json").write_text(json.dumps(spec))
+        (proj / "images/hero.png").write_bytes(b"old hero")
+        return proj
+
+    def regenerate(self, proj, hero_ok):
+        """Run gen_images.py --force with two workers and a fake generator; return what each item saw."""
+        gen = load("gen_images", proj)
+        seen = {}
+
+        def fake_generate(item):
+            if item["id"] == "hero":
+                time.sleep(0.5)   # a slow paid generation, so a scene started alongside it would win the race
+                if not hero_ok:
+                    return False, "hero: FAILED"
+            seen[item["id"]] = (proj / "images/hero.png").read_bytes()
+            (proj / "images" / f"{item['id']}.png").write_bytes(f"new {item['id']}".encode())
+            return True, f"{item['id']}: ok"
+
+        with patch.object(gen, "generate", side_effect=fake_generate), \
+                patch.object(sys, "argv", ["gen_images.py", "--force", "--workers=2"]):
+            try:
+                gen.main()
+                exit_msg = None
+            except SystemExit as e:
+                exit_msg = str(e)
+        return seen, exit_msg
+
+    def test_a_reference_being_regenerated_finishes_before_its_dependents_start(self):
+        proj = self.image_project("images-force")
+        seen, exit_msg = self.regenerate(proj, hero_ok=True)
+        self.assertIsNone(exit_msg)
+        self.assertEqual(seen.get("scene"), b"new hero", "the scene was conditioned on the old hero")
+
+    def test_a_reference_that_fails_to_regenerate_blocks_its_dependents(self):
+        proj = self.image_project("images-hero-fails")
+        seen, exit_msg = self.regenerate(proj, hero_ok=False)
+        self.assertNotIn("scene", seen, "the scene was generated from the old hero")
+        self.assertIn("scene", exit_msg or "")
 
     @unittest.skipUnless(Image, "Pillow not installed")
     def test_a_contact_sheet_renders_wherever_the_script_runs(self):
