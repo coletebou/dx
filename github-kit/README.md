@@ -145,9 +145,7 @@ show in the Actions tab, but never among the PR's checks, which are its pull_req
 what its required checks are judged on. So a dispatch is a signal (for a draft, or a retargeted
 PR), and a failed or cancelled full lane on a ready PR is repaired by rerunning the PR's own run,
 which keeps that run's commit and event: a run started while the PR was a draft stays a fast
-lane. GitHub does not record which PR started a run (a run lists every open PR whose head matches
-it), so when one head branch has open PRs into two bases, the approval reruns nothing and says
-why. That workflow keeps this contract:
+lane. That workflow keeps this contract:
 
 - it accepts `workflow_dispatch` with the string inputs `pr` (the PR number) and `base` (the PR's
   base branch, the new one after a retarget), which the dispatching workflows set, and does not
@@ -155,6 +153,13 @@ why. That workflow keeps this contract:
 - when `base` is set, every job that tests code merges `origin/<base>` into its checkout before
   anything else runs (a conflict fails the job), so a dispatched run tests what a pull_request run
   tests, the PR merged onto its base, and a retarget that breaks the integration turns it red;
+- it titles a PR's runs with `run-name`, exactly `ci-full #<PR> -> <base>`, from the triggering
+  event (the pull request's number and base, or a dispatch's `pr` and `base`). GitHub records no
+  triggering PR on a run: a run's `pull_requests` are the PRs open now whose head matches it, so
+  two PRs on one head branch appear on each other's runs, and a closed one's runs list only the
+  other. The title is fixed when the run is created, so `ci-full-on-approval.yml` ties a run to
+  its PR, and to the base it tested, by the title alone. A run titled otherwise (no `run-name`, so
+  the PR's title) is never rerun: the step summary says the run-name is missing;
 - its concurrency group is keyed by the PR, so a dispatched run and the PR's own runs cancel
   each other like runs of one PR: `ci-${{ inputs.pr || github.event.pull_request.number || github.ref }}`;
 - one job, named by `CI_FULL_JOB` (default `full`; the name a run shows for it), has no `needs`
@@ -165,6 +170,10 @@ A skeleton:
 
 ```yaml
 name: ci
+run-name: >-
+  ${{ (github.event.pull_request.number || inputs.pr) && format('ci-full #{0} -> {1}',
+  github.event.pull_request.number || inputs.pr, github.event.pull_request.base.ref || inputs.base)
+  || format('ci-full {0}', github.ref_name) }}
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]

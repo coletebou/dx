@@ -557,11 +557,12 @@ mkdir -p "$tmp/wfbin"
 cat > "$tmp/wfbin/gh" <<'PY'
 #!/usr/bin/env python3
 """A fake gh for workflow steps. $FAKE_RUNS holds {"tip": SHA, "runs": [...]}, newest first, each
-run {databaseId, headSha, status, conclusion, event, headBranch, headRepository, pullRequests,
-jobs}. `api .../pulls/N`, `api .../actions/runs/ID` (the REST run: as on GitHub, its
-pull_requests are the open PRs whose head matches the run, not the PR that started it), `run
-list` and `run view` answer from it (--jq through the real jq); `run rerun` and `workflow run`
-only succeed. Every call's argv goes to $FAKE_GH_LOG as a JSON line."""
+run {databaseId, headSha, status, conclusion, event, headBranch, headRepository, title,
+pullRequests, jobs}. `api .../pulls/N`, `api .../actions/runs/ID` (the REST run: its
+display_title is the run-name, and as on GitHub its pull_requests are the PRs open NOW whose head
+matches the run, not the PR that started it), `run list` and `run view` answer from it (--jq
+through the real jq); `run rerun` and `workflow run` only succeed. Every call's argv goes to
+$FAKE_GH_LOG as a JSON line."""
 import json
 import os
 import subprocess
@@ -592,7 +593,7 @@ if argv[:1] == ["api"] and "/actions/runs/" in argv[1]:
     run = next(r for r in data["runs"] if argv[1].endswith("/actions/runs/%s" % r["databaseId"]))
     answer({"id": run["databaseId"], "event": run["event"], "status": run["status"],
             "conclusion": run["conclusion"] or None, "head_branch": run["headBranch"], "head_sha": run["headSha"],
-            "head_repository": {"full_name": run["headRepository"]},
+            "head_repository": {"full_name": run["headRepository"]}, "display_title": run["title"],
             "pull_requests": [{"number": n} for n in run["pullRequests"]]})
 if argv[:1] == ["api"] and "/pulls/" in argv[1]:
     answer({"head": {"sha": data["tip"]}})
@@ -614,7 +615,7 @@ run_step() {  # run_step WORKFLOW_FILE STEP_NAME [VAR=VALUE...]: its exit status
   : > "$tmp/wf.log"; : > "$tmp/summary"
   python3 "$tmp/step.py" "$file" "$name" > "$tmp/step.sh" 2> "$tmp/step.out" || return 99
   env PATH="$tmp/wfbin:$PATH" FAKE_GH_LOG="$tmp/wf.log" FAKE_RUNS="$tmp/runs.json" GITHUB_STEP_SUMMARY="$tmp/summary" \
-    GH_TOKEN=x GH_REPO=example/widgets WORKFLOW=ci.yml PR_NUMBER=7 HEAD_REF=feature HEAD_SHA="$head_sha" "$@" \
+    GH_TOKEN=x GH_REPO=example/widgets WORKFLOW=ci.yml PR_NUMBER=7 HEAD_REF=feature BASE_REF=main HEAD_SHA="$head_sha" "$@" \
     bash -eo pipefail "$tmp/step.sh" > "$tmp/step.out" 2>&1
 }
 # The calls that act (a rerun or a dispatch), one per line, without gh's other arguments' quoting.
@@ -629,16 +630,18 @@ runs() {  # runs TIP RUN_JSON...: the fixture, newest run first
   printf '{"tip": "%s", "runs": [%s]}\n' "$tip" "$(IFS=,; printf '%s' "$*")" > "$tmp/runs.json"
 }
 prun() {  # prun ID EVENT BRANCH STATUS CONCLUSION [FULL_STATUS FULL_CONCLUSION]: one run
-  # PRS: the numbers GitHub lists in the run's pull_requests (default 7); HREPO: its head repository.
+  # TITLE: its display title, the contract's run-name (default PR #7 into main); PRS: the PR numbers
+  # GitHub lists in its pull_requests now (default 7); HREPO: its head repository.
   local jobs='[{"name": "fast", "status": "completed", "conclusion": "success"}' prs="${PRS-7}"
+  local title="${TITLE-ci-full #7 -> main}"
   if [[ $# -ge 7 ]]; then jobs="$jobs"', {"name": "full", "status": "'"$6"'", "conclusion": "'"$7"'"}]'
   elif [[ "$4" == completed && "$5" == cancelled ]]; then jobs='[]'
   else jobs="$jobs]"; fi
-  printf '{"databaseId": %s, "headSha": "%s", "event": "%s", "headBranch": "%s", "status": "%s", "conclusion": "%s", "headRepository": "%s", "pullRequests": [%s], "jobs": %s}' \
-    "$1" "$head_sha" "$2" "$3" "$4" "$5" "${HREPO:-example/widgets}" "$prs" "$jobs"
+  printf '{"databaseId": %s, "headSha": "%s", "event": "%s", "headBranch": "%s", "status": "%s", "conclusion": "%s", "headRepository": "%s", "title": "%s", "pullRequests": [%s], "jobs": %s}' \
+    "$1" "$head_sha" "$2" "$3" "$4" "$5" "${HREPO:-example/widgets}" "$title" "$prs" "$jobs"
 }
 approval="$kit/workflows/ci-full-on-approval.yml"
-approve() { run_step "$approval" "Rerun the PR's full CI lane for the approved head" FULL_JOB=full; }
+approve() { run_step "$approval" "Rerun the PR's full CI lane for the approved head" FULL_JOB=full "$@"; }
 if command -v jq >/dev/null 2>&1; then
   runs "$head_sha" "$(prun 30 workflow_dispatch feature completed success completed success)" \
     "$(prun 20 pull_request feature completed failure completed failure)"
@@ -659,26 +662,45 @@ if command -v jq >/dev/null 2>&1; then
   approve; rc=$?
   equal "approval: a draft's fast-lane run is not rerun (a rerun keeps its draft payload)" "0 " "$rc $(acts)"
   check "...and the summary says how to get a full run" "mark it ready for review again" "$(cat "$tmp/summary")"
-  runs "$head_sha" "$(PRS=9 prun 25 pull_request other completed failure completed failure)"
+  runs "$head_sha" "$(PRS=9 TITLE='ci-full #9 -> main' prun 25 pull_request other completed failure completed failure)"
   approve; rc=$?
   equal "approval: another PR's run of the same commit is not rerun" "0 " "$rc $(acts)"
-  # One head branch with open PRs into two bases (#7 and #8): their runs share the head commit and
-  # branch, and GitHub lists both PRs on each, so no run can be told to be #7's.
-  runs "$head_sha" "$(PRS=7,8 prun 31 pull_request feature completed failure completed failure)"
+  # One head branch with PRs into two bases (#7 into main, #8 into release): their runs share the
+  # head commit and branch, and GitHub lists every OPEN one of them on each run, so only the
+  # run-name tells whose a run is.
+  runs "$head_sha" "$(PRS=7,8 TITLE='ci-full #8 -> release' prun 31 pull_request feature completed failure completed failure)" \
+    "$(PRS=7,8 prun 30 pull_request feature completed failure completed failure)"
   approve; rc=$?
-  equal "approval: with two open PRs on one head, a failed run that may be the other's is not rerun" "0 " "$rc $(acts)"
-  check "...and the summary names both PRs" "#7 #8" "$(cat "$tmp/summary")"
-  runs "$head_sha" "$(PRS=7,8 prun 33 pull_request feature completed success completed success)" \
+  equal "approval: two open PRs on one head: this PR's failed run is rerun, not the other's newer one" "0 run rerun 30" "$rc $(acts)"
+  runs "$head_sha" "$(PRS=7,8 TITLE='ci-full #8 -> release' prun 33 pull_request feature completed success completed success)" \
     "$(PRS=7,8 prun 32 pull_request feature completed failure completed failure)"
   approve; rc=$?
-  equal "...nor does a passing run that may be the other's count as this PR's" "0 " "$rc $(acts)"
-  lacks "...(the summary does not call the head covered)" "already" "$(cat "$tmp/summary")"
+  equal "...and the other's passing run does not stand in for this PR's" "0 run rerun 32" "$rc $(acts)"
+  # #8 has been closed: its runs now list only the open #7.
+  runs "$head_sha" "$(PRS=7 TITLE='ci-full #8 -> release' prun 37 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: a closed sibling's failed run, which lists only this PR now, is not rerun" "0 " "$rc $(acts)"
+  runs "$head_sha" "$(PRS=7 TITLE='ci-full #8 -> release' prun 39 pull_request feature completed success completed success)" \
+    "$(prun 38 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "...nor does its pass suppress this PR's rerun" "0 run rerun 38" "$rc $(acts)"
+  runs "$head_sha" "$(TITLE='Fix the widget' prun 40 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: a run without the contract's run-name (its title is the PR's) is not rerun" "0 " "$rc $(acts)"
+  check "...and the summary says what to set" "run-name" "$(cat "$tmp/summary")"
+  runs "$head_sha" "$(TITLE='follow-up to ci-full #7 -> main' prun 41 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: a title that only contains the tag is not the run-name" "0 " "$rc $(acts)"
+  runs "$head_sha" "$(TITLE='ci-full #7 -> release' prun 42 pull_request feature completed failure completed failure)"
+  approve; rc=$?
+  equal "approval: this PR's run against a base it no longer has is not rerun (a rerun tests that base)" "0 " "$rc $(acts)"
+  check "...and the summary names the base it tested" "release" "$(cat "$tmp/summary")"
+  runs "$head_sha" "$(TITLE='ci-full #7 -> release/1.x' prun 43 pull_request feature completed failure completed failure)"
+  approve BASE_REF=release/1.x; rc=$?
+  equal "approval: a base with a slash and a dot in its name matches" "0 run rerun 43" "$rc $(acts)"
   runs "$head_sha" "$(PRS='' HREPO=someone/widgets prun 34 pull_request feature completed failure completed failure)"
   approve; rc=$?
   equal "approval: a fork PR's run of the same commit, from a branch of the same name, is not rerun" "0 " "$rc $(acts)"
-  runs "$head_sha" "$(PRS='' prun 35 pull_request feature completed failure completed failure)"
-  approve; rc=$?
-  equal "approval: a run GitHub ties to no open PR is not rerun" "0 " "$rc $(acts)"
   runs "$head_sha" "$(HREPO=Example/Widgets prun 36 pull_request feature completed failure completed failure)"
   approve; rc=$?
   equal "approval: the head repository's name matches in any case, as GitHub's names do" "0 run rerun 36" "$rc $(acts)"
@@ -703,6 +725,9 @@ equal "ci:full: a fork PR is refused, with no dispatch" "1 " "$rc $(acts)"
 echo "the CI skeleton in the kit's README"
 awk '/^A skeleton:$/ { s = 1; next } s && /^```yaml$/ { y = 1; next } y && /^```$/ { exit } y' "$kit/README.md" > "$tmp/skeleton.yml"
 check "the skeleton takes the base as a dispatch input" $'      base:\n' "$(cat "$tmp/skeleton.yml")"
+check "...and titles a PR's runs ci-full #<PR> -> <base>, from the event or the dispatch inputs" \
+  "format('ci-full #{0} -> {1}',"$'\n'"  github.event.pull_request.number || inputs.pr, github.event.pull_request.base.ref || inputs.base)" \
+  "$(cat "$tmp/skeleton.yml")"
 check "...and fetches the history a merge needs when it is set" "fetch-depth: \${{ inputs.base != '' && '0' || '1' }}" "$(cat "$tmp/skeleton.yml")"
 merge_step="Merge the base, as a pull_request run would"
 unmerged=""

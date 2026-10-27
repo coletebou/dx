@@ -33,13 +33,18 @@ name: CI Full On Approval
 # previous head's run cancels, and an approval often lands in that window.
 #
 # Whose run a run is: GitHub records no triggering PR on a run. Its
-# `pull_requests` are the open PRs whose head matches the run, so a run counts
-# as this PR's only when it is a pull_request run from this repository whose
-# list is exactly this PR. One head branch with open PRs into two bases gives
-# runs that list both PRs: any of them may be the other PR's, so none is
-# rerun and none counts as a pass, and the summary says why. A fork's head
-# gives an empty list (and another head repository), so a fork's run of the
-# same commit, even from a branch of the same name, is never this PR's.
+# `pull_requests` are the PRs open NOW whose head matches it, so two PRs on one
+# head branch (into two bases) both appear on each other's runs, and once one
+# closes, its runs list only the other. The evidence used instead is the run's
+# title, fixed when the run is created: the full CI workflow sets
+# `run-name: ci-full #<PR> -> <base>` from its triggering event (the kit's
+# README.md has the contract). A run is this PR's when it is a pull_request
+# run from this repository titled exactly `ci-full #<this PR> -> <its base
+# now>`. Titled for this PR but another base (it ran before a retarget), it is
+# not rerun: a rerun keeps the run's merge commit, so it would test that base
+# again. A run with any other title (no run-name, so the PR's title) is never
+# this PR's: it is reported, not rerun. A fork's run of the same commit, even
+# from a branch of the same name, has another head repository and never is.
 
 on:
   pull_request_review:
@@ -76,36 +81,39 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           tip="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq .head.sha)"
           if [[ "$tip" != "$HEAD_SHA" ]]; then
             echo "Branch tip ${tip:0:7} moved past the approved ${HEAD_SHA:0:7}; nothing to rerun." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          # Each run of the head, newest first, is first placed: "mine" (a
-          # pull_request run from this repository listing exactly this PR),
-          # "shared #A #B" (it lists this PR and others, so it may be any of
-          # theirs) or "other" (a fork's, another PR's, a dispatch, a run GitHub
-          # ties to no open PR). Then it is one of:
+          # Each run of the head, newest first, is first placed by its title:
+          # "mine" (a pull_request run from this repository titled
+          # `ci-full #<this PR> -> <its base now>`), "stale <base>" (titled for
+          # this PR, another base), "untagged" (a pull_request run from this
+          # repository with another title) or "other" (another PR's, a fork's,
+          # a dispatch). Then it is one of:
           #   inflight  not finished, with FULL_JOB running or still to come
           #   passed    this PR's, with FULL_JOB and the whole run passed
           #   rerun     this PR's and finished, its full lane failed or cancelled
           #             (or the run cancelled before its jobs existed)
           #   draft     this PR's and finished, with FULL_JOB skipped
-          #   shared    finished, and possibly another open PR's
+          #   stale     finished, this PR's run against another base
+          #   untagged  finished, and not tied to any PR by its title
           #   none      anything else, a finished dispatched run among them
           #             (never one of the PR's checks)
-          rerun="" draft=0 shared=""
+          rerun="" draft=0 stale="" untagged=0
           for run_id in $(gh run list --workflow "$WORKFLOW" --commit "$HEAD_SHA" \
             --json databaseId --jq '.[].databaseId'); do
-            # shellcheck disable=SC2016 # $pr and $prs are jq variables
+            # shellcheck disable=SC2016 # $tag is a jq variable
             owner="$(gh api "repos/${GH_REPO}/actions/runs/${run_id}" --jq '
-              (env.PR_NUMBER | tonumber) as $pr
-              | ([.pull_requests[]?.number] | sort) as $prs
+              ([.display_title // "" | match("^ci-full #([0-9]+) -> ([^ ]+)$") | .captures | map(.string)] | first) as $tag
               | if .event != "pull_request" or (.head_repository.full_name | ascii_downcase) != (env.GH_REPO | ascii_downcase) then "other"
-                elif $prs == [$pr] then "mine"
-                elif ($prs | any(. == $pr)) then "shared " + ($prs | map("#\(.)") | join(" "))
-                else "other" end')"
+                elif $tag == null then "untagged"
+                elif $tag[0] != env.PR_NUMBER then "other"
+                elif $tag[1] != env.BASE_REF then "stale " + $tag[1]
+                else "mine" end')"
             # shellcheck disable=SC2016 # $run, $status and $job are jq variables
             state="$(OWNER="${owner%% *}" gh run view "$run_id" --json status,conclusion,jobs,event --jq '
               .conclusion as $run
@@ -116,7 +124,7 @@ jobs:
                     if env.OWNER != "other" or .event == "workflow_dispatch" or .event == "merge_group" then "inflight" else "none" end
                   elif $job.conclusion == "skipped" then "none"
                   else "inflight" end
-                elif env.OWNER == "shared" then "shared"
+                elif env.OWNER == "stale" or env.OWNER == "untagged" then env.OWNER
                 elif env.OWNER != "mine" then "none"
                 elif $job == null then "rerun"
                 elif $job.conclusion == "skipped" then "draft"
@@ -128,12 +136,15 @@ jobs:
                 exit 0 ;;
               rerun) [[ -n "$rerun" ]] || rerun="$run_id" ;;
               draft) draft=1 ;;
-              shared) shared="${owner#shared }" ;;
+              stale) stale="${owner#stale }" ;;
+              untagged) untagged=1 ;;
             esac
           done
           if [[ -z "$rerun" ]]; then
-            if [[ -n "$shared" ]]; then
-              echo "\`${HEAD_REF}\` at ${HEAD_SHA:0:7} is the head of more than one open PR (${shared}), and GitHub does not record which PR started a run, so none is rerun. Push a commit, or rerun the right run from the Actions tab." >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$untagged" == 1 ]]; then
+              echo "${WORKFLOW} runs of ${HEAD_SHA:0:7} are not titled \`ci-full #<PR> -> <base>\`, so none can be tied to PR #${PR_NUMBER} and none is rerun. Set that run-name in ${WORKFLOW}, as the kit's README.md says." >> "$GITHUB_STEP_SUMMARY"
+            elif [[ -n "$stale" ]]; then
+              echo "PR #${PR_NUMBER}'s ${WORKFLOW} runs of ${HEAD_SHA:0:7} tested base \`${stale}\`, not its base now (\`${BASE_REF}\`), and a rerun would test \`${stale}\` again. Convert the PR to draft and mark it ready for review again to run the full lane." >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$draft" == 1 ]]; then
               echo "PR #${PR_NUMBER}'s only ${WORKFLOW} run of ${HEAD_SHA:0:7} is a draft's fast lane, which a rerun would repeat. Convert the PR to draft and mark it ready for review again to run the full lane." >> "$GITHUB_STEP_SUMMARY"
             else
