@@ -110,10 +110,13 @@ Git (the committed Markdown, never the working tree) and runs `memory-canary --s
 push cannot publish an index that Claude Code would truncate or that links to nothing. Rows must
 name directories inside the repository: relative paths, `~/.dotfiles/...` (where `install.sh`
 links the checkout), or absolute paths that resolve into it; rows outside it are live memory with
-nothing committed to check. A repository with no committed `claude/memory-homes.conf` anywhere in
-its history (this public one, any other) passes at once and prints nothing. Deleting the
-configuration retires it, and the homes still committed are still checked. Clean verdicts are
-cached by content in `~/.cache/pre-push-memory` (`PRE_PUSH_MEMORY_CACHE=0` turns that off).
+nothing committed to check. To make the gate insist on the configuration, also commit an empty
+`claude/memory-repo`: while that declaration is committed, a push without
+`claude/memory-homes.conf` is blocked. A repository with neither file anywhere in its history
+(this public one, any other) passes at once and prints nothing; never commit either to a public
+fork. Deleting the configuration (and the declaration, if there is one) retires memory, and the
+homes still committed are still checked. Clean verdicts are cached by content in
+`~/.cache/pre-push-memory` (`PRE_PUSH_MEMORY_CACHE=0` turns that off).
 
 ## Sharing memory with Codex
 

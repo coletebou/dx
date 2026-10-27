@@ -103,7 +103,7 @@ class MemoryGateTest(unittest.TestCase):
 
     def test_repository_shipping_the_checker_without_a_configuration_passes_silently(self):
         # This repository and its forks: the gate, the checker, the baseline template and the
-        # configuration template are committed, no configuration and no memory are.
+        # configuration template are committed; no configuration, declaration or memory is.
         for name in ('scripts/pre-push-memory', 'scripts/memory-canary', 'scripts/wiki-dangle-baseline',
                      'claude/memory-homes.conf.example'):
             self.write(name, 'shipped\n')
@@ -120,6 +120,70 @@ class MemoryGateTest(unittest.TestCase):
         result = subprocess.run([str(HELPER)], cwd=self.repo, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn('usage: pre-push-memory', result.stderr)
+
+    def test_declaration_alone_makes_a_memory_repository_that_needs_a_configuration(self):
+        # claude/memory-repo declares a memory repository before (or without) its configuration.
+        self.write('claude/memory-repo', '')
+        old = self.commit()
+        self.git('update-ref', 'refs/remotes/origin/existing', old)
+        self.write('README.md', 'later work')
+        tip = self.commit()
+        for args in ((old, ZERO), (tip, old), (tip, ZERO)):
+            with self.subTest(args=args):
+                result = self.gate(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('(claude/memory-repo) is missing claude/memory-homes.conf', result.stderr)
+
+    def test_declared_repository_checks_its_configured_homes(self):
+        self.write('claude/memory-repo', '')
+        tip = self.setup_memory()
+        result = self.gate(tip)
+        self.assertEqual((result.returncode, reported_homes(result.stdout)), (0, ['memory/test']), result.stderr)
+        self.write('memory/test/MEMORY.md', '[broken](absent.md)')
+        self.assertNotEqual(self.check(self.commit(), tip), 0)
+
+    def test_deleting_the_configuration_of_a_declared_repository_blocks(self):
+        self.write('claude/memory-repo', '')
+        old = self.setup_memory()
+        (self.repo / 'claude/memory-homes.conf').unlink()
+        result = self.gate(self.commit(), old)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is missing claude/memory-homes.conf', result.stderr)
+
+    def test_removing_declaration_and_configuration_retires_the_repository(self):
+        for index, blocks in ((None, False), ('[broken](absent.md)', True), ('# Healthy, still checked', False)):
+            with self.subTest(index=index):
+                self.doCleanups()
+                self.setUp()
+                self.write('claude/memory-repo', '')
+                old = self.setup_memory()
+                self.git('update-ref', 'refs/remotes/origin/existing', old)
+                for name in ('claude/memory-repo', 'claude/memory-homes.conf'):
+                    (self.repo / name).unlink()
+                if index is None:
+                    (self.repo / 'memory/test/MEMORY.md').unlink()  # memory retired completely
+                else:
+                    self.write('memory/test/MEMORY.md', index)
+                tip = self.commit()
+                for args in ((tip, old), (tip, ZERO)):
+                    result = self.gate(*args)
+                    self.assertEqual(result.returncode != 0, blocks, result.stdout + result.stderr)
+                    self.assertEqual(reported_homes(result.stdout), [] if index is None else ['memory/test'])
+
+    def test_declaration_only_in_history_is_still_a_memory_repository(self):
+        # A declaration that was removed still marks the history: its former homes stay checked.
+        self.write('claude/memory-repo', '')
+        self.write('memory/test/MEMORY.md', '# Healthy')
+        self.write('claude/memory-homes.conf', 'test memory/test\n')
+        self.commit()
+        for name in ('claude/memory-repo', 'claude/memory-homes.conf'):
+            (self.repo / name).unlink()
+        retired = self.commit()
+        self.git('update-ref', 'refs/remotes/origin/existing', retired)
+        self.write('memory/test/MEMORY.md', '[broken](absent.md)')
+        tip = self.commit()
+        self.assertNotEqual(self.check(tip, retired), 0)
+        self.assertNotEqual(self.check(tip), 0)
 
     def test_committed_good_ignores_dirty_bad(self):
         tip = self.setup_memory()

@@ -6,7 +6,8 @@
 base/git/hooks/pre-push runs this once per outgoing ref, in the repository being pushed,
 when it exists next to the hook's checkout. A repository is a memory repository when its
 history holds a committed claude/memory-homes.conf (rows `<shortname> <path>`; a path outside
-the repository is live memory, with nothing committed to check). For each memory home the
+the repository is live memory, with nothing committed to check) or claude/memory-repo (a
+declaration: while it is committed, the configuration must be too). For each memory home the
 push changes, the committed Markdown is copied out of Git into a temporary directory and
 checked with `memory-canary --strict`; the working tree and the live memory directories are
 never read. Any other repository, this one included, passes at once and prints nothing.
@@ -27,12 +28,15 @@ import tempfile
 import unicodedata
 
 CONFIG = 'claude/memory-homes.conf'
-# What makes a repository a memory repository: a committed configuration, at the tip or
-# anywhere in the history the push reaches. The checker is not a marker: this repository
-# ships it with only a template (claude/memory-homes.conf.example), and so does every fork
-# that commits no memory. A repository that ever committed a configuration cannot hide its
-# homes by deleting it: every home still in the tree is checked as a former home.
-MARKERS = (CONFIG,)
+# Declares a memory repository even before (or without) its configuration.
+DECLARATION = 'claude/memory-repo'
+# What makes a repository a memory repository: a committed configuration or declaration, at
+# the tip or anywhere in the history the push reaches. The checker is not a marker: this
+# repository ships it with only a template (claude/memory-homes.conf.example), and so does
+# every fork that commits no memory. A repository that ever committed a configuration
+# cannot hide its homes by deleting it: every home still in the tree is checked as a former
+# home. A tip that still declares itself must carry its configuration.
+MARKERS = (CONFIG, DECLARATION)
 CHECKER = pathlib.Path(__file__).resolve().with_name('memory-canary')
 OBJECT_ID = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 # Each git process costs ~70-90 ms to start on macOS. Independent reads and the
@@ -411,6 +415,8 @@ def main():
         if not has_marker(history):
             return
         candidates = list(dict.fromkeys(candidates + history))
+    if exists(tip, DECLARATION) and not exists(tip, CONFIG):
+        raise ValueError(f'outgoing memory repository ({DECLARATION}) is missing {CONFIG}')
     # Only a memory repository gets here. Start its remaining independent reads;
     # each result is collected where the sequential gate used to run it.
     tree_listing = POOL.submit(git, 'ls-tree', '-r', '-t', '-z', tip)
@@ -421,9 +427,10 @@ def main():
     # has_marker already answered whether each candidate holds a configuration.
     configurations([revision for revision in candidates if exists(revision, CONFIG)])
     # Two repo keys may share one home (a renamed repo that kept its old key, say);
-    # check each home once. A tip without a configuration has retired it: no home is
-    # configured, and every former home still in the tree is checked below, so a
-    # repository can stop committing memory without hiding what it still commits.
+    # check each home once. A tip without a configuration (and so, after the check above,
+    # without a declaration) has retired it: no home is configured, and every former home
+    # still in the tree is checked below, so a repository can stop committing memory
+    # without hiding what it still commits.
     configured = list(dict.fromkeys(homes(tip))) if exists(tip, CONFIG) else []
     tree_paths = [record.split(b'\t', 1)[1].decode('utf-8', errors='surrogateescape')
                   for record in tree_listing.result().split(b'\0') if record]
