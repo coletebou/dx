@@ -49,6 +49,8 @@ installer stops and tells you your options.
 | [`memory`](plugins/memory) | `reflect`, `dreaming`, `session-analyzer` | End-of-session retrospectives, nightly memory consolidation, and a transcript scan for unfinished work and repeated corrections. |
 | [`codex`](plugins/codex) | `codex-subagents`, `codex-transcripts` | Fan out Codex subagents through tmux; read what a Codex agent really did from its transcript. |
 | [`review`](plugins/review) | `adversarial-review`, `mcp-agent-safety`, `fable-second-opinion` | Reviews where every finding must survive refuters; a canary harness proving an MCP server cannot leak its secrets; a second-opinion advisor in its own tmux window. |
+| [`toolbox`](plugins/toolbox) | `disk-reclaim`, `shipped-but-open` | Free disk space without touching active work, from a bounded read-only survey; find open GitLab issues whose work already merged. |
+| [`music-video`](plugins/music-video) | `music-video` | An original song and a music video for it, end to end: lyrics, generated takes picked by fidelity, word-timed typography and three.js 3D rendered frame by frame, a mastered mix and social cuts. |
 
 ### Components (`install.sh`)
 

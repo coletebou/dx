@@ -90,13 +90,15 @@ for b in pw pw-append stack-branches stack-claude wt-helper cc-park cc-handoff r
   [[ -L "$HOME/.local/bin/$b" && -x "$HOME/.local/bin/$b" ]] || bad "~/.local/bin/$b is a working link" "a link" "$(ls -l "$HOME/.local/bin/$b" 2>&1)"
 done
 ok "the CLIs are linked into ~/.local/bin"
-for s in cc-park fresh-session-handoff parallel-worktrees tmux-archive reflect codex-subagents mcp-agent-safety; do
+for s in cc-park fresh-session-handoff parallel-worktrees tmux-archive reflect codex-subagents mcp-agent-safety \
+  disk-reclaim shipped-but-open; do
   [[ -f "$HOME/.claude/skills/$s/SKILL.md" ]] || bad "skill $s is linked" "SKILL.md" "$(ls -l "$HOME/.claude/skills/$s" 2>&1)"
 done
 ok "the skills are linked into ~/.claude/skills"
 lacks "schedules are not part of --all" "systemctl" "$(cat "$tmp/calls" 2>/dev/null)"
 equal "the manager overlay setting is not part of --all" "absent" \
   "$([[ -e "$HOME/.config/drover/dx-openclaw-manager.env" ]] && echo present || echo absent)"
+equal "...nor is music-video" "absent" "$([[ -e "$HOME/.claude/skills/music-video" ]] && echo present || echo absent)"
 
 echo "idempotent"
 out="$(inst --all)"; rc=$?
@@ -110,6 +112,11 @@ if command -v zsh >/dev/null 2>&1; then
 else
   ok "# SKIP zsh not installed"
 fi
+
+echo "music-video"
+out="$(inst --with music-video)"; rc=$?
+equal "a music-video install succeeds" 0 "$rc"
+equal "...and links its skill" "$root/plugins/music-video/skills/music-video" "$(readlink "$HOME/.claude/skills/music-video")"
 
 echo "a foreign ~/.dotfiles"
 newhome 3

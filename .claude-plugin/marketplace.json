@@ -50,6 +50,20 @@
       "version": "1.0.0",
       "source": "./plugins/review",
       "category": "review"
+    },
+    {
+      "name": "toolbox",
+      "description": "Free disk space on a Mac or Linux dev host without touching active work, from a bounded read-only survey (disk-reclaim), and find open GitLab issues whose work already merged (shipped-but-open)",
+      "version": "1.0.0",
+      "source": "./plugins/toolbox",
+      "category": "utilities"
+    },
+    {
+      "name": "music-video",
+      "description": "Make an original song and a music video for it end to end: lyrics, generated song takes picked by fidelity, word-timed kinetic typography and three.js 3D rendered frame by frame, a mastered mix and social cuts (music-video)",
+      "version": "1.0.0",
+      "source": "./plugins/music-video",
+      "category": "creative"
     }
   ]
 }

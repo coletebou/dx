@@ -17,7 +17,7 @@ cd "$root" || exit 1
 sh_files=() zsh_files=() py_files=() json_files=()
 while IFS= read -r -d '' f; do
   [[ -f "$f" && ! -L "$f" ]] || continue
-  first="$(head -n 1 "$f" 2>/dev/null)"
+  first="$(head -n 1 "$f" 2>/dev/null | tr -d '\0')"  # binary files (fonts) hold NUL bytes
   case "$f" in
     *.json) json_files+=("$f"); continue ;;
     *.py) py_files+=("$f"); continue ;;

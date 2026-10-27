@@ -2,6 +2,13 @@
 
 Everything in this repository is MIT-licensed (see [LICENSE](LICENSE)) unless a file says otherwise.
 
+## Included under other licenses
+
+- **Fonts** in `plugins/music-video/skills/music-video/template/fonts/`: Bricolage Grotesque, Caveat,
+  Instrument Serif, Inter and JetBrains Mono, from [Google Fonts](https://fonts.google.com), under the
+  [SIL Open Font License 1.1](https://openfontlicense.org). Each family's copyright notice and the license
+  text are in that directory's [OFL.txt](plugins/music-video/skills/music-video/template/fonts/OFL.txt).
+
 ## Designs followed
 
 - **Dreaming** (`scripts/dream`, the `dreaming` skill) is an independent implementation of the

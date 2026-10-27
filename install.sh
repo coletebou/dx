@@ -26,8 +26,8 @@
 set -euo pipefail
 
 DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review schedules github-kit manager"
-DEFAULT_ALL="shell git tmux claude codex session worktrees memory review"
+ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review toolbox music-video schedules github-kit manager"
+DEFAULT_ALL="shell git tmux claude codex session worktrees memory review toolbox"
 
 describe() {
     case "$1" in
@@ -40,6 +40,8 @@ describe() {
         worktrees) echo "wt-helper, pw, stack-branches and stack-claude, with their skills" ;;
         memory)    echo "reflections, dream, session-analyzer and claude-consolidate, with their skills" ;;
         review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
+        toolbox)   echo "the disk-reclaim and shipped-but-open skills" ;;
+        music-video) echo "the music-video skill (song and video pipeline; paid API keys; not in --all)" ;;
         schedules) echo "launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, nightly dream, tmux autosave (not in --all)" ;;
         github-kit) echo "issue forms, a PR template, labels and workflows, copied into the .github/ of the repo --target names (not in --all)" ;;
         manager)   echo "a Drover setting naming identities/<id>/openclaw-manager as its fleet manager's overlay (not in --all)" ;;
@@ -424,6 +426,18 @@ c_memory() {
 c_review() {
     link_bins "$DOTFILES_DIR/scripts/autoreview-pair"
     link_skills review
+}
+
+c_toolbox() {
+    link_skills toolbox
+    need python3 "disk-reclaim's survey is Python"
+    need glab "shipped-but-open reads GitLab through glab"
+}
+
+c_music_video() {
+    link_skills music-video
+    need ffmpeg "music-video mixes, masters and encodes with ffmpeg"
+    need node "music-video renders frames in headless Chrome through Node"
 }
 
 # The schedule templates name their binaries under __HOME__/.dotfiles (launchd) or
