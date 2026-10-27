@@ -3,8 +3,11 @@
 # touched. The step harness (rows, skips, a failing step that stops the run, the timing table,
 # readiness markers); flag parsing; the clobber refusal and the fast-forward-only update; the
 # default dry run writing nothing but the checkout; a download cut short doing nothing; the NVMe
-# instance-store detection against a fake /sys, /dev, lsblk and nvme (EBS, none, several, already
-# mounted), and apply with fake mkfs and mount; and the overlay's hook order and contract.
+# instance-store detection against a fake /sys, /dev, mountinfo, lsblk and nvme (EBS, none,
+# several, mounted with bind mounts), and apply with fake mkfs, mount and chown (a user's cache
+# stays theirs); --upgrade against the fast path; apt signing keys with throwaway gpg keys (only
+# the pinned one installed); Tailscale joins and clones with a fake tailscale and systemctl; and the
+# overlay's hook order and contract.
 # The end-to-end runs in fresh Ubuntu containers are scripts/tests/bootstrap-e2e.sh.
 #
 #   bash scripts/tests/bootstrap.test.sh [SECTION...]
@@ -16,8 +19,8 @@ tmp="$(mktemp -d)"
 tmp="$(cd "$tmp" && pwd -P)"
 trap 'rm -rf "$tmp"' EXIT
 
-# With arguments, only those sections run: harness pins os system flags provision checkout cut nvme
-# overlay.
+# With arguments, only those sections run: harness pins os system flags provision checkout cut
+# nvme upgrade aptkey tailscale overlay.
 only="$*"
 section() {  # section NAME TITLE: whether to run this section; says its title when it does
     if [ -n "$only" ] && [[ " $only " != *" $1 "* ]]; then return 1; fi
@@ -607,122 +610,64 @@ else
 fi
 fi
 
-if section aptkey "apt signing keys: only the pinned key, and nothing but it, is installed"; then
-if command -v gpg >/dev/null 2>&1; then
-    g="$tmp/gpg"
-    mkdir -p "$g/home" "$g/served" "$g/bin"
-    chmod 700 "$g/home"
-    genkey() {  # genkey UID: a throwaway signing key; prints its fingerprint
-        GNUPGHOME="$g/home" gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
-            --quick-gen-key "$1" ed25519 sign never 2>/dev/null
-        GNUPGHOME="$g/home" gpg --batch --with-colons --list-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }'
-    }
-    A="$(genkey 'dx test signer <signer@example.invalid>')"
-    B="$(genkey 'dx test intruder <intruder@example.invalid>')"
-    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" > "$g/served/genuine.asc"
-    GNUPGHOME="$g/home" gpg --batch --export "$A" > "$g/served/genuine.gpg"
-    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" "$B" > "$g/served/bundle.asc"
-    GNUPGHOME="$g/home" gpg --batch --export "$B" "$A" > "$g/served/bundle.gpg"
-    GNUPGHOME="$g/home" gpg --batch --armor --export "$B" > "$g/served/other.asc"
-    gpgconf --homedir "$g/home" --kill all 2>/dev/null || true
-    # curl, faked: serves $g/served/<the URL's file name> to -o.
-    cat > "$g/bin/curl" <<EOF
+if section tailscale "Tailscale: a join, a box cloned from an image, and no key"; then
+ts="$tmp/ts"
+mkdir -p "$ts/bin" "$ts/state" "$ts/sys/etc" "$ts/var"
+# tailscale and systemctl, faked: they log, and status answers from $ts/status.json.
+cat > "$ts/bin/tailscale" <<EOF
 #!/bin/sh
-out="" last=""
-while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; *) last="\$1"; shift ;; esac; done
-cp "$g/served/\$(basename "\$last")" "\$out"
+echo "tailscale \$*" >> "$ts/calls"
+case "\$1" in status) cat "$ts/status.json" ;; up) printf '{"BackendState":"Running","Self":{"HostName":"box-a","Tags":["tag:server"]}}\n' > "$ts/status.json" ;; esac
 EOF
-    chmod +x "$g/bin/curl"
-    keyrun() {  # keyrun FILE FPR: apt_repo_key for a served FILE, root writing under a scratch root
-        (cd "$tmp/harness" && PATH="$g/bin:$PATH" bash -c 'set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"
-            as_root() { "$@"; }; BOOTSTRAP_SYSROOT="$2"; trap cleanup_run EXIT
-            apt_repo_key test "https://example.invalid/keys/$3" "$4"' bash "$lib" "$g/root-$1" "$1" "$2" 2>&1)
-    }
-    fprs_in() {  # the primary fingerprints in a key file, space-separated
-        local h
-        h="$(mktemp -d)"
-        GNUPGHOME="$h" gpg --batch --with-colons --show-keys "$1" 2>/dev/null \
-            | awk -F: '$1 == "pub" { p = 1; next } $1 == "fpr" && p { print $10; p = 0 }' | tr '\n' ' ' | sed 's/ $//'
-        rm -rf "$h"
-    }
-    equal "two different throwaway keys were made" yes "$( [ -n "$A" ] && [ -n "$B" ] && [ "$A" != "$B" ] && echo yes)"
-    out="$(keyrun genuine.asc "$A")"; rc=$?
-    equal "the pinned key alone is accepted" 0 "$rc"
-    equal "...and its keyring path printed for signed-by" /etc/apt/keyrings/test.gpg "$(printf '%s\n' "$out" | tail -n 1)"
-    equal "...holding exactly the pinned key" "$A" "$(fprs_in "$g/root-genuine.asc/etc/apt/keyrings/test.gpg")"
-    out="$(keyrun genuine.gpg "$A")"; rc=$?
-    equal "...armored or binary" "0 $A" "$rc $(fprs_in "$g/root-genuine.gpg/etc/apt/keyrings/test.gpg")"
-    for bundle in bundle.asc bundle.gpg; do
-        out="$(keyrun "$bundle" "$A")"; rc=$?
-        equal "a download holding the pinned key and another one ($bundle) is refused" 1 "$rc"
-        check "...as not exactly the pinned key" "is not exactly the pinned key $A" "$out"
-        equal "...and no keyring is installed" "" "$(ls "$g/root-$bundle/etc/apt/keyrings" 2>/dev/null)"
-    done
-    out="$(keyrun other.asc "$A")"; rc=$?
-    equal "a different key alone is refused" 1 "$rc"
-    equal "...and installs nothing" "" "$(ls "$g/root-other.asc/etc/apt/keyrings" 2>/dev/null)"
-else
-    ok "# SKIP no gpg here"
-fi
-fi
-
-if section aptkey "apt signing keys: only the pinned key, and nothing but it, is installed"; then
-if command -v gpg >/dev/null 2>&1; then
-    g="$tmp/gpg"
-    mkdir -p "$g/home" "$g/served" "$g/bin"
-    chmod 700 "$g/home"
-    genkey() {  # genkey UID: a throwaway signing key; prints its fingerprint
-        GNUPGHOME="$g/home" gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
-            --quick-gen-key "$1" ed25519 sign never 2>/dev/null
-        GNUPGHOME="$g/home" gpg --batch --with-colons --list-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }'
-    }
-    A="$(genkey 'dx test signer <signer@example.invalid>')"
-    B="$(genkey 'dx test intruder <intruder@example.invalid>')"
-    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" > "$g/served/genuine.asc"
-    GNUPGHOME="$g/home" gpg --batch --export "$A" > "$g/served/genuine.gpg"
-    GNUPGHOME="$g/home" gpg --batch --armor --export "$A" "$B" > "$g/served/bundle.asc"
-    GNUPGHOME="$g/home" gpg --batch --export "$B" "$A" > "$g/served/bundle.gpg"
-    GNUPGHOME="$g/home" gpg --batch --armor --export "$B" > "$g/served/other.asc"
-    gpgconf --homedir "$g/home" --kill all 2>/dev/null || true
-    # curl, faked: serves $g/served/<the URL's file name> to -o.
-    cat > "$g/bin/curl" <<EOF
-#!/bin/sh
-out="" last=""
-while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; *) last="\$1"; shift ;; esac; done
-cp "$g/served/\$(basename "\$last")" "\$out"
-EOF
-    chmod +x "$g/bin/curl"
-    keyrun() {  # keyrun FILE FPR: apt_repo_key for a served FILE, root writing under a scratch root
-        (cd "$tmp/harness" && PATH="$g/bin:$PATH" bash -c 'set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"
-            as_root() { "$@"; }; BOOTSTRAP_SYSROOT="$2"; trap cleanup_run EXIT
-            apt_repo_key test "https://example.invalid/keys/$3" "$4"' bash "$lib" "$g/root-$1" "$1" "$2" 2>&1)
-    }
-    fprs_in() {  # the primary fingerprints in a key file, space-separated
-        local h
-        h="$(mktemp -d)"
-        GNUPGHOME="$h" gpg --batch --with-colons --show-keys "$1" 2>/dev/null \
-            | awk -F: '$1 == "pub" { p = 1; next } $1 == "fpr" && p { print $10; p = 0 }' | tr '\n' ' ' | sed 's/ $//'
-        rm -rf "$h"
-    }
-    equal "two different throwaway keys were made" yes "$( [ -n "$A" ] && [ -n "$B" ] && [ "$A" != "$B" ] && echo yes)"
-    out="$(keyrun genuine.asc "$A")"; rc=$?
-    equal "the pinned key alone is accepted" 0 "$rc"
-    equal "...and its keyring path printed for signed-by" /etc/apt/keyrings/test.gpg "$(printf '%s\n' "$out" | tail -n 1)"
-    equal "...holding exactly the pinned key" "$A" "$(fprs_in "$g/root-genuine.asc/etc/apt/keyrings/test.gpg")"
-    out="$(keyrun genuine.gpg "$A")"; rc=$?
-    equal "...armored or binary" "0 $A" "$rc $(fprs_in "$g/root-genuine.gpg/etc/apt/keyrings/test.gpg")"
-    for bundle in bundle.asc bundle.gpg; do
-        out="$(keyrun "$bundle" "$A")"; rc=$?
-        equal "a download holding the pinned key and another one ($bundle) is refused" 1 "$rc"
-        check "...as not exactly the pinned key" "is not exactly the pinned key $A" "$out"
-        equal "...and no keyring is installed" "" "$(ls "$g/root-$bundle/etc/apt/keyrings" 2>/dev/null)"
-    done
-    out="$(keyrun other.asc "$A")"; rc=$?
-    equal "a different key alone is refused" 1 "$rc"
-    equal "...and installs nothing" "" "$(ls "$g/root-other.asc/etc/apt/keyrings" 2>/dev/null)"
-else
-    ok "# SKIP no gpg here"
-fi
+printf '#!/bin/sh\necho "systemctl $*" >> "%s/calls"\n' "$ts" > "$ts/bin/systemctl"
+chmod +x "$ts/bin/tailscale" "$ts/bin/systemctl"
+tsrun() {  # tsrun CODE: step_tailscale's world, faked
+    (cd "$tmp/harness" && PATH="$ts/bin:$PATH" bash -c 'set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"
+        . "$1/../versions.sh"; . "$1/modules.sh"
+        as_root() { "$@"; }; has_systemd() { true; }
+        BOOTSTRAP_SYSROOT="$2/sys" BOOTSTRAP_STATE_DIR="$2/state" BOOTSTRAP_TAILSCALE_STATE="$2/var/tailscaled.state"
+        BOOTSTRAP_TAILSCALE=1 BOOTSTRAP_TAILSCALE_TAGS=tag:server
+        eval "$3"; run_step modules.tailscale step_tailscale
+        printf "%s\n" "${STEP_ROWS[@]}" | cut -f1,2' bash "$lib" "$ts" "$1" 2>&1)
+}
+printf 'secret-free placeholder\n' > "$ts/keyfile"
+newbox() {  # newbox MACHINE-ID RECORDED STATE: a fresh fake box
+    rm -f "$ts/calls" "$ts/state/tailscale-machine-id"
+    printf '%s\n' "$1" > "$ts/sys/etc/machine-id"
+    [ -z "$2" ] || printf '%s\n' "$2" > "$ts/state/tailscale-machine-id"
+    printf '{"BackendState":"%s","Self":{"HostName":"box-a","Tags":["tag:server"]}}\n' "$3" > "$ts/status.json"
+    printf 'machine key of the image\n' > "$ts/var/tailscaled.state"
+}
+newbox m-image m-image Running
+out="$(tsrun 'BOOTSTRAP_TAILSCALE_AUTHKEY_FILE='"$ts/keyfile")"
+check "a box already joined as itself is left alone" "modules.tailscale	skip-ready" "$out"
+lacks "...not logged out, not joined again" "tailscale up" "$(cat "$ts/calls")"
+newbox m-clone m-image Running
+out="$(tsrun 'BOOTSTRAP_TAILSCALE_AUTHKEY_FILE='"$ts/keyfile")"; rc=$?
+calls="$(cat "$ts/calls")"
+equal "a clone of a joined box joins" 0 "$rc"
+check "...as a new device: tailscaled stopped" "systemctl stop tailscaled.service" "$calls"
+equal "...its state (and the image's machine key) removed" gone "$( [ -e "$ts/var/tailscaled.state" ] && echo kept || echo gone)"
+check "...started again, then joined with the key from the file" "systemctl start tailscaled.service" "$calls"
+check "...with the key read from a file, never argv" "tailscale up --auth-key=file:$ts/keyfile --advertise-tags=tag:server" "$calls"
+equal "...in that order" "stop start up" "$(grep -oE 'systemctl (stop|start) tailscaled|tailscale up' "$ts/calls" | sed 's/systemctl //; s/ tailscaled//; s/tailscale //' | tr '\n' ' ' | sed 's/ $//')"
+equal "...and it records the machine it joined as" m-clone "$(cat "$ts/state/tailscale-machine-id")"
+newbox m-clone m-image NeedsLogin
+out="$(tsrun 'BOOTSTRAP_TAILSCALE_AUTHKEY_FILE='"$ts/keyfile")"
+check "a clone whose image was logged out still drops the image's identity" "systemctl stop tailscaled.service" "$(cat "$ts/calls")"
+newbox m-clone m-image Running
+out="$(tsrun ':')"; rc=$?
+equal "a clone with no auth key is refused" 1 "$rc"
+check "...saying why" "must join the tailnet as a new device" "$out"
+equal "...and keeps its state" kept "$( [ -e "$ts/var/tailscaled.state" ] && echo kept || echo gone)"
+lacks "...untouched" "systemctl stop" "$(cat "$ts/calls" 2>/dev/null)"
+newbox m-one m-one Running
+out="$(tsrun 'BOOTSTRAP_TAILSCALE_REJOIN=1 BOOTSTRAP_TAILSCALE_AUTHKEY_FILE='"$ts/keyfile")"
+check "--tailscale-rejoin joins again as a new device" "systemctl stop tailscaled.service" "$(cat "$ts/calls")"
+newbox m-new "" NeedsLogin
+out="$(tsrun 'BOOTSTRAP_TAILSCALE_AUTHKEY_FILE='"$ts/keyfile")"
+check "a fresh box joins" "tailscale up --auth-key=file:" "$(cat "$ts/calls")"
+lacks "...without resetting anything" "systemctl stop" "$(cat "$ts/calls")"
 fi
 
 if section overlay "the overlay: hook order and contract"; then

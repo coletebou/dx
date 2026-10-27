@@ -63,17 +63,35 @@ _tailscale_key_file() {
     fi
 }
 
-# A machine joined while it had machine-id M. A box started from an image of it has another id
-# but the same node identity, and must log out and join as itself.
+# A machine joined while it had machine-id M. A box started from an image of it has another id,
+# but the image carried tailscaled's state, and with it the machine key that is the node's identity:
+# a logout and a new login keep that key, so the clone would come back as the same device. It must
+# drop the state and join as a new one.
 _tailscale_joined_id() { cat "$BOOTSTRAP_STATE_DIR/tailscale-machine-id" 2>/dev/null || true; }
+BOOTSTRAP_TAILSCALE_STATE="${BOOTSTRAP_TAILSCALE_STATE:-/var/lib/tailscale/tailscaled.state}"
+
+# _tailscale_reset_identity WHY: stop tailscaled, remove its state (machine key included), start it
+# again, and wait until it answers.
+_tailscale_reset_identity() {
+    local i=0
+    log "  forgetting this node's Tailscale identity: $1"
+    as_root systemctl stop tailscaled.service
+    as_root rm -f "$BOOTSTRAP_TAILSCALE_STATE"
+    as_root systemctl start tailscaled.service
+    until as_root tailscale status --json 2>/dev/null | jq -e '.BackendState' >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -le 30 ] || die "tailscaled did not answer after its state was reset"
+        sleep 1
+    done
+}
 
 step_tailscale() {
-    local keyring arch state key args=() tags="" mid t joined why
+    local keyring arch state key args=() tags="" mid t joined why=""
     if [ "${BOOTSTRAP_TAILSCALE:-0}" != 1 ]; then step_skip off "no --tailscale"; return 0; fi
     if ! command -v tailscale >/dev/null 2>&1; then
         keyring="$(apt_repo_key tailscale "https://pkgs.tailscale.com/stable/$OS_ID/$OS_CODENAME.noarmor.gpg" "$PIN_TAILSCALE_APT_FPR")"
         arch="$(dpkg --print-architecture)"
-        root_write /etc/apt/sources.list.d/tailscale.list \
+        root_write "$(sysf /etc/apt/sources.list.d/tailscale.list)" \
             "deb [arch=$arch signed-by=$keyring] https://pkgs.tailscale.com/stable/$OS_ID $OS_CODENAME main"
         apt_update force
         sub_begin apt-install
@@ -86,22 +104,25 @@ step_tailscale() {
         warn "no systemd: tailscaled is installed but not running, so no join (a container?)"
         return 0
     fi
-    state="$(as_root tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true)"
-    mid="$(cat /etc/machine-id 2>/dev/null || true)"
+    mid="$(cat "$(sysf /etc/machine-id)" 2>/dev/null || true)"
+    joined="$(_tailscale_joined_id)"
     key="$(_tailscale_key_file)"
-    if [ "$state" = Running ]; then
-        joined="$(_tailscale_joined_id)"
-        if [ "${BOOTSTRAP_TAILSCALE_REJOIN:-0}" != 1 ] && { [ -z "$joined" ] || [ "$joined" = "$mid" ]; }; then
+    if [ "${BOOTSTRAP_TAILSCALE_REJOIN:-0}" = 1 ]; then
+        why="--tailscale-rejoin"
+    elif [ -n "$joined" ] && [ "$joined" != "$mid" ]; then
+        why="this machine was made from an image of another one (its machine-id changed)"
+    fi
+    if [ -n "$why" ]; then
+        # Never drop the identity without a key to join again: the box would be left off the tailnet.
+        [ -n "$key" ] || die "this node must join the tailnet as a new device ($why), but there is no auth key (--tailscale-authkey-file)"
+        _tailscale_reset_identity "$why"
+    else
+        state="$(as_root tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true)"
+        if [ "$state" = Running ]; then
             [ -n "$joined" ] || root_write "$BOOTSTRAP_STATE_DIR/tailscale-machine-id" "$mid"
             step_skip ready "already on the tailnet as $(as_root tailscale status --json | jq -r '.Self.HostName')"
             return 0
         fi
-        why="--tailscale-rejoin"
-        [ "${BOOTSTRAP_TAILSCALE_REJOIN:-0}" = 1 ] || why="its node identity came with the image it was made from"
-        # Never log out without a key to join again: that would leave the box off the tailnet.
-        [ -n "$key" ] || die "this node must join the tailnet again ($why), but there is no auth key (--tailscale-authkey-file)"
-        log "  logging out first: $why"
-        as_root tailscale logout || true
     fi
     if [ -z "$key" ]; then
         log "  installed; no auth key, so not joined. Join with:"
