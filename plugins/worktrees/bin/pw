@@ -1,0 +1,1212 @@
+#!/usr/bin/env bash
+# pw — parallel-worktrees launcher/monitor/teardown.
+#
+# Subcommands:
+#   pw launch    <manifest.tsv> [--test] [--force] [--no-bootstrap]  Spawn sessions
+#                [--engine=claude|codex] [--codex-model=M]           Engine: Claude (default) or Codex.
+#                [--codex-effort=E] [--codex-sandbox=bypass|full-auto]  Per-row override via 4th manifest column
+#                                                                   (codex | codex:MODEL | codex:MODEL:EFFORT;
+#                                                                   MODEL alias sol→gpt-5.6-sol, luna→gpt-5.6-luna).
+#                                                                   Codex always uses ChatGPT auth.
+#   pw log       [manifest.tsv]                                     Follow merged log (less +F, falls back to tail -F)
+#   pw teardown  <manifest.tsv> [--delete-branches]                 Kill + clean up the repo recorded at launch
+#                                                                   (main checkout if no record), removing the
+#                                                                   worktrees launch recorded and the ones the layout
+#                                                                   gives now (plain and test- names), only those git
+#                                                                   lists as worktrees of that repo. Exits 1,
+#                                                                   keeping the .log-path sidecar, if nothing matched.
+#   pw validate  <manifest.tsv>                                     Lint before launch
+#   pw status    <session>                                          Read-only: one line per pane (target, state, command).
+#                                                                   Exits 2 if any pane waits for a human (permission or
+#                                                                   workflow-prompt), 1 on error.
+#   pw broadcast <session> <prompt-file-or-string>                  Send same prompt to every Claude pane in a tmux session
+#                [--windows W1,W2,...] [--include glob]
+#                [--exclude glob] [--dry-run]                       Detects pane state (claude/shell/permission/
+#                                                                   workflow-prompt/unknown), skips non-Claude panes
+#                                                                   and never types into a waiting prompt, chunks long prompts, drops
+#                                                                   prompts >10000 chars to $PW_BROADCAST_DIR
+#                                                                   and sends a one-line "Read X" pointer instead.
+#                                                                   Verifies engagement post-send. Use for:
+#                                                                     - a fleet-wide broadcast to every agent of a run
+#                                                                     - same-session multi-worktree updates after a
+#                                                                       `pw launch` to refine instructions
+#                                                                     - any "tell N agents the same thing" pattern
+#
+# Worktree creation: delegates to wt-helper (scripts/wt-helper in this repo),
+# the same primitive `wt` uses for solo work. Inherits its default-branch
+# detection (origin/HEAD), branch-state machine, and conflict resolution.
+# Worktree path overridden via --target so we keep tag-based names
+# (<repo>-<tag>) instead of branch-slug names; the directory
+# they go in comes from `wt-helper --print-base-dir`, so both follow the same
+# layout, including the repo's worktree.baseDirectory setting.
+#
+# Bootstrap (on by default for launch; disable with --no-bootstrap):
+#   After each worktree is created, pw:
+#     1. Copies dev-time files from the source repo (.env, .env.keys,
+#        .env.local, .npmrc, .tool-versions, .nvmrc, .node-version,
+#        docker-compose.override.yml).
+#     2. Writes .envrc with COMPOSE_PROJECT_NAME=<repo>-<tag> so each
+#        worktree gets its own Docker Compose project (avoids the "two
+#        worktrees → one set of containers" mount footgun). Same value is
+#        also exported into the tmux window directly.
+#     3. Runs `npm install` if package.json is present (PW_NPM_INSTALL=0 skips
+#        it, e.g. for a bun repo whose hook installs instead).
+#     4. Runs PW_BOOTSTRAP_HOOK, if set, in the new worktree: the place for a
+#        repo's own setup (regenerate configs, warn about pending migrations).
+#   Pass --no-bootstrap to skip steps 1-4.
+#
+# Environment overrides (all optional; defaults unchanged):
+#   PW_CLAUDE_CMD    agent command typed into each window, before
+#                    --session-id (default: claude --dangerously-skip-permissions;
+#                    e.g. 'yu --model opus --effort max')
+#   PW_TMUX_SOCKET   run every tmux call on this socket (tmux -L), so a run
+#                    can live in its own server and memory scope
+#   PW_SESSION       tmux session name (default: <repo>-parallel)
+#   PW_BOOTSTRAP_HOOK  shell command run (sh -c) in each new worktree at the end
+#                    of the bootstrap, with PW_SOURCE_REPO, PW_WORKTREE and
+#                    PW_TAG set; a failure is a warning, not a stop
+#   PW_NPM_INSTALL   0 skips the bootstrap's `npm install` (default 1)
+#   PW_BROADCAST_DIR where `pw broadcast` writes prompts too long to type
+#                    (default: ~/.claude/skill-data/parallel-worktrees/broadcast)
+#
+# Manifest format (TSV, 3 cols, # for comments):
+#   tag<TAB>branch<TAB>prompt-spec
+#
+# prompt-spec: @/abs/path/to/prompt.md   (file)
+#           or a literal string (single line, no tabs)
+
+set -euo pipefail
+
+# The directory this script really lives in, through any symlink (install.sh links
+# it into ~/.local/bin), so PARALLEL_APPEND names the pw-append next to it.
+_pw_self="$0"
+while [ -L "$_pw_self" ]; do
+    _pw_link="$(readlink "$_pw_self")"
+    case "$_pw_link" in
+        /*) _pw_self="$_pw_link" ;;
+        *)  _pw_self="$(dirname "$_pw_self")/$_pw_link" ;;
+    esac
+done
+PW_BIN_DIR="$(cd "$(dirname "$_pw_self")" && pwd)"
+unset _pw_self _pw_link
+# Runtime logs live under ~/.claude/skill-data/ so the skill dir itself
+# can be a read-only symlink into a dotfiles repo.
+LOG_DIR="$HOME/.claude/skill-data/parallel-worktrees/logs"
+mkdir -p "$LOG_DIR"
+
+# ───────── helpers ──────────────────────────────────────────────────────
+die()    { echo "Error: $*" >&2; exit 1; }
+warn()   { echo "Warn:  $*" >&2; }
+info()   { echo "$*"; }
+
+# ───────── engine selection (claude | codex) ─────────────────────────────
+# Each manifest row may pick its runtime in an optional 4th column. Empty →
+# the run default (--engine / PW_ENGINE, itself defaulting to claude), so
+# existing 3-column manifests behave exactly as before.
+#
+# Engine spec grammar (4th column):
+#   claude                      Claude Code session (default)
+#   codex                       Codex session, default model + effort
+#   codex:MODEL                 Codex with a model, default effort
+#   codex:MODEL:EFFORT          Codex with a model and reasoning effort
+# MODEL accepts short aliases sol → gpt-5.6-sol, luna → gpt-5.6-luna, or any
+# full model id. EFFORT is a codex model_reasoning_effort level: low, medium,
+# high, xhigh, max (availability varies by model).
+PW_ENGINE="${PW_ENGINE:-claude}"          # run-wide default engine
+# Command that starts a Claude session in each window. Override to launch through a
+# wrapper (e.g. a shell function that pins a model/route, like `yuma`); it receives
+# --session-id <uuid> "<prompt>" as its arguments.
+PW_CLAUDE_CMD="${PW_CLAUDE_CMD:-claude --dangerously-skip-permissions}"
+PW_CODEX_MODEL="${PW_CODEX_MODEL:-gpt-5.6-sol}"   # default codex model
+PW_CODEX_EFFORT="${PW_CODEX_EFFORT:-high}"        # default codex reasoning effort
+# Autonomy for codex windows. pw agents work unattended in isolated worktrees
+# and must run git/gh (network + writes), so the default matches claude's
+# --dangerously-skip-permissions: no approval prompts, no sandbox. Override
+# with PW_CODEX_SANDBOX=full-auto for the workspace-write sandbox (note: it
+# denies network by default, which stalls `gh`).
+PW_CODEX_SANDBOX="${PW_CODEX_SANDBOX:-bypass}"
+
+# Expand a codex model alias to its full id. Unknown values pass through so a
+# brand-new model id works without a code change here.
+codex_model_alias() {
+    case "$1" in
+        sol)  echo "gpt-5.6-sol" ;;
+        luna) echo "gpt-5.6-luna" ;;
+        "")   echo "$PW_CODEX_MODEL" ;;
+        *)    echo "$1" ;;
+    esac
+}
+
+# Resolve a per-row engine spec into globals ENGINE / CODEX_MODEL /
+# CODEX_EFFORT. Returns non-zero on an unparseable spec (parse_manifest turns
+# that into a fatal, line-numbered error before any worktree is created).
+resolve_engine() {
+    local spec="${1:-}"
+    [ -z "$spec" ] && spec="$PW_ENGINE"
+    case "$spec" in
+        claude)
+            ENGINE=claude; CODEX_MODEL=""; CODEX_EFFORT="" ;;
+        codex|codex:*)
+            ENGINE=codex
+            local rest="${spec#codex}"; rest="${rest#:}"   # strip "codex" then a ":"
+            local m="${rest%%:*}"
+            local e=""
+            [[ "$rest" == *:* ]] && e="${rest#*:}"
+            CODEX_MODEL="$(codex_model_alias "$m")"
+            CODEX_EFFORT="${e:-$PW_CODEX_EFFORT}"
+            ;;
+        *)
+            return 1 ;;
+    esac
+    return 0
+}
+
+# The directory pw's worktrees go in, asked of wt-helper once per run so pw and
+# solo `wt` share one layout: WT_BASE_DIR, WT_LAYOUT=sibling|nested, the repo's
+# worktree.baseDirectory setting (.claude/settings.local.json, then
+# .claude/settings.json), else <repo>/.claude/worktrees. wt-helper refuses a
+# setting on a volume that isn't mounted, and pw stops with it rather than
+# fill the root disk. (A wt-helper without --print-base-dir is too old: update it.)
+PW_WT_BASE=""
+pw_resolve_wt_base() {
+    PW_WT_BASE="$(cd "$1" && wt-helper --print-base-dir < /dev/null)" && [ -n "$PW_WT_BASE" ] \
+        || die "wt-helper could not say where worktrees go for $1 (see above; a wt-helper without --print-base-dir is too old: update it)"
+}
+
+# Worktree path for a tag: <dir>/<repo>-<tag>. pw keeps the tag-based name in
+# every layout so tmux/Compose project names stay stable; we pass the result to
+# wt-helper via --target.
+pw_wt_path() {
+    local repo="$1" tag="$2"
+    [ -n "$PW_WT_BASE" ] || die "internal: pw_resolve_wt_base was not called"
+    printf '%s' "$PW_WT_BASE/$(basename "$repo")-$tag"
+}
+
+usage() {
+    # Print the contiguous # comment block at the top of this file (skip the
+    # shebang). Stop at the first non-comment line.
+    awk '
+        NR == 1 && /^#!/ { next }
+        /^#/            { sub(/^# ?/, ""); print; next }
+                          { exit }
+    ' "$0"
+    exit "${1:-0}"
+}
+
+require() {
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required on PATH"
+    done
+}
+
+# Every tmux call goes through here so PW_TMUX_SOCKET selects the server.
+tmux() {
+    command tmux ${PW_TMUX_SOCKET:+-L "$PW_TMUX_SOCKET"} "$@"
+}
+
+repo_root() {
+    # Caller sits inside a git repo when launching. Worktrees of that repo
+    # become siblings of the repo dir.
+    git -C "$1" rev-parse --show-toplevel 2>/dev/null \
+        || die "Not inside a git repository: $1"
+}
+
+main_checkout() {
+    # The main worktree, even when called from a linked one (e.g. a Claude
+    # worktree under <repo>/.claude/worktrees/), where --show-toplevel names
+    # the linked worktree. `git worktree list` always prints the main one first.
+    local list
+    list="$(git -C "$1" worktree list --porcelain 2>/dev/null)" \
+        || die "Not inside a git repository: $1"
+    list="${list%%$'\n'*}"
+    printf '%s' "${list#worktree }"
+}
+
+# Parse manifest → global arrays TAGS[], BRANCHES[], PROMPT_SPECS[], PROMPT_BODIES[].
+# Resolves @/path prompts to their contents. Errors early on missing files.
+parse_manifest() {
+    local mfile="$1" read_prompts="${2:-1}"
+    [ -f "$mfile" ] || die "Manifest not found: $mfile"
+
+    TAGS=(); BRANCHES=(); PROMPT_SPECS=(); PROMPT_BODIES=(); ENGINE_SPECS=()
+    local lineno=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno+1))
+        # strip CRLF
+        line="${line%$'\r'}"
+        # skip blanks and comments
+        [[ -z "${line// }" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # split on TAB exactly. The optional 4th column is an engine spec
+        # (claude | codex | codex:MODEL[:EFFORT]); empty → the run default.
+        local engine_spec=""
+        IFS=$'\t' read -r tag branch prompt_spec engine_spec <<< "$line"
+        [ -n "${tag:-}" ] && [ -n "${branch:-}" ] && [ -n "${prompt_spec:-}" ] \
+            || die "Manifest line $lineno: expected at least 3 tab-separated fields (tag, branch, prompt[, engine]), got: $line"
+
+        [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] \
+            || die "Manifest line $lineno: invalid tag '$tag' (alnum/-/_ only)"
+
+        # Teardown passes read_prompts=0: it needs only tags and branches, and a
+        # relative @path resolves against the cwd, or the file may be gone.
+        local body="$prompt_spec"
+        if [[ "$prompt_spec" == @* ]] && [ "$read_prompts" = 1 ]; then
+            local path="${prompt_spec#@}"
+            [ -f "$path" ] || die "Manifest line $lineno: prompt file missing: $path"
+            body="$(cat "$path")"
+        fi
+
+        # Validate the engine spec now so a typo fails before any worktree is made.
+        resolve_engine "$engine_spec" >/dev/null \
+            || die "Manifest line $lineno: bad engine spec '$engine_spec' (use claude | codex | codex:MODEL[:EFFORT])"
+
+        TAGS+=("$tag")
+        BRANCHES+=("$branch")
+        PROMPT_SPECS+=("$prompt_spec")
+        PROMPT_BODIES+=("$body")
+        ENGINE_SPECS+=("$engine_spec")
+    done < "$mfile"
+
+    [ "${#TAGS[@]}" -ge 1 ] || die "Manifest is empty: $mfile"
+}
+
+# ───────── subcommands ──────────────────────────────────────────────────
+bootstrap_worktree() {
+    # Bootstrap a fresh worktree for development. Runs once per worktree
+    # right after `git worktree add` (or wt-helper). Steps:
+    #
+    # 1. Copy untracked dev-time files from source repo (.env, .env.keys, …).
+    # 2. Write/append `.envrc` with COMPOSE_PROJECT_NAME=<repo>-<tag> so each
+    #    worktree gets its own Docker Compose project (avoids the "two
+    #    worktrees → one set of containers, code from main repo" footgun).
+    # 3. Run `npm install` if package.json is present.
+    # 4. Run PW_BOOTSTRAP_HOOK, if set: the repo's own setup steps.
+    # 5. Share .remember with the source repo (see below).
+    #
+    # docker-compose.override.yml is included in step 1 because Compose
+    # auto-loads it next to the main compose file but it's typically
+    # gitignored. Without it, a stack that worked in main silently loses
+    # override behavior in the worktree (e.g. host ~/.aws mounts).
+    local src="$1" wt="$2" tag="$3"
+    local copied=()
+    local f
+    for f in .env .env.keys .env.local .npmrc .tool-versions .nvmrc .node-version docker-compose.override.yml; do
+        if [ -f "$src/$f" ] && [ ! -e "$wt/$f" ]; then
+            cp -p "$src/$f" "$wt/$f" && copied+=("$f")
+        fi
+    done
+    if [ ${#copied[@]} -gt 0 ]; then
+        info "  copied: ${copied[*]}"
+    fi
+
+    # 2. .envrc — COMPOSE_PROJECT_NAME isolates this worktree's Compose
+    #    project. Without this, Compose attaches to the existing project and
+    #    mounts the *main repo's* packages/, not the worktree's, so code
+    #    changes in the worktree are invisible to running containers. See
+    #    SKILL.md "Docker Compose project name collisions" for the full
+    #    diagnosis. Worktree-tag is the natural unique discriminator.
+    local repo_basename; repo_basename="$(basename "$src")"
+    local compose_project="${repo_basename}-${tag}"
+    local envrc="$wt/.envrc"
+    if [ -f "$envrc" ]; then
+        # Don't clobber an inherited .envrc; append only if our line is missing.
+        if ! grep -q '^export COMPOSE_PROJECT_NAME=' "$envrc"; then
+            printf '\n# Added by pw — isolate this worktree'\''s Compose project.\nexport COMPOSE_PROJECT_NAME=%s\n' "$compose_project" >> "$envrc"
+            info "  appended COMPOSE_PROJECT_NAME=$compose_project to .envrc"
+        fi
+    else
+        cat > "$envrc" <<EOF
+# Generated by pw (parallel-worktrees) — isolates this worktree's Docker
+# Compose project so each worktree gets its own containers/network/volumes
+# instead of attaching to the main repo's stack. If direnv is installed,
+# the export is loaded automatically when you cd into this dir; otherwise
+# source .envrc manually:  source .envrc
+export COMPOSE_PROJECT_NAME=$compose_project
+EOF
+        info "  wrote .envrc with COMPOSE_PROJECT_NAME=$compose_project"
+    fi
+
+    # 3. npm install, unless PW_NPM_INSTALL=0 (a bun or pnpm repo installs
+    #    through PW_BOOTSTRAP_HOOK instead).
+    if [ -f "$wt/package.json" ] && [ "${PW_NPM_INSTALL:-1}" != 0 ]; then
+        info "  running npm install..."
+        # --prefer-offline keeps reruns fast; --no-audit/--no-fund cut noise.
+        # --legacy-peer-deps: large monorepos often need it.
+        if ! (cd "$wt" && npm install --prefer-offline --no-audit --no-fund --legacy-peer-deps >/tmp/pw-npm-$$.log 2>&1); then
+            warn "  npm install failed in $wt — see /tmp/pw-npm-$$.log"
+        else
+            rm -f /tmp/pw-npm-$$.log
+        fi
+    fi
+
+    # 4. The repo's own setup, last, so it can use what npm installed. Its
+    #    output goes to a log kept only when it fails, like npm's.
+    if [ -n "${PW_BOOTSTRAP_HOOK:-}" ]; then
+        info "  running PW_BOOTSTRAP_HOOK..."
+        local hook_log="${TMPDIR:-/tmp}/pw-hook-$$-$tag.log"
+        if ! (cd "$wt" && PW_SOURCE_REPO="$src" PW_WORKTREE="$wt" PW_TAG="$tag" \
+                sh -c "$PW_BOOTSTRAP_HOOK" >"$hook_log" 2>&1); then
+            warn "  PW_BOOTSTRAP_HOOK failed in $wt — see $hook_log"
+        else
+            rm -f "$hook_log"
+        fi
+    fi
+
+    # 5. Share .remember across worktrees. The `remember` plugin keys its
+    #    data dir off the working-tree path, so each worktree would get an
+    #    isolated journal. wt-helper symlinks this for worktrees it creates,
+    #    but pw reuses pre-existing worktrees (skipping wt-helper) — cover
+    #    that path here too. Mirrors Claude's native git-repo-keyed memory.
+    if [ -d "$src/.remember" ] && [ ! -e "$wt/.remember" ]; then
+        if ln -s "$src/.remember" "$wt/.remember" 2>/dev/null; then
+            info "  linked .remember → $src/.remember (shared journal)"
+        fi
+    fi
+}
+
+cmd_launch() {
+    local manifest=""
+    local test_mode=0 force=0 bootstrap=1
+    for a in "$@"; do
+        case "$a" in
+            -t|--test)       test_mode=1 ;;
+            -f|--force)      force=1 ;;
+            --no-bootstrap)  bootstrap=0 ;;
+            --engine=*)      PW_ENGINE="${a#*=}" ;;
+            --codex-model=*) PW_CODEX_MODEL="$(codex_model_alias "${a#*=}")" ;;
+            --codex-effort=*) PW_CODEX_EFFORT="${a#*=}" ;;
+            --codex-sandbox=*) PW_CODEX_SANDBOX="${a#*=}" ;;
+            -h|--help)       usage 0 ;;
+            -*)              die "Unknown flag: $a" ;;
+            *)               manifest="$a" ;;
+        esac
+    done
+    [ -n "$manifest" ] || die "usage: pw launch <manifest.tsv> [--test] [--force] [--engine=claude|codex]"
+    manifest="$(cd "$(dirname "$manifest")" && pwd)/$(basename "$manifest")"
+
+    # Fail fast on a bad run-wide default before touching the filesystem.
+    resolve_engine "" >/dev/null \
+        || die "--engine/PW_ENGINE='$PW_ENGINE' is invalid (use claude | codex | codex:MODEL[:EFFORT])"
+
+    require tmux git wt-helper
+    # uuidgen is GNU util-linux; fall back to /proc/sys/kernel/random/uuid
+    if ! command -v uuidgen >/dev/null 2>&1; then
+        uuidgen() { cat /proc/sys/kernel/random/uuid; }
+    fi
+
+    parse_manifest "$manifest"
+
+    # Require only the engine binaries this run actually uses.
+    local _need_claude=0 _need_codex=0 _es
+    for _es in "${ENGINE_SPECS[@]}"; do
+        resolve_engine "$_es" >/dev/null
+        [ "$ENGINE" = claude ] && _need_claude=1
+        [ "$ENGINE" = codex ]  && _need_codex=1
+    done
+    [ "$_need_claude" = 1 ] && require claude
+    [ "$_need_codex" = 1 ]  && require codex
+
+    local repo; repo="$(repo_root "$(pwd)")"
+    local repo_name; repo_name="$(basename "$repo")"
+    # Before any tmux or log side effect, so an unmounted volume stops the run cleanly.
+    pw_resolve_wt_base "$repo"
+    local ts; ts="$(date +%Y%m%d-%H%M%S)"
+    local session_base="${PW_SESSION:-$repo_name-parallel}"
+    local session="$session_base"
+    local tag_prefix="" branch_prefix=""
+
+    if [ "$test_mode" -eq 1 ]; then
+        session="${session_base}-test"
+        tag_prefix="test-"
+        branch_prefix="test/"
+        info "TEST MODE: worktrees=${tag_prefix}<tag>, branches=${branch_prefix}<branch>, session=$session"
+    fi
+
+    # tmux session pre-flight. "=" makes tmux match the name exactly: a bare
+    # -t resolves by prefix, so "<repo>-parallel" would hit "<repo>-parallel-test".
+    if tmux has-session -t "=$session" 2>/dev/null; then
+        if [ "$force" -eq 1 ]; then
+            info "Killing existing tmux session '$session' (--force)..."
+            tmux kill-session -t "=$session"
+        else
+            die "tmux session '$session' exists.
+  Attach:   tmux attach -t $session
+  Recreate: rerun with --force"
+        fi
+    fi
+
+    local log_file="$LOG_DIR/${repo_name}-${ts}.log"
+    : > "$log_file"
+    # The lock is a directory created on demand by bin/pw-append (mkdir-mutex);
+    # nothing to pre-create. Clear any stale .lockd from a crashed prior run.
+    rm -rf "${log_file}.lockd" 2>/dev/null || true
+    local -a SESSION_IDS=() JSONL_PATHS=()
+    local -a ENGINES=() CODEX_MODELS=() CODEX_EFFORTS=()
+    echo "# parallel-worktrees run" > "$log_file"
+    echo "# repo=$repo" >> "$log_file"
+    echo "# manifest=$manifest" >> "$log_file"
+    echo "# session=$session" >> "$log_file"
+    echo "# started_at=$(date -Iseconds)" >> "$log_file"
+    echo "# test_mode=$test_mode" >> "$log_file"
+    echo "# tasks=${#TAGS[@]}" >> "$log_file"
+    echo "" >> "$log_file"
+
+    # Record log path next to manifest for `pw log <manifest>` lookup later.
+    echo "$log_file" > "${manifest}.log-path"
+
+    # Create worktrees (idempotent).
+    #
+    # We delegate worktree creation to wt-helper (scripts/wt-helper, the same
+    # primitive `wt` uses for solo work). It handles: default-branch detection
+    # (origin/HEAD), branch-state machine (new vs. exists vs.
+    # checked-out-elsewhere), and conflict resolution. We pass --target so the
+    # worktree path matches our tag-based name (<repo>-<tag>)
+    # instead of wt-helper's branch-slug default. We pass --no-cd because we
+    # want the path on stdout, not a cwd change. We pass --from fresh because
+    # batch mode needs to run non-interactively.
+    for i in "${!TAGS[@]}"; do
+        local tag="${tag_prefix}${TAGS[$i]}"
+        local branch="${branch_prefix}${BRANCHES[$i]}"
+        local wt; wt="$(pw_wt_path "$repo" "$tag")"
+
+        if [ -d "$wt" ]; then
+            # Existing worktree on the right branch → reuse and skip wt-helper.
+            # wt-helper would re-prompt about the existing checkout; we already
+            # know what we want.
+            local have; have="$(git -C "$wt" branch --show-current 2>/dev/null || echo "")"
+            if [ "$have" = "${branch#refs/heads/}" ]; then
+                info "Reusing worktree $wt on $branch"
+                continue
+            else
+                die "Worktree $wt exists but is on '$have' (want '$branch').
+  Remove manually:  git worktree remove '$wt'"
+            fi
+        fi
+
+        info "Creating worktree $wt on $branch (via wt-helper)"
+        # --no-fetch: wt-helper caches origin/HEAD per repo for 7 days; we
+        # don't need a fetch per tree. The user typically `git fetch`'d
+        # before launching, and a default branch a few hours stale is fine.
+        # --no-cd --print-target: don't bother with a cwd change (we run
+        # batch-mode); do print the path so we can verify it matches.
+        # Stdin is closed so wt-helper can't try to prompt interactively.
+        local helper_path
+        if ! helper_path="$(wt-helper "$branch" --from fresh --no-cd --print-target --no-fetch --target "$wt" < /dev/null 2>/dev/null)"; then
+            die "wt-helper failed for $branch (re-run with stderr visible to debug)"
+        fi
+        if [ "$helper_path" != "$wt" ]; then
+            warn "wt-helper returned path '$helper_path', expected '$wt' — proceeding anyway"
+        fi
+
+        if [ "$bootstrap" = 1 ]; then
+            bootstrap_worktree "$repo" "$wt" "$tag"
+        fi
+    done
+
+    # Spawn tmux session.
+    #
+    # Layout: window 0 is always "log" — it auto-runs `pw log <manifest>` so
+    # the merged log is visible without typing anything. Windows 1..N are
+    # the per-agent claude sessions. We `select-window` the first agent at
+    # the end so attaching lands in agent-1 by default; the log is one
+    # keybind away (Ctrl-b 0).
+    local first_tag="${tag_prefix}${TAGS[0]}"
+    tmux new-session -d -s "$session" -n log -c "$repo"
+    # set-titles on + "#S/#W" are set globally in this repo's base/tmux.conf.
+
+    # Auto-tail the merged log in window 0. Use `pw log <manifest>` so it
+    # picks up the right log via the .log-path sidecar we just wrote.
+    tmux send-keys -t "$session:log" \
+        "$(printf %q "$0") log $(printf %q "$manifest")" C-m
+
+    # Header section: per-task metadata so a future merge reviewer can find
+    # every agent's full transcript by filesystem path, not by guessing.
+    echo "# === agents ===" >> "$log_file"
+    for i in "${!TAGS[@]}"; do
+        local tag="${tag_prefix}${TAGS[$i]}"
+        local branch="${branch_prefix}${BRANCHES[$i]}"
+        local wt; wt="$(pw_wt_path "$repo" "$tag")"
+
+        resolve_engine "${ENGINE_SPECS[$i]}" >/dev/null
+        ENGINES[$i]="$ENGINE"
+        CODEX_MODELS[$i]="$CODEX_MODEL"
+        CODEX_EFFORTS[$i]="$CODEX_EFFORT"
+
+        # Pre-generate a session UUID (used as PARALLEL_SESSION_ID for both
+        # engines, and as claude's --session-id).
+        local sid; sid="$(uuidgen)"
+        SESSION_IDS[$i]="$sid"
+
+        local jsonl engine_label
+        if [ "$ENGINE" = codex ]; then
+            # Codex assigns its own rollout id at runtime, so the exact file
+            # can't be pre-named; point reviewers at the day's session dir.
+            jsonl="$HOME/.codex/sessions/  (codex rollout-*.jsonl, id assigned at runtime)"
+            engine_label="codex ${CODEX_MODEL} effort=${CODEX_EFFORT}"
+        else
+            # Claude's projects dir encodes the cwd's absolute path by turning
+            # every character that is not a letter or digit into "-" (so the
+            # default <repo>/.claude/worktrees layout gives "--claude-").
+            local enc_cwd; enc_cwd="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
+            jsonl="$HOME/.claude/projects/${enc_cwd}/${sid}.jsonl"
+            engine_label="claude"
+        fi
+        JSONL_PATHS[$i]="$jsonl"
+
+        printf '# tag=%-20s branch=%-30s worktree=%s\n' "$tag" "$branch" "$wt" >> "$log_file"
+        printf '#   engine=%s\n' "$engine_label" >> "$log_file"
+        printf '#   session_id=%s\n' "$sid" >> "$log_file"
+        printf '#   transcript=%s\n' "$jsonl" >> "$log_file"
+    done
+    echo "" >> "$log_file"
+
+    for i in "${!TAGS[@]}"; do
+        local tag="${tag_prefix}${TAGS[$i]}"
+        local branch="${branch_prefix}${BRANCHES[$i]}"
+        local wt; wt="$(pw_wt_path "$repo" "$tag")"
+        local sid="${SESSION_IDS[$i]}"
+        local jsonl="${JSONL_PATHS[$i]}"
+
+        # Window 0 is always the log; agents start at window index 1.
+        # Always create a new window (no special-case for i=0 anymore).
+        tmux new-window -t "$session" -n "$tag" -c "$wt"
+
+        # Export env vars into the window so the prompt footer works.
+        # PARALLEL_APPEND points at the portable mkdir-mutex append helper —
+        # spawned agents pipe their summary into it instead of using flock(1)
+        # (which doesn't exist on macOS).
+        # COMPOSE_PROJECT_NAME mirrors what bootstrap_worktree wrote into
+        # .envrc; we export it directly too in case direnv isn't installed
+        # and the user runs `docker compose` before sourcing .envrc.
+        local compose_project="${repo_name}-${tag}"
+        tmux send-keys -t "$session:$tag" \
+            "export PARALLEL_LOG=$(printf %q "$log_file") PARALLEL_TAG=$(printf %q "$tag") PARALLEL_BRANCH=$(printf %q "$branch") PARALLEL_SESSION_ID=$(printf %q "$sid") PARALLEL_TRANSCRIPT=$(printf %q "$jsonl") PARALLEL_APPEND=$(printf %q "$PW_BIN_DIR/pw-append") COMPOSE_PROJECT_NAME=$(printf %q "$compose_project")" C-m
+        tmux send-keys -t "$session:$tag" \
+            "echo '=== $tag ($branch) ===' && pwd && git branch --show-current && echo 'transcript: $jsonl'" C-m
+
+        # Write the prompt to a per-session file; pass it to the engine via an
+        # xargs-safe path.
+        local prompt_path="$wt/.pw-prompt.md"
+        printf '%s\n' "${PROMPT_BODIES[$i]}" > "$prompt_path"
+
+        if [ "${ENGINES[$i]}" = codex ]; then
+            local cmodel="${CODEX_MODELS[$i]}" ceffort="${CODEX_EFFORTS[$i]}"
+            # Autonomy flag: bypass (match claude --dangerously-skip-permissions)
+            # or full-auto (workspace-write sandbox; denies network by default).
+            local codex_auto="--dangerously-bypass-approvals-and-sandbox"
+            [ "$PW_CODEX_SANDBOX" = "full-auto" ] && codex_auto="--full-auto"
+            # Always ChatGPT auth: unset OPENAI_API_KEY (and relay) in the
+            # window so codex uses the stored ChatGPT login in ~/.codex/auth.json
+            # instead of an ambient API key. Reasoning effort is set via -c.
+            tmux send-keys -t "$session:$tag" \
+                "unset OPENAI_API_KEY OPENAI_BASE_URL; codex $codex_auto -m $(printf %q "$cmodel") -c model_reasoning_effort=$(printf %q "\"$ceffort\"") \"\$(cat $(printf %q "$prompt_path"))\"" C-m
+        else
+            tmux send-keys -t "$session:$tag" \
+                "$PW_CLAUDE_CMD --session-id $sid \"\$(cat $(printf %q "$prompt_path"))\"" C-m
+        fi
+    done
+
+    tmux select-window -t "$session:$first_tag"
+
+    cat <<EOF
+
+==========================================
+Launched '$session' with $((${#TAGS[@]} + 1)) windows (1 log + ${#TAGS[@]} agents).
+
+Window layout:
+  0. log     — auto-tailing merged log via \`pw log\` (Ctrl-b 0 to view)
+  1..${#TAGS[@]}. agents — one per manifest row (attach lands on agent-1)
+
+Attach:   tmux attach -t $session
+Log:      pw log $(printf %q "$manifest")
+Teardown: pw teardown $(printf %q "$manifest")
+Raw log:  $log_file
+==========================================
+EOF
+}
+
+cmd_log() {
+    local manifest="${1:-}"
+    local log_file=""
+
+    if [ -n "$manifest" ] && [ -f "${manifest}.log-path" ]; then
+        log_file="$(cat "${manifest}.log-path")"
+    else
+        # Fall back: most recent log in $LOG_DIR.
+        log_file="$(ls -1t "$LOG_DIR"/*.log 2>/dev/null | head -1 || true)"
+    fi
+    [ -n "$log_file" ] && [ -f "$log_file" ] \
+        || die "No log found. Pass a manifest or run 'pw launch' first."
+
+    # Prefer `less +F` over `tail -F`: same follow-mode behavior, but Ctrl-C
+    # drops you into normal less paging (scrollback, /search, ?-search,
+    # gg/G, line-numbers) without ending the session — Shift-F resumes
+    # follow. tail -F can't scroll back through finished sessions or search
+    # the merged log.
+    if command -v less >/dev/null 2>&1; then
+        info "Following $log_file with less +F  (Ctrl-C to pause/scroll, Shift-F to resume, q to quit)"
+        # +F = start in follow mode.
+        # -R = pass ANSI color escapes through (Claude CLI emits them).
+        # -i = case-insensitive search unless the pattern has uppercase.
+        # --use-color = colorize less's own status line; ignored on old less.
+        less +F -R -i --use-color "$log_file"
+    else
+        info "Tailing $log_file with tail -F  (Ctrl-C to stop) — install \`less\` for scrollback/search"
+        tail -F "$log_file"
+    fi
+}
+
+cmd_teardown() {
+    local manifest=""
+    local delete_branches=0
+    for a in "$@"; do
+        case "$a" in
+            --delete-branches) delete_branches=1 ;;
+            -h|--help)         usage 0 ;;
+            -*)                die "Unknown flag: $a" ;;
+            *)                 manifest="$a" ;;
+        esac
+    done
+    [ -n "$manifest" ] || die "usage: pw teardown <manifest.tsv> [--delete-branches]"
+
+    parse_manifest "$manifest" 0
+
+    # Tear down the repo the run was launched from, not the one we stand in:
+    # from a linked worktree, `repo_root "$(pwd)"` names that worktree and no
+    # session or worktree path below matches. Launch records its repo in the
+    # log header (# repo=...), which the .log-path sidecar points at. Without
+    # that record, fall back to the main checkout.
+    local repo="" repo_src="" log_file=""
+    [ -f "${manifest}.log-path" ] && log_file="$(cat "${manifest}.log-path")"
+    if [ -n "$log_file" ] && [ -f "$log_file" ]; then
+        repo="$(awk 'sub(/^# repo=/, "") { print; exit }' "$log_file")"
+        repo_src="recorded in $log_file"
+    fi
+    if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+        repo="$(main_checkout "$(pwd)")"
+        repo_src="main checkout of $(pwd); no launch record"
+    fi
+    local repo_name; repo_name="$(basename "$repo")"
+    info "Tearing down in $repo ($repo_src)"
+    local session_base="${PW_SESSION:-$repo_name-parallel}"
+
+    # Detect test-mode worktrees by probing both prefixed and plain names.
+    local -a tried=()
+    local matched=0
+    for session in "$session_base" "$session_base-test"; do
+        tried+=("session  $session")
+        if tmux has-session -t "=$session" 2>/dev/null; then
+            info "Killing tmux session $session"
+            tmux kill-session -t "=$session"
+            matched=$((matched+1))
+        fi
+    done
+
+    # The worktrees to remove: the ones the launch header records
+    # (# tag=<tag> ... worktree=<path>, read up to the blank line that ends
+    # it, since every agent appends to the log after it), where launch put
+    # them even if the setting or a WT_* lever changed since, and the ones the
+    # layout gives now under the plain and the test- names, which also finds
+    # a run of the other mode whose log the sidecar no longer names. If the
+    # setting's volume is unmounted, that stops teardown here only when there
+    # is no record to go by (mount it and re-run).
+    local -a wt_paths=()
+    local rec_tag rec_path
+    if [ -n "$log_file" ] && [ -f "$log_file" ]; then
+        while IFS=$'\t' read -r rec_tag rec_path; do
+            for tag_core in "${TAGS[@]}"; do
+                if [ "$rec_tag" = "$tag_core" ] || [ "$rec_tag" = "test-$tag_core" ]; then
+                    wt_paths+=("$rec_path")
+                    break
+                fi
+            done
+        done < <(awk '/^# === agents ===$/ { agents = 1; next } agents && /^$/ { exit }
+            agents && sub(/^# tag=/, "") { i = index($0, " worktree="); if (i) print $1 "\t" substr($0, i + 10) }' "$log_file")
+    fi
+    if [ "${#wt_paths[@]}" -eq 0 ]; then
+        require wt-helper
+        pw_resolve_wt_base "$repo"
+    elif ! command -v wt-helper >/dev/null 2>&1 \
+        || ! PW_WT_BASE="$(cd "$repo" && wt-helper --print-base-dir < /dev/null)" || [ -z "$PW_WT_BASE" ]; then
+        warn "wt-helper could not say where worktrees go for $repo; removing only the worktrees the launch recorded"
+        PW_WT_BASE=""
+    fi
+    if [ -n "$PW_WT_BASE" ]; then
+        for tag_core in "${TAGS[@]}"; do
+            for prefix in "" "test-"; do
+                wt_paths+=("$(pw_wt_path "$repo" "${prefix}${tag_core}")")
+            done
+        done
+    fi
+    # Only what git lists as a linked worktree of this repo goes: a recorded
+    # path may have been reused since, and a layout path may hold someone
+    # else's directory (the --force removal, and rm -rf after it, would take
+    # either). The first entry of the list is the main checkout.
+    local registered wt wt_p done_paths=$'\n'
+    registered="$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2 \
+        | while IFS= read -r wt_p; do (cd "$wt_p" 2>/dev/null && pwd -P) || printf '%s\n' "$wt_p"; done)" || registered=""
+    for wt in "${wt_paths[@]}"; do
+        case "$done_paths" in *$'\n'"$wt"$'\n'*) continue ;; esac
+        done_paths="$done_paths$wt"$'\n'
+        tried+=("worktree $wt")
+        [ -d "$wt" ] || continue
+        wt_p="$(cd "$wt" && pwd -P)" || continue
+        if ! grep -qxF -- "$wt_p" <<< "$registered"; then
+            warn "Leaving $wt: git does not list it as a worktree of $repo"
+            continue
+        fi
+        info "Removing worktree $wt"
+        git -C "$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
+        matched=$((matched+1))
+    done
+
+    # Branches count as matches so `--delete-branches` still works after an
+    # earlier teardown already removed the sessions and worktrees.
+    if [ "$delete_branches" -eq 1 ]; then
+        for i in "${!BRANCHES[@]}"; do
+            for prefix in "" "test/"; do
+                local branch="${prefix}${BRANCHES[$i]}"
+                tried+=("branch   $branch")
+                if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+                    info "Deleting branch $branch"
+                    git -C "$repo" branch -D "$branch" || true
+                    matched=$((matched+1))
+                fi
+            done
+        done
+    fi
+
+    # A match of nothing means the wrong repo, not a finished teardown. Keep
+    # the sidecar so a rerun from the right place still finds the log.
+    if [ "$matched" -eq 0 ]; then
+        warn "Nothing torn down: no tmux session, worktree or branch matched in $repo."
+        local t
+        for t in "${tried[@]}"; do warn "  tried $t"; done
+        [ -f "${manifest}.log-path" ] && warn "Kept ${manifest}.log-path."
+        exit 1
+    fi
+
+    [ -f "${manifest}.log-path" ] && rm -f "${manifest}.log-path"
+    info "Teardown complete."
+}
+
+cmd_validate() {
+    local manifest="${1:-}"
+    [ -n "$manifest" ] || die "usage: pw validate <manifest.tsv>"
+    parse_manifest "$manifest"
+
+    local warnings=0
+    for i in "${!TAGS[@]}"; do
+        local tag="${TAGS[$i]}"
+        local body="${PROMPT_BODIES[$i]}"
+        if ! printf '%s' "$body" | grep -qE 'PARALLEL_LOG|PARALLEL_APPEND'; then
+            warn "Task '$tag' prompt does not reference \$PARALLEL_LOG or \$PARALLEL_APPEND — its summary won't be merged."
+            warnings=$((warnings+1))
+        fi
+        if printf '%s' "$body" | grep -qE '\bflock\b'; then
+            warn "Task '$tag' prompt uses flock(1) — not installed on macOS. Pipe into \$PARALLEL_APPEND instead (see examples/prompt-template.md)."
+            warnings=$((warnings+1))
+        fi
+    done
+
+    info "Manifest OK: ${#TAGS[@]} tasks, $warnings warning(s)."
+}
+
+# ───────── pane state ───────────────────────────────────────────────────
+#
+# classify_pane <target> prints one of:
+#   workflow-prompt  Claude is showing the "Run a dynamic workflow?"
+#                    confirmation. Option 1 ("Yes, run it") is preselected,
+#                    so a stray Enter approves the workflow.
+#   permission       a tool-permission prompt ("Do you want to proceed?")
+#   claude           Claude Code input box / footer (safe to type into)
+#   shell            a shell prompt
+#   unknown          anything else
+#
+# tmux pads the visible screen with empty rows, so trailing blank lines are
+# dropped before looking at "the bottom" (otherwise a pane whose content has
+# not reached the last row reads as empty). Matches are unanchored, so
+# box-drawing borders around a line don't matter, and capture-pane without -e
+# emits no ANSI escapes.
+classify_pane() {
+    local target="$1"
+    local screen tail
+    screen=$(tmux capture-pane -p -J -t "$target" -S -40 2>/dev/null \
+        | awk 'NF { last = NR } { line[NR] = $0 } END { for (i = 1; i <= last; i++) print line[i] }')
+    # The workflow dialog is 15+ rows tall (question, phase list, options,
+    # key hints), so search the whole capture, not the last 8 lines. The
+    # question only counts if the idle input box (rule, one line, rule) is
+    # not drawn below it; that shape means the text is quoted output.
+    if awk '
+        /Run a dynamic workflow\?/ { live = 1; rule = 0; n = 0; next }
+        !NF                        { next }
+        /───/                      { if (rule && n == 1) live = 0; rule = 1; n = 0; next }
+                                   { n++ }
+        END                        { exit !live }
+    ' <<<"$screen"; then
+        echo workflow-prompt; return
+    fi
+    tail=$(tail -8 <<<"$screen")
+    # Permission prompt UI typically has "Do you want to proceed?" near
+    # the bottom plus numbered options.
+    if grep -qE "Do you want to proceed\?|Permission rule" <<<"$tail"; then
+        echo permission; return
+    fi
+    # Claude Code footer has model badges + spinner area + a mode line
+    # ("bypass permissions on (shift+tab to cycle)", "auto mode on (...)").
+    # Match a few stable substrings.
+    if grep -qE "(opus·|sonnet·|haiku·|bypass permissions on|shift\+tab to cycle|new task\? /clear)" <<<"$tail"; then
+        # Footer text alone is not proof: when Claude exits, its last frame stays
+        # on screen above the new shell prompt, and sending there would run the
+        # broadcast as a shell command. Require POSITIVE evidence that Claude is
+        # the foreground process: the native client reports as `claude` or its
+        # version string (e.g. `2.1.283`). Not `node`: a Node REPL started after
+        # Claude exits would pass, so an npm-installed Claude reads as unknown and
+        # is skipped. Anything else, including a failed lookup, is not safe to
+        # type into. Only this "safe to type" state is gated; the needs-a-human
+        # states above keep their text verdict.
+        local fg
+        fg=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null)
+        if [[ "$fg" == claude || "$fg" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo claude; return
+        fi
+        case "$fg" in
+            bash|zsh|sh|dash|ash|mksh|ksh|fish|tcsh|csh|yash|nu|xonsh|elvish|pwsh) echo shell ;;
+            *) echo unknown ;;
+        esac
+        return
+    fi
+    # Shell prompt heuristics: zsh starship "❯" or plain "$" or "#"
+    # at the start of the LAST nonblank line.
+    local last_line
+    last_line=$(awk 'NF' <<<"$tail" | tail -1)
+    if [[ "$last_line" =~ ^([[:space:]]*[❯%$#]|.*\@.*\:.*[\$#]) ]]; then
+        echo shell; return
+    fi
+    echo unknown
+}
+
+# ───────── cmd_status ───────────────────────────────────────────────────
+#
+# Read-only. Prints one line per pane in a session (target, state,
+# pane_current_command) using the classifier above, then names any pane that
+# is waiting for a human. Exit 2 = at least one pane is in permission or
+# workflow-prompt; exit 1 = error (e.g. no such session).
+cmd_status() {
+    local session="" a
+    for a in "$@"; do
+        case "$a" in
+            -h|--help) usage 0 ;;
+            -*)        die "Unknown flag: $a" ;;
+            *)         [[ -z "$session" ]] || die "Too many positional args: $a"
+                       session="$a" ;;
+        esac
+    done
+    [[ -n "$session" ]] || die "usage: pw status <session>"
+    tmux has-session -t "$session" 2>/dev/null \
+        || die "tmux session '$session' not found.  tmux ls to list."
+
+    local target cmd state
+    local -a waiting=()
+    while IFS=$'\t' read -r target cmd; do
+        state=$(classify_pane "$target")
+        printf '%-28s %-16s %s\n' "$target" "$state" "$cmd"
+        case "$state" in
+            workflow-prompt) waiting+=("$target: waiting for a human to approve a dynamic workflow") ;;
+            permission)      waiting+=("$target: waiting for a human to answer a permission prompt") ;;
+        esac
+    done < <(tmux list-panes -s -t "$session" -F $'#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}')
+
+    (( ${#waiting[@]} == 0 )) && return 0
+    local w
+    for w in "${waiting[@]}"; do warn "$w"; done
+    exit 2
+}
+
+# ───────── cmd_broadcast ────────────────────────────────────────────────
+#
+# Send the same prompt to every Claude Code pane in a tmux session.
+#
+# Usage:
+#   pw broadcast <session> <prompt-file-or-string>
+#                                 [--windows W1,W2,...] [--include PATTERN]
+#                                 [--exclude PATTERN]  [--dry-run]
+#
+# Behavior, per pane:
+#   1. Detect state with classify_pane (see "pane state" above):
+#       - Claude Code (footer matches "opus·" / "sonnet·" / "haiku·" /
+#         "bypass permissions" / "shift+tab to cycle") → send via
+#         send-keys -l + Enter
+#       - zsh/bash shell prompt ("❯" or "$" or "#") → SKIP (don't accidentally
+#         run prompt text as shell commands)
+#       - permission-prompt UI ("Do you want to proceed?") → SKIP (would
+#         answer the prompt with random text)
+#       - dynamic-workflow confirmation ("Run a dynamic workflow?") → SKIP
+#         (the closing Enter would approve the workflow)
+#       - empty / unknown → SKIP
+#   2. For prompts ≤ ~10000 chars: send via `tmux send-keys -l` in chunks
+#      of 4000 chars to dodge the per-call cap. Press Enter once at the end.
+#   3. For longer prompts: drop to $PW_BROADCAST_DIR/<timestamp>-<session>.md
+#      and send a one-line "Read <path> and execute it. GO." pointer instead.
+#   4. After Enter, sleep briefly and capture the pane to verify the agent
+#      engaged (look for spinner verbs / "Crunching" / token count) before
+#      reporting success.
+#
+# Returns rollup like:
+#   broadcast: 9 engaged, 0 skipped, 1 failed (window cinema: still at zsh)
+#
+# Options:
+#   --windows  comma-separated list of window names or indices to target.
+#              Default: all windows in the session.
+#   --include  glob (matched against window name) — only target matches.
+#   --exclude  glob — skip matches.
+#   --dry-run  print what would be sent + per-pane decision, no actual send.
+#
+cmd_broadcast() {
+    local session=""
+    local prompt_input=""
+    local include_pat=""
+    local exclude_pat=""
+    local windows_csv=""
+    local dry_run=0
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --windows)  windows_csv="$2"; shift 2 ;;
+            --include)  include_pat="$2"; shift 2 ;;
+            --exclude)  exclude_pat="$2"; shift 2 ;;
+            --dry-run)  dry_run=1; shift ;;
+            -h|--help)  usage 0 ;;
+            -*)         die "Unknown flag: $1" ;;
+            *)
+                if [[ -z "$session" ]]; then
+                    session="$1"
+                elif [[ -z "$prompt_input" ]]; then
+                    prompt_input="$1"
+                else
+                    die "Too many positional args: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$session" ]]      || die "session required.  Usage: pw broadcast <session> <prompt-file-or-string>"
+    [[ -n "$prompt_input" ]] || die "prompt required."
+
+    # Resolve the prompt body. If the input is a readable file, use its
+    # contents; otherwise treat the literal string as the prompt.
+    local prompt_text
+    if [[ -f "$prompt_input" ]]; then
+        prompt_text=$(<"$prompt_input")
+    else
+        prompt_text="$prompt_input"
+    fi
+    [[ -n "$prompt_text" ]] || die "prompt is empty."
+
+    # Verify session exists.
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        die "tmux session '$session' not found.  tmux ls to list."
+    fi
+
+    # Build target window list.
+    local -a targets=()
+    if [[ -n "$windows_csv" ]]; then
+        local IFS=,
+        for w in $windows_csv; do targets+=("$w"); done
+    else
+        # All windows in the session.
+        # A read loop, not mapfile: macOS ships bash 3.2.
+        local _w
+        while IFS= read -r _w; do targets+=("$_w"); done \
+            < <(tmux list-windows -t "$session" -F '#{window_index}: #{window_name}')
+    fi
+    [[ ${#targets[@]} -gt 0 ]] || die "No windows resolved for session '$session'."
+
+    # Decide delivery mode based on length. The 10000-char threshold is
+    # well under tmux's per-call cap (~12k) but we chunk to 4k regardless
+    # because long sends sometimes still drop chars at terminal boundaries.
+    local prompt_len=${#prompt_text}
+    local pointer_path=""
+    local effective_prompt="$prompt_text"
+
+    if (( prompt_len > 10000 )); then
+        local briefs_dir="${PW_BROADCAST_DIR:-$HOME/.claude/skill-data/parallel-worktrees/broadcast}"
+        mkdir -p "$briefs_dir"
+        local stamp
+        stamp=$(date +%Y%m%d-%H%M%S)
+        pointer_path="$briefs_dir/${stamp}-${session}.md"
+        printf '%s' "$prompt_text" > "$pointer_path"
+        info "Prompt is ${prompt_len} chars (>10000) — wrote to $pointer_path"
+        info "Pane will receive a 'Read <path> and execute it' pointer instead of the full text."
+        effective_prompt="Read ${pointer_path} and execute it end-to-end. The file contains a complete brief. Begin by reading it, then act on the instructions. GO."
+    fi
+
+    # Send a prompt to one pane. Chunks long input to avoid tmux's per-call
+    # length cap; presses Enter exactly once at the end. Returns 0 on send,
+    # 1 on classification skip (the state is left in skip_state for the
+    # rollup).
+    send_to_pane() {
+        local target="$1"
+        local text="$2"
+        local state
+        # synchronize-panes mirrors send-keys to EVERY pane of the window, including
+        # one waiting at a permission or workflow prompt that the final Enter would
+        # answer. Skip the whole window rather than classify only this pane. Read the
+        # EFFECTIVE value: show-window-options misses a global (setw -g) or pane-level
+        # (set -p) setting, while #{pane_synchronized} reflects all of them.
+        if [[ "$(tmux display-message -p -t "$target" '#{pane_synchronized}' 2>/dev/null)" == "1" ]]; then
+            warn "  $target: synchronize-panes is on (skipping — keys would reach every pane in the window)"
+            skip_state="synchronized"
+            return 1
+        fi
+        state=$(classify_pane "$target")
+        skip_state="$state"
+
+        case "$state" in
+            claude) ;;  # send below
+            shell)
+                warn "  $target: at shell prompt (skipping — would run as bash command)"
+                return 1
+                ;;
+            permission)
+                warn "  $target: permission prompt waiting (skipping — would answer randomly)"
+                return 1
+                ;;
+            workflow-prompt)
+                warn "  $target: waiting for a human to approve a dynamic workflow (skipping — Enter would approve it)"
+                return 1
+                ;;
+            unknown|*)
+                warn "  $target: pane state unknown (skipping — capture target manually to investigate)"
+                return 1
+                ;;
+        esac
+
+        if (( dry_run )); then
+            info "  $target: would send (state=$state, ${#text} chars)"
+            return 0
+        fi
+
+        # Press Escape first to clear any partial input or paste-collapse
+        # placeholder in the input box.
+        tmux send-keys -t "$target" Escape
+        sleep 0.2
+
+        # Chunk into 4000-char pieces for safety.
+        local chunk_size=4000
+        local i=0
+        while (( i < ${#text} )); do
+            local chunk="${text:i:chunk_size}"
+            tmux send-keys -t "$target" -l "$chunk"
+            i=$((i + chunk_size))
+            sleep 0.1
+        done
+        sleep 0.3
+        tmux send-keys -t "$target" Enter
+        return 0
+    }
+
+    # Verify the agent actually engaged: capture the pane after a few
+    # seconds and look for a spinner verb / token count.
+    verify_engagement() {
+        local target="$1"
+        sleep 4
+        local tail
+        tail=$(tmux capture-pane -p -t "$target" -S -10 2>/dev/null | tail -10)
+        if grep -qE "(✻|✶|✽|✢|✷|✻|↑ [0-9]+\.[0-9]+k tokens|↓ [0-9]+\.[0-9]+k tokens|· thought for [0-9]+s|still thinking)" <<<"$tail"; then
+            return 0
+        fi
+        return 1
+    }
+
+    # Main loop.
+    local engaged=0 skipped=0 failed=0 skip_state=""
+    local -a failed_windows=()
+    local -a engaged_windows=()
+    local -a skipped_windows=()
+
+    info "broadcast: session=$session, ${#targets[@]} window(s), prompt=${prompt_len} chars$( (( prompt_len > 10000 )) && echo " (sent as briefs pointer)" )"
+
+    for entry in "${targets[@]}"; do
+        # Entry is either "INDEX: NAME" (from list-windows) or a raw user-supplied id/name.
+        local idx="${entry%%:*}"
+        local name="${entry#*: }"
+        # If user supplied a raw arg, idx==entry==name.
+        if [[ "$idx" == "$name" ]]; then
+            # Resolve to (idx, name) by querying tmux.
+            local resolved
+            resolved=$(tmux list-windows -t "$session" -F '#{window_index}: #{window_name}' 2>/dev/null \
+                | awk -v q="$entry" '$0 ~ ":[ \t]*"q"$" || $1 == q":" {print; exit}')
+            if [[ -z "$resolved" ]]; then
+                warn "  $entry: not found in session $session — skipping"
+                skipped=$((skipped+1))
+                skipped_windows+=("$entry (not-found)")
+                continue
+            fi
+            idx="${resolved%%:*}"
+            name="${resolved#*: }"
+        fi
+        # Strip leading whitespace from name.
+        name="${name## }"
+
+        # include / exclude filters by name. The patterns are globs, so the
+        # right-hand sides stay unquoted on purpose.
+        # shellcheck disable=SC2053
+        if [[ -n "$include_pat" ]] && [[ "$name" != $include_pat ]]; then
+            continue
+        fi
+        # shellcheck disable=SC2053
+        if [[ -n "$exclude_pat" ]] && [[ "$name" == $exclude_pat ]]; then
+            continue
+        fi
+
+        local target="${session}:${idx}"
+        if send_to_pane "$target" "$effective_prompt"; then
+            if (( dry_run )); then
+                engaged=$((engaged+1))
+                engaged_windows+=("$idx:$name (dry-run)")
+            elif verify_engagement "$target"; then
+                engaged=$((engaged+1))
+                engaged_windows+=("$idx:$name")
+                info "  $idx:$name ✓ engaged"
+            else
+                failed=$((failed+1))
+                failed_windows+=("$idx:$name (no spinner detected)")
+                warn "  $idx:$name ⚠ sent but no engagement signal — verify manually"
+            fi
+        else
+            skipped=$((skipped+1))
+            skipped_windows+=("$idx:$name ($skip_state)")
+        fi
+    done
+
+    info ""
+    info "broadcast complete: ${engaged} engaged, ${skipped} skipped, ${failed} unverified"
+    if (( ${#failed_windows[@]} > 0 )); then
+        info "  unverified windows:"
+        for w in "${failed_windows[@]}"; do info "    - $w"; done
+    fi
+    if (( ${#skipped_windows[@]} > 0 )); then
+        info "  skipped windows:"
+        for w in "${skipped_windows[@]}"; do info "    - $w"; done
+    fi
+    if [[ -n "$pointer_path" ]]; then
+        info "  brief saved: $pointer_path"
+    fi
+}
+
+# ───────── dispatch ─────────────────────────────────────────────────────
+sub="${1:-}"
+shift || true
+case "$sub" in
+    launch)    cmd_launch "$@" ;;
+    log)       cmd_log "$@" ;;
+    teardown)  cmd_teardown "$@" ;;
+    validate)  cmd_validate "$@" ;;
+    status)    cmd_status "$@" ;;
+    broadcast) cmd_broadcast "$@" ;;
+    -h|--help|"") usage 0 ;;
+    *)         die "Unknown subcommand: $sub. Run 'pw --help'." ;;
+esac

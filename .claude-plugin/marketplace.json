@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "dx",
+  "description": "Skills and CLIs for running coding agents in tmux and git worktrees: session lifecycle, parallel worktrees, tmux, memory, Codex, review and more",
+  "owner": {
+    "name": "Cole Tebou"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "session",
+      "description": "Park idle Claude Code sessions in tmux to free memory and resume them with one keypress (cc-park), and hand a long session off to a fresh one through a written brief (fresh-session-handoff)",
+      "version": "1.0.0",
+      "source": "./plugins/session",
+      "category": "workflow"
+    },
+    {
+      "name": "worktrees",
+      "description": "Run N Claude Code or Codex sessions in parallel git worktrees with a merged log (parallel-worktrees), contract-first fan-outs (contract-fanout), and branch stacking (stack-branches, stack-claude)",
+      "version": "1.0.0",
+      "source": "./plugins/worktrees",
+      "category": "workflow"
+    }
+  ]
+}

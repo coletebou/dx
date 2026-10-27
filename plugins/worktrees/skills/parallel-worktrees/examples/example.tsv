@@ -1,0 +1,11 @@
+# Manifest columns (TAB-separated):
+#   tag<TAB>branch<TAB>prompt-spec[<TAB>engine]
+# prompt-spec: @/abs/path/to/prompt.md  (file)
+#           or a literal single-line string
+# engine (optional): claude | codex | codex:MODEL[:EFFORT]
+#
+# Comments start with # and must be the first non-space char.
+search	feat/search-filters	@/path/to/prompts/01-search-filters.md
+export	feat/csv-export	@/path/to/prompts/02-csv-export.md
+docs	docs/api-reference	@/path/to/prompts/03-api-reference.md
+audit	review/security	@/path/to/prompts/04-security-audit.md	codex:sol:xhigh

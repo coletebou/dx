@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# pw-append — atomically append stdin to $PARALLEL_LOG using a portable
+# mkdir-mutex. Works on Linux, macOS, and WSL with no dependency on flock(1)
+# (which is not installed on macOS by default).
+#
+# Usage:
+#   echo "..." | pw-append
+#   pw-append <<EOF
+#   ...
+#   EOF
+#
+# Env vars:
+#   PARALLEL_LOG              (required) target log path; set by `pw launch`
+#   PARALLEL_APPEND_TIMEOUT   (optional) seconds to wait for the lock; default 30
+
+set -euo pipefail
+
+: "${PARALLEL_LOG:?PARALLEL_LOG must be set; run inside a 'pw launch' tmux window}"
+
+LOCK_DIR="${PARALLEL_LOG}.lockd"
+TIMEOUT="${PARALLEL_APPEND_TIMEOUT:-30}"
+
+# mkdir is atomic on POSIX local filesystems — portable replacement for flock(1).
+# Holding the lock = the directory exists; releasing = rmdir.
+elapsed=0
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [ "$elapsed" -ge "$TIMEOUT" ]; then
+        echo "pw-append: timed out acquiring $LOCK_DIR after ${TIMEOUT}s" >&2
+        exit 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+# Release the lock on any exit path (success, error, signal).
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+cat >> "$PARALLEL_LOG"

@@ -1,0 +1,10 @@
+{
+  "name": "worktrees",
+  "description": "Parallel agents in git worktrees: spawn N Claude Code or Codex sessions in their own worktrees and tmux windows with a merged append-only log, check and broadcast to their panes (parallel-worktrees, pw), coordinate a contract-first fan-out of one issue across workers (contract-fanout), start a branch with pinned WIP branches stacked on it (stack-branches), and carry local agent tooling as one removable commit (stack-claude)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cole Tebou"
+  },
+  "license": "MIT",
+  "keywords": ["claude-code", "codex", "git-worktree", "tmux", "parallel-agents"]
+}

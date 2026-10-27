@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# stack-claude — squash a "claude tooling" branch into ONE obvious
+# "[REMOVE-BEFORE-MR]" commit on top of the CURRENT branch.
+#
+# Variant of stack-branches for the specific case of "I want my claude
+# tooling (CLAUDE.md rules, .claude/ settings, skills, hooks) on this
+# feature branch for local dev ergonomics without letting it leak into
+# the PR or MR I'm going to open." Unlike stack-branches, this never creates a
+# new branch — it always operates on HEAD.
+#
+# Usage:
+#   stack-claude -b <branch>        squash branch onto HEAD as one commit
+#   stack-claude unstack            remove the most recent stack commit
+#   stack-claude status             show whether HEAD is stacked
+#
+# Design notes:
+#   - Commit subject uses conventional-commits type so commitlint accepts it:
+#       chore: claude tooling stack [REMOVE-BEFORE-MR]
+#     The bracketed tag is the grep token for unstack/status. Marker is
+#     advisory only — run 'stack-claude unstack' before pushing.
+#   - Squash merge + single commit keeps the feature-branch log clean.
+#   - Records the pre-stack SHA in .git/stack-claude-head so unstack is
+#     deterministic. Self-heals if the file goes stale.
+#   - No hardcoded default branch: caller MUST set $STACK_CLAUDE_BRANCH or
+#     pass -b. This prevents rot when whatever issue branch you're carrying
+#     (e.g. 123-claude-md-refactor) merges and the ref disappears.
+#   - Never discards work: stack and unstack (a hard reset) both refuse a
+#     dirty tracked file. Untracked files are fine.
+
+set -euo pipefail
+
+CLAUDE_BRANCH="${STACK_CLAUDE_BRANCH:-}"
+REMOTE="${STACK_CLAUDE_REMOTE:-origin}"
+MARKER="[REMOVE-BEFORE-MR]"
+
+if [[ -t 2 ]]; then
+    C_BLUE=$'\033[1;34m'; C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'
+    C_RED=$'\033[1;31m'; C_RESET=$'\033[0m'
+else
+    C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_RESET=""
+fi
+
+log()  { echo "${C_BLUE}[stack-claude]${C_RESET} $*" >&2; }
+ok()   { echo "${C_GREEN}[stack-claude]${C_RESET} $*" >&2; }
+warn() { echo "${C_YELLOW}[stack-claude]${C_RESET} $*" >&2; }
+die()  { echo "${C_RED}[stack-claude]${C_RESET} $*" >&2; exit 1; }
+
+# Porcelain format is "XY PATH"; "??" rows are untracked files, which are fine.
+# Any other row is a change that a squash merge could mix into the stack commit,
+# or that unstack's hard reset would destroy, so it stops the run.
+need_clean_tree() {
+    local dirty
+    dirty=$(git status --porcelain | grep -vE '^\?\? ' || true)
+    if [[ -n "$dirty" ]]; then
+        warn "working tree has changes:"
+        echo "$dirty" >&2
+        die "commit or stash them first (untracked files are OK)"
+    fi
+}
+
+cmd_stack() {
+    local claude_branch="$CLAUDE_BRANCH"
+    while (( $# > 0 )); do
+        case "$1" in
+            -b|--branch) claude_branch="$2"; shift 2 ;;
+            -h|--help)   cmd_help; exit 0 ;;
+            -*)          die "unknown flag: $1" ;;
+            *)           die "unexpected arg: $1 (use -b <branch>)" ;;
+        esac
+    done
+
+    [[ -n "$claude_branch" ]] || die "no branch specified — pass -b <branch> or set STACK_CLAUDE_BRANCH"
+
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        || die "not inside a git repo"
+
+    local cur_branch
+    cur_branch=$(git branch --show-current)
+    [[ -z "$cur_branch" ]] && die "detached HEAD — check out a branch first"
+    if [[ "$cur_branch" == "$claude_branch" \
+       || "$cur_branch" == "${claude_branch#${REMOTE}/}" ]]; then
+        die "refusing to stack $claude_branch onto itself"
+    fi
+
+    if [[ "${STACK_CLAUDE_NO_FETCH:-0}" != "1" ]]; then
+        log "fetching $REMOTE ..."
+        git fetch --quiet "$REMOTE" || die "git fetch failed"
+    fi
+
+    git rev-parse --verify --quiet "$claude_branch" >/dev/null \
+        || die "claude branch not found: $claude_branch (pass -b to override)"
+
+    # Already stacked? Top commit carries the marker token.
+    if git log -1 --pretty=%B | grep -qF "$MARKER"; then
+        warn "HEAD already carries a '$MARKER' commit:"
+        git --no-pager log -1 --oneline >&2
+        warn "unstack first:  stack-claude unstack"
+        exit 1
+    fi
+
+    need_clean_tree
+
+    if git merge-base --is-ancestor "$claude_branch" HEAD; then
+        ok "$claude_branch is already fully in HEAD — nothing to stack"
+        # No marker commit is created, so don't record stack-claude-head
+        # either (would confuse a later unstack into resetting past real work).
+        exit 0
+    fi
+
+    local pre_sha
+    pre_sha=$(git rev-parse HEAD)
+    log "current:   $cur_branch ($(git rev-parse --short HEAD))"
+    log "squashing: $claude_branch ($(git rev-parse --short "$claude_branch"))"
+
+    if ! git merge --squash "$claude_branch"; then
+        warn "squash merge hit a conflict"
+        warn "  resolve, stage, then:"
+        warn "    git commit -m 'chore: claude tooling stack $MARKER'"
+        warn "  or abort with:"
+        warn "    git reset --merge && git restore ."
+        # Record pre-stack SHA even on conflict so a manual-commit-then-unstack
+        # still has a deterministic target.
+        local git_dir
+        git_dir=$(git rev-parse --git-dir)
+        echo "$pre_sha" > "$git_dir/stack-claude-head"
+        exit 2
+    fi
+
+    # Conventional-commits compatible subject; marker as bracketed tag.
+    # The SHA goes in the body only (avoids leaking issue-numbered branch
+    # names into the subject line, which would be noise for reviewers if
+    # the commit ever slipped into an MR).
+    git commit \
+        -m "chore: claude tooling stack $MARKER" \
+        -m "Generated by stack-claude. Squashed from $(git rev-parse --short "$claude_branch"). Run 'stack-claude unstack' before pushing." \
+        >/dev/null
+
+    local git_dir
+    git_dir=$(git rev-parse --git-dir)
+    echo "$pre_sha" > "$git_dir/stack-claude-head"
+
+    ok "stacked $claude_branch onto $cur_branch as one commit"
+    git --no-pager log -1 --oneline >&2
+    warn "REMEMBER: run 'stack-claude unstack' before pushing"
+}
+
+cmd_unstack() {
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        || die "not inside a git repo"
+
+    local git_dir pre_sha target_sha
+    git_dir=$(git rev-parse --git-dir)
+
+    # Happy path: marker at top of HEAD.
+    if git log -1 --pretty=%B | grep -qF "$MARKER"; then
+        need_clean_tree
+        if [[ -f "$git_dir/stack-claude-head" ]]; then
+            pre_sha=$(<"$git_dir/stack-claude-head")
+            if git rev-parse --verify --quiet "$pre_sha" >/dev/null \
+               && git merge-base --is-ancestor "$pre_sha" HEAD; then
+                target_sha="$pre_sha"
+            fi
+        fi
+        # Fallback: if recorded SHA is missing/stale/unreachable, use HEAD^.
+        # This is only safe because we already confirmed the marker is the
+        # top commit — HEAD^ is definitively the pre-stack state.
+        [[ -z "${target_sha:-}" ]] && target_sha=$(git rev-parse HEAD^)
+
+        log "resetting HEAD to $(git rev-parse --short "$target_sha")"
+        git reset --hard "$target_sha"
+        rm -f "$git_dir/stack-claude-head"
+        ok "unstacked"
+        return 0
+    fi
+
+    # Marker not at top. Refuse to guess — require explicit action.
+    if [[ -f "$git_dir/stack-claude-head" ]]; then
+        pre_sha=$(<"$git_dir/stack-claude-head")
+        warn "HEAD is not a '$MARKER' commit, but a pre-stack SHA is recorded:"
+        warn "  pre-stack: $(git rev-parse --short "$pre_sha" 2>/dev/null || echo "$pre_sha (unreachable)")"
+        warn "  current:   $(git rev-parse --short HEAD)"
+        warn "commits on top of the stack will be lost if you reset."
+        warn "if that's what you want:"
+        warn "  git reset --hard $pre_sha && rm $git_dir/stack-claude-head"
+        warn "or clear the stale record without resetting:"
+        warn "  rm $git_dir/stack-claude-head"
+        exit 1
+    fi
+
+    die "HEAD is not a '$MARKER' commit and no pre-stack SHA recorded (nothing to unstack)"
+}
+
+cmd_status() {
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        die "not inside a git repo"
+    fi
+    local git_dir marker_sha
+    git_dir=$(git rev-parse --git-dir)
+
+    if git log -1 --pretty=%B 2>/dev/null | grep -qF "$MARKER"; then
+        echo "stacked (HEAD): $(git log -1 --pretty='%h %s')"
+    else
+        # Bounded search: only look in commits unique to HEAD vs the
+        # remote default branch. If no upstream is knowable, cap at 500.
+        local upstream=""
+        local ref
+        for ref in "$REMOTE/HEAD" "$REMOTE/dev" "$REMOTE/master" "$REMOTE/main"; do
+            if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+                upstream="$ref"; break
+            fi
+        done
+        # --fixed-strings makes --grep treat MARKER literally (brackets etc).
+        if [[ -n "$upstream" ]]; then
+            marker_sha=$(git log --fixed-strings --grep="$MARKER" --pretty=%H "$upstream..HEAD" 2>/dev/null | head -1)
+        else
+            marker_sha=$(git log --fixed-strings --grep="$MARKER" --max-count=500 --pretty=%H 2>/dev/null | head -1)
+        fi
+        if [[ -n "$marker_sha" ]]; then
+            echo "stacked (buried): $(git log -1 --pretty='%h %s' "$marker_sha")"
+            echo "  ($(git rev-list --count "$marker_sha..HEAD") commits on top of it)"
+        else
+            echo "not stacked"
+        fi
+    fi
+    if [[ -f "$git_dir/stack-claude-head" ]]; then
+        local recorded
+        recorded=$(<"$git_dir/stack-claude-head")
+        if git rev-parse --verify --quiet "$recorded" >/dev/null; then
+            echo "  recorded pre-stack SHA: $(git rev-parse --short "$recorded")"
+        else
+            echo "  recorded pre-stack SHA: $recorded (STALE — object not found)"
+        fi
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+stack-claude — squash a branch onto HEAD as ONE "$MARKER" commit.
+
+Carries local claude tooling (CLAUDE.md, .claude/, skills, hooks) onto
+a feature branch for local dev ergonomics, without letting it leak into
+the PR or MR.
+
+Usage:
+  stack-claude -b BRANCH       squash BRANCH onto current branch
+  stack-claude unstack         remove the stack commit
+  stack-claude status          show whether HEAD is stacked
+  stack-claude help            this message
+
+Env:
+  STACK_CLAUDE_BRANCH    default branch to squash (no built-in default)
+  STACK_CLAUDE_REMOTE    remote name (default: origin)
+  STACK_CLAUDE_NO_FETCH  skip git fetch before stacking (default: 0)
+
+The commit subject 'chore: claude tooling stack $MARKER' is a
+conventional-commits type, so commitlint accepts it. The marker is
+advisory — 'stack-claude unstack' before pushing.
+EOF
+}
+
+main() {
+    # NOTE: 'shift' under 'set -e' exits when \$# == 0.
+    local sub="${1:-stack}"
+    case "$sub" in
+        unstack|pop)     shift || true; cmd_unstack "$@" ;;
+        status|st)       shift || true; cmd_status "$@" ;;
+        -h|--help|help)  cmd_help ;;
+        stack)           shift || true; cmd_stack "$@" ;;
+        -*)              cmd_stack "$@" ;;
+        *)               die "unknown subcommand: $sub (try: stack-claude help)" ;;
+    esac
+}
+
+main "$@"

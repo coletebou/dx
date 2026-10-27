@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# stack-branches — create a fresh branch from the remote's default branch
+# (origin/HEAD) with pinned WIP branches stacked on top (octopus merge). Profiles live in ~/.config/stack-branches/profiles.d/*.json
+# and select which branches get stacked.
+#
+# Usage:
+#   stack-branches                         # fuzzy-pick a profile, prompt for branch name
+#   stack-branches -p <profile>            # use a named profile
+#   stack-branches -p <profile> -n <name>  # non-interactive
+#   stack-branches profiles list           # list profiles
+#   stack-branches profiles show <name>    # show profile contents
+#   stack-branches profiles add            # create a profile (fzf multi-select branches)
+#   stack-branches profiles add <name>     # create with explicit name
+#   stack-branches profiles remove         # fuzzy-pick profile to delete
+#   stack-branches profiles edit <name>    # $EDITOR on the profile JSON
+#
+# Design notes:
+#   - One JSON file per profile keeps add/remove trivial (no YAML/round-trip edits).
+#   - Octopus merge ('git merge b1 b2 ...') is used for stacking: clean history,
+#     fails loudly on conflicts. For throwaway WIP branches this is exactly right.
+#   - Base is always a fresh origin/HEAD (fetched every run; STACK_BRANCHES_BASE
+#     picks another). Caller opts out of the fetch via STACK_BRANCHES_NO_FETCH=1
+#     if offline or to save a few seconds.
+#   - Stops at the first conflict: the octopus is retried as sequential merges,
+#     and the first one that conflicts is left in place for a manual resolve,
+#     with the commands to continue or to abandon the new branch (exit 2).
+#   - Never discards work: a dirty tracked file stops the run before any
+#     branch is touched (untracked files are fine).
+
+set -euo pipefail
+
+CONFIG_DIR="${STACK_BRANCHES_CONFIG:-$HOME/.config/stack-branches}"
+PROFILES_DIR="$CONFIG_DIR/profiles.d"
+mkdir -p "$PROFILES_DIR"
+
+REMOTE="${STACK_BRANCHES_REMOTE:-origin}"
+BASE_BRANCH="${STACK_BRANCHES_BASE:-$REMOTE/HEAD}"
+
+# Colours — only if stderr is a TTY (skill/script mode stays clean).
+if [[ -t 2 ]]; then
+    C_BLUE=$'\033[1;34m'; C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'
+    C_RED=$'\033[1;31m'; C_RESET=$'\033[0m'
+else
+    C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_RESET=""
+fi
+
+log()  { echo "${C_BLUE}[stack]${C_RESET} $*" >&2; }
+ok()   { echo "${C_GREEN}[stack]${C_RESET} $*" >&2; }
+warn() { echo "${C_YELLOW}[stack]${C_RESET} $*" >&2; }
+die()  { echo "${C_RED}[stack]${C_RESET} $*" >&2; exit 1; }
+
+# ── Profile helpers ──────────────────────────────────────────────────
+profile_path() { echo "$PROFILES_DIR/$1.json"; }
+
+profile_exists() { [[ -f "$(profile_path "$1")" ]]; }
+
+list_profiles() {
+    # A glob, not find -printf (GNU-only).
+    local f
+    for f in "$PROFILES_DIR"/*.json; do
+        [[ -f "$f" ]] && basename "$f" .json
+    done | sort
+}
+
+
+profile_branches() {
+    # Emit branches from a profile, one per line.
+    local name="$1"
+    profile_exists "$name" || die "profile not found: $name"
+    jq -r '.branches[]' "$(profile_path "$name")"
+}
+
+profile_description() {
+    local name="$1"
+    jq -r '.description // ""' "$(profile_path "$name")" 2>/dev/null
+}
+
+pick_profile() {
+    # Emit the picked profile name, or exit 1 if no selection / no profiles.
+    # A read loop, not mapfile: macOS ships bash 3.2.
+    local profiles=() _p
+    while IFS= read -r _p; do profiles+=("$_p"); done < <(list_profiles)
+    (( ${#profiles[@]} > 0 )) || die "no profiles defined. create one with: stack-branches profiles add"
+
+    if [[ ! -t 0 || ! -t 1 ]] || ! command -v fzf >/dev/null 2>&1; then
+        # Non-TTY fallback: if only one profile, use it; else require -p.
+        if (( ${#profiles[@]} == 1 )); then
+            echo "${profiles[0]}"; return 0
+        fi
+        die "non-interactive with >1 profile — pass -p <profile>. Available: ${profiles[*]}"
+    fi
+
+    local rows
+    rows=$(for p in "${profiles[@]}"; do
+        local desc count
+        desc=$(profile_description "$p")
+        count=$(profile_branches "$p" 2>/dev/null | wc -l)
+        printf '%-30s  %2d branches  %s\n' "$p" "$count" "$desc"
+    done)
+    local picked
+    picked=$(echo "$rows" | fzf \
+        --prompt='profile ❯ ' \
+        --header='↑↓ pick · enter select · esc cancel' \
+        --height=40% --reverse --no-sort) || return 1
+    [[ -z "$picked" ]] && return 1
+    echo "$picked" | awk '{print $1}'
+}
+
+# ── Branch stacking ──────────────────────────────────────────────────
+do_stack() {
+    local profile_name="$1" new_branch="$2"
+
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        || die "not inside a git repo"
+
+    # Gather branches from profile and normalise to "origin/foo" form.
+    local branches=()
+    while IFS= read -r br; do
+        [[ -z "$br" ]] && continue
+        # If user stored a bare name, try origin/<name>. If they stored
+        # origin/<name>, keep it. If local-only, keep it.
+        if [[ "$br" == */* ]]; then
+            branches+=("$br")
+        elif git rev-parse --verify --quiet "$REMOTE/$br" >/dev/null; then
+            branches+=("$REMOTE/$br")
+        elif git rev-parse --verify --quiet "$br" >/dev/null; then
+            branches+=("$br")
+        else
+            die "branch '$br' not found locally or on $REMOTE"
+        fi
+    done < <(profile_branches "$profile_name")
+
+    (( ${#branches[@]} > 0 )) || die "profile '$profile_name' has no branches"
+
+    # Fetch to make sure origin/* refs are fresh.
+    if [[ "${STACK_BRANCHES_NO_FETCH:-0}" != "1" ]]; then
+        log "fetching $REMOTE ..."
+        git fetch --quiet "$REMOTE" || die "git fetch failed"
+    fi
+
+    # Resolve refs to SHAs so we know exactly what we're stacking.
+    local base_sha
+    base_sha=$(git rev-parse --verify --quiet "$BASE_BRANCH^{commit}") \
+        || die "base branch $BASE_BRANCH not found (fetched? for $REMOTE/HEAD: git remote set-head $REMOTE --auto, or set STACK_BRANCHES_BASE)"
+    # origin/HEAD is a symbolic ref: log the branch it stands for.
+    local base_name
+    base_name=$(git rev-parse --abbrev-ref "$BASE_BRANCH" 2>/dev/null) || base_name="$BASE_BRANCH"
+
+    # Require a clean working tree before touching branches: the conflict path
+    # below resets the new branch, and nothing uncommitted may ride along.
+    # Untracked files are fine.
+    local dirty
+    dirty=$(git status --porcelain | grep -vE '^\?\? ' || true)
+    if [[ -n "$dirty" ]]; then
+        warn "working tree has changes:"
+        echo "$dirty" >&2
+        die "commit or stash your changes before stacking (untracked files are OK)"
+    fi
+
+    # Make sure the new branch doesn't already exist.
+    if git rev-parse --verify --quiet "refs/heads/$new_branch" >/dev/null; then
+        die "branch '$new_branch' already exists locally"
+    fi
+
+    log "base: $base_name ($(git rev-parse --short "$base_sha"))"
+    log "stack: ${branches[*]}"
+    log "target: $new_branch"
+
+    # Create the branch from base and switch to it.
+    git switch -c "$new_branch" "$base_sha" >/dev/null
+
+    # Try an octopus merge first — single commit, fast, fails clean.
+    if git merge --no-ff --no-edit -m "stack($profile_name): $(printf '%s + ' "${branches[@]}" | sed 's/ + $//')" "${branches[@]}"; then
+        ok "stacked ${#branches[@]} branches onto $new_branch (octopus)"
+        git --no-pager log --oneline "$base_sha..HEAD" | head -15 >&2
+        return 0
+    fi
+
+    warn "octopus merge failed — falling back to sequential merges"
+    git merge --abort 2>/dev/null || true
+    # Reset branch to base, then merge one by one so the first conflict
+    # stops us with a clear pointer to which branch broke it.
+    git reset --hard "$base_sha" >/dev/null
+    for br in "${branches[@]}"; do
+        log "merging $br ..."
+        if ! git merge --no-ff --no-edit "$br"; then
+            warn "conflict on $br — leaving branch in place for manual resolve"
+            warn "  fix conflicts, then:  git merge --continue"
+            warn "  or abandon with:      git merge --abort && git switch - && git branch -D $new_branch"
+            exit 2
+        fi
+    done
+    ok "stacked ${#branches[@]} branches onto $new_branch (sequential)"
+    git --no-pager log --oneline "$base_sha..HEAD" | head -15 >&2
+}
+
+# ── Profile management ──────────────────────────────────────────────
+cmd_profiles_list() {
+    local profiles=() _p
+    while IFS= read -r _p; do profiles+=("$_p"); done < <(list_profiles)
+    (( ${#profiles[@]} > 0 )) || { echo "(no profiles — create with: stack-branches profiles add)"; return; }
+    printf '%-30s  %-10s  %s\n' "PROFILE" "BRANCHES" "DESCRIPTION"
+    for p in "${profiles[@]}"; do
+        printf '%-30s  %-10d  %s\n' "$p" "$(profile_branches "$p" | wc -l)" "$(profile_description "$p")"
+    done
+}
+
+cmd_profiles_show() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "usage: stack-branches profiles show <name>"
+    profile_exists "$name" || die "profile not found: $name"
+    jq . "$(profile_path "$name")"
+}
+
+cmd_profiles_add() {
+    local name="${1:-}"
+    # If no name given, fuzzy-pick branches then prompt for name.
+    command -v fzf >/dev/null 2>&1 || die "fzf required for interactive add"
+
+    if [[ -z "$name" ]]; then
+        read -r -p 'profile name: ' name
+        [[ -z "$name" ]] && die "name required"
+    fi
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "profile name must match [a-zA-Z0-9_-]+"
+    profile_exists "$name" && die "profile already exists: $name (remove it first)"
+
+    log "fetching remote branches ..."
+    git fetch --quiet "$REMOTE" 2>/dev/null || warn "fetch failed — using cached refs"
+
+    # Collect all branches — remote and local — and dedupe.
+    local all_branches
+    all_branches=$( { git branch -r --format='%(refname:short)' | grep -v 'HEAD' ;
+                     git branch --format='%(refname:short)' ; } | sort -u)
+
+    local picks
+    picks=$(echo "$all_branches" | fzf \
+        --multi \
+        --prompt='branches ❯ ' \
+        --header='TAB to select multiple · enter to confirm · esc to cancel' \
+        --height=60% --reverse)
+    [[ -z "$picks" ]] && die "no branches selected"
+
+    read -r -p 'description (optional): ' desc
+
+    # Write as JSON.
+    jq -n --arg name "$name" --arg desc "$desc" --argjson branches "$(echo "$picks" | jq -R . | jq -s .)" \
+        '{name: $name, description: $desc, branches: $branches, created: now | todate}' \
+        > "$(profile_path "$name")"
+    ok "created profile: $name"
+    cmd_profiles_show "$name"
+}
+
+cmd_profiles_remove() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        name=$(pick_profile) || die "cancelled"
+    fi
+    profile_exists "$name" || die "profile not found: $name"
+    rm "$(profile_path "$name")"
+    ok "removed profile: $name"
+}
+
+cmd_profiles_edit() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { name=$(pick_profile) || die "cancelled"; }
+    profile_exists "$name" || die "profile not found: $name"
+    "${EDITOR:-vi}" "$(profile_path "$name")"
+    # Validate JSON after edit.
+    jq . "$(profile_path "$name")" >/dev/null || die "invalid JSON after edit"
+    ok "saved profile: $name"
+}
+
+# ── Main dispatch ───────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+stack-branches — create a fresh branch from origin/HEAD with pinned WIP stacked on top.
+
+Stacking:
+  stack-branches                       pick profile (fzf), prompt for new-branch name
+  stack-branches -p <profile>          stack with named profile, prompt for name
+  stack-branches -p <profile> -n NAME  fully non-interactive
+  stack-branches -p <profile> NAME     shorthand (positional name)
+
+Profiles:
+  stack-branches profiles list
+  stack-branches profiles show <name>
+  stack-branches profiles add [<name>]       fzf multi-select branches
+  stack-branches profiles remove [<name>]    fzf picker if no name
+  stack-branches profiles edit [<name>]      \$EDITOR on JSON
+
+Env:
+  STACK_BRANCHES_BASE     base branch (default: <remote>/HEAD, the default branch)
+  STACK_BRANCHES_REMOTE   remote name (default: origin)
+  STACK_BRANCHES_NO_FETCH skip 'git fetch' on stacking (default: 0)
+  STACK_BRANCHES_CONFIG   config dir (default: ~/.config/stack-branches)
+EOF
+}
+
+main() {
+    local sub="${1:-}"
+    case "$sub" in
+        profiles)
+            shift
+            local action="${1:-list}"; shift || true
+            case "$action" in
+                list)   cmd_profiles_list "$@" ;;
+                show)   cmd_profiles_show "$@" ;;
+                add)    cmd_profiles_add "$@" ;;
+                remove|rm|delete) cmd_profiles_remove "$@" ;;
+                edit)   cmd_profiles_edit "$@" ;;
+                *)      die "unknown profiles action: $action (list/show/add/remove/edit)" ;;
+            esac
+            ;;
+        -h|--help|help) usage ;;
+        *)
+            # Stacking mode. Parse flags.
+            local profile="" new_name=""
+            while (( $# > 0 )); do
+                case "$1" in
+                    -p|--profile) profile="$2"; shift 2 ;;
+                    -n|--name)    new_name="$2"; shift 2 ;;
+                    -h|--help)    usage; exit 0 ;;
+                    -*)           die "unknown flag: $1" ;;
+                    *)            # First positional is new-branch name if no -n given
+                                  [[ -z "$new_name" ]] && new_name="$1"
+                                  shift ;;
+                esac
+            done
+
+            [[ -z "$profile" ]] && profile=$(pick_profile)
+            [[ -z "$profile" ]] && die "no profile selected"
+            profile_exists "$profile" || die "profile not found: $profile"
+
+            if [[ -z "$new_name" ]]; then
+                if [[ -t 0 && -t 1 ]]; then
+                    read -r -p 'new branch name: ' new_name
+                fi
+            fi
+            [[ -z "$new_name" ]] && die "new branch name required (use -n or positional arg)"
+
+            do_stack "$profile" "$new_name"
+            ;;
+    esac
+}
+
+main "$@"
