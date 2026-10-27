@@ -25,7 +25,8 @@ prompt = open(a[a.index("--prompt") + 1]).read()
 phase = next(p for p in ("LIGHT", "REM", "DEEP") if prompt.startswith(p))
 inputs = [a[i + 1] for i, x in enumerate(a) if x == "--input"]
 with open(os.environ["FAKE_CALLS"], "a") as f:
-    f.write(json.dumps({"phase": phase, "model": a[a.index("--model") + 1], "inputs": inputs}) + "\n")
+    f.write(json.dumps({"phase": phase, "model": a[a.index("--model") + 1], "inputs": inputs,
+                        "isolated": "--isolated" in a}) + "\n")
 if os.environ.get("FAKE_FAIL") == phase:
     sys.exit(3)
 out = a[a.index("--output") + 1]
@@ -103,6 +104,7 @@ class DreamTest(unittest.TestCase):
         calls = self.calls_made()
         self.assertEqual([(c["phase"], c["model"]) for c in calls], [("LIGHT", "haiku"), ("REM", "sonnet"), ("DEEP", "opus")])
         self.assertTrue(any(p.endswith("laptop/unfinished.md") for p in calls[0]["inputs"]), "per-host .analysis is read")
+        self.assertTrue(all(c["isolated"] for c in calls), "session text never reaches a model that has tools")
         self.assertEqual((self.mem / "feedback_use_pnpm.md").read_text().splitlines()[1], "name: Use pnpm")
         self.assertIn("- [Use pnpm](feedback_use_pnpm.md)", (self.mem / "MEMORY.md").read_text())
         diary = (self.mem / "DREAMS.md").read_text()
@@ -153,6 +155,22 @@ Quiet.
         self.assertNotIn("Never written", index, "a line with any unresolved link is dropped")
         self.assertNotIn("escape", index)
         self.assertEqual(index.count("reference_existing.md"), 1, "the existing line is not re-appended")
+
+    def test_a_promotion_no_appended_line_indexes_is_rolled_back(self):
+        two = PROMOTION.replace("=== MEMORY.md append ===", "=== FILE: gotcha_second.md ===\n---\nname: Second\n---\n"
+                                "second body\n\n=== MEMORY.md append ===")
+        self.deep.write_text(two)
+        r = self.dream("deep")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.mem / "feedback_use_pnpm.md").exists(), "the indexed promotion stays")
+        self.assertFalse((self.mem / "gotcha_second.md").exists(), "the unindexed one is rolled back")
+        self.assertNotIn("gotcha_second", (self.mem / "MEMORY.md").read_text())
+        (self.mem / "feedback_use_pnpm.md").unlink()
+        self.deep.write_text(PROMOTION.replace("=== MEMORY.md append ===\n- [Use pnpm](feedback_use_pnpm.md) installs go "
+                                               "through pnpm\n", ""))
+        r = self.dream("deep")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((self.mem / "feedback_use_pnpm.md").exists(), "a reply without an append block keeps no file")
 
     def test_a_full_index_refuses_the_append_and_rolls_the_file_back(self):
         lines = "".join(f"- [M{n}](reference_existing.md) x\n" for n in range(188))

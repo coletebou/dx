@@ -174,6 +174,18 @@ class ConsolidateTest(unittest.TestCase):
         self.run_it()
         self.assertIsNone(self.seen_env()["AWS_BEARER_TOKEN_BEDROCK"], "no file is read unless named")
 
+    def test_an_aws_model_id_takes_the_bearer_even_with_an_anthropic_key_exported(self):
+        env_file = self.root / "secrets.env"
+        env_file.write_text("AWS_BEARER_TOKEN_BEDROCK=from-file\nANTHROPIC_API_KEY=file-key\n")
+        for model in ("us.anthropic.claude-sonnet-5-5", "anthropic.claude-sonnet-5-5"):
+            r = self.run_it("--model", model, CLAUDE_CONSOLIDATE_ENV_FILE=str(env_file), ANTHROPIC_API_KEY="exported")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.seen_env()["AWS_BEARER_TOKEN_BEDROCK"], "from-file", model)
+        r = self.run_it("--model", "us.anthropic.claude-sonnet-5-5", CLAUDE_CONSOLIDATE_ENV_FILE=str(env_file),
+                        AWS_BEARER_TOKEN_BEDROCK="exported-bearer")
+        self.assertEqual(self.seen_env()["AWS_BEARER_TOKEN_BEDROCK"], "exported-bearer", "an exported bearer wins")
+        self.assertIsNone(self.seen_env()["ANTHROPIC_API_KEY"], "an AWS route takes no Anthropic key from the file")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

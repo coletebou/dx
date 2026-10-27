@@ -250,6 +250,8 @@ prompt = open(args[args.index("--prompt") + 1]).read()
 open({str(self.prompt_seen)!r}, "a").write(prompt + "\\n=====\\n")
 if os.environ.get("AGENT_HOOK_CHILD") != "1":
     sys.exit(9)  # the reflector must always mark its children
+if "--isolated" not in args:
+    sys.exit(8)  # transcript text must never reach a model that has tools
 model = args[args.index("--model") + 1]
 open({str(self.models_seen)!r}, "a").write(model + "\\n")
 if model.startswith("anthropic."):

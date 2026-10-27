@@ -19,7 +19,8 @@
 #   us.anthropic.* / global.anthropic.* Bedrock Runtime ($AWS_REGION, default us-east-1)
 # Headless jobs (systemd, launchd) that do not load your shell's secrets can name
 # a file with CLAUDE_CONSOLIDATE_ENV_FILE: only AWS_BEARER_TOKEN_BEDROCK and
-# ANTHROPIC_API_KEY are read from it, and only when absent from the environment.
+# ANTHROPIC_API_KEY are read from it. An AWS model id takes the bearer when the
+# environment lacks it; any other model takes both, when neither is set.
 #
 # Data boundary: MEMORY_BOUNDARY_CMD (scripts/lib/memory-boundary.sh) is asked
 # about the prompt and every input file; a restricted answer refuses the call
@@ -193,10 +194,21 @@ if [[ "$(id -u)" -eq 0 && -z "${IS_SANDBOX:-}" ]]; then
   export IS_SANDBOX=1
 fi
 ENV_FILE="${CLAUDE_CONSOLIDATE_ENV_FILE:-}"
-if [[ -n "$ENV_FILE" && -f "$ENV_FILE" && -z "${AWS_BEARER_TOKEN_BEDROCK:-}" \
-      && -z "${ANTHROPIC_API_KEY:-}" ]]; then
-  # Only the two auth keys, so an unrelated secret cannot leak into the child.
-  for _k in AWS_BEARER_TOKEN_BEDROCK ANTHROPIC_API_KEY; do
+# What the call's route needs from it. An AWS model id needs only the Bedrock
+# bearer (its route blanks the Anthropic key), so an exported Anthropic key must
+# not keep the bearer out. Any other model follows the login, and there a
+# credential of either kind already in the environment wins.
+if [[ "$MODEL" == anthropic.* || "$MODEL" == us.anthropic.* || "$MODEL" == global.anthropic.* ]]; then
+  ENV_KEYS="AWS_BEARER_TOKEN_BEDROCK"
+  [[ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ]] || ENV_KEYS=""
+elif [[ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  ENV_KEYS="AWS_BEARER_TOKEN_BEDROCK ANTHROPIC_API_KEY"
+else
+  ENV_KEYS=""
+fi
+if [[ -n "$ENV_FILE" && -f "$ENV_FILE" && -n "$ENV_KEYS" ]]; then
+  # Only the auth keys, so an unrelated secret cannot leak into the child.
+  for _k in $ENV_KEYS; do
     _v=$(sed -nE "s/^(export )?$_k=[\"']?([^\"']*)[\"']?$/\2/p" \
            "$ENV_FILE" 2>/dev/null | tail -1)
     [[ -n "$_v" ]] && export "$_k=$_v"

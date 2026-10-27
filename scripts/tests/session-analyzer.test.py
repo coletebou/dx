@@ -25,7 +25,8 @@ a = sys.argv[1:]
 prompt = open(a[a.index("--prompt") + 1]).read()
 inputs = [a[i + 1] for i, x in enumerate(a) if x == "--input"]
 with open(os.environ["FAKE_CALLS"], "a") as f:
-    f.write(json.dumps({"prompt": prompt[:200], "inputs": [open(p).read() for p in inputs]}) + "\n")
+    f.write(json.dumps({"prompt": prompt[:200], "inputs": [open(p).read() for p in inputs],
+                        "isolated": "--isolated" in a}) + "\n")
 out = a[a.index("--output") + 1]
 if "workflow patterns" in prompt:
     open(out, "w").write("# Workflow tips (1 actionable)\n\n## Do not push early\n")
@@ -124,6 +125,31 @@ class SessionAnalyzerTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("already known", calls[0]["inputs"][0], "MEMORY.md is offered so known facts are skipped")
         self.assertFalse(any("quarterly" in i for c in calls for i in c["inputs"]))
+        self.assertTrue(all(c["isolated"] for c in calls), "captured prompts never reach a model that has tools")
+
+    def test_a_task_created_then_completed_is_not_open(self):
+        def result(tool_id, text, task_id=None):
+            e = {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": text}]}}
+            if task_id:
+                e["toolUseResult"] = {"task": {"id": task_id, "subject": "x"}}
+            return e
+        self.write("d1", [
+            user("tidy the release", "u-d1-1"),
+            assistant({"type": "tool_use", "name": "TaskCreate", "id": "toolu_a", "input": {"subject": "Done by id"}}),
+            result("toolu_a", "Task #1 created successfully: Done by id", task_id="1"),
+            assistant({"type": "tool_use", "name": "TaskCreate", "id": "toolu_b", "input": {"subject": "Done by text"}}),
+            result("toolu_b", "Task #2 created successfully: Done by text"),
+            assistant({"type": "tool_use", "name": "TaskUpdate", "id": "toolu_c", "input": {"taskId": "1", "status": "completed"}}),
+            assistant({"type": "tool_use", "name": "TaskUpdate", "id": "toolu_d", "input": {"taskId": "2", "status": "completed"}}),
+            assistant({"type": "text", "text": "Both done."}),
+        ])
+        r = self.run_it("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        unfinished = (self.home / ".analysis" / "unfinished.md").read_text()
+        self.assertIn("Ship the widget", unfinished, "a task never updated is still open")
+        for done in ("Done by id", "Done by text"):
+            self.assertNotIn(done, unfinished, "a completed task is not reported as open")
 
     def test_without_a_boundary_every_recent_session_is_read(self):
         r = self.run_it()

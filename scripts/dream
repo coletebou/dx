@@ -472,8 +472,10 @@ EOF
 
   local reply="$phase_report"
   log "  $phase: model=$phase_model inputs=${#inputs[@]}"
+  # --isolated: the inputs carry session text (captured prompts, assistant
+  # snippets), so the unattended model gets no tools, MCP servers or hooks.
   if ! "$SCRIPT_DIR/claude-consolidate" \
-        --prompt "$prompt" --output "$reply" --model "$phase_model" \
+        --prompt "$prompt" --output "$reply" --model "$phase_model" --isolated \
         "${inputs[@]}"; then
     log "  $phase: claude-consolidate failed. skipping write."
     rm -f "$prompt" ${held_file:+"$held_file"}
@@ -548,9 +550,12 @@ EOF
     done
 
     # Index append is DERIVED from what was actually written, so a skip can
-    # never leave a dangling link in the always-on index.
-    if [[ $npromo -gt 0 && -f "$staging/__memory_index_append.md" ]]; then
-      local line kept="" cur add cap cap_lines cur_lines add_lines
+    # never leave a dangling link in the always-on index. The reverse holds too:
+    # a promotion that no appended line indexes (the reply left out the append
+    # block, or indexed only some files) is rolled back like any other orphan.
+    if [[ $npromo -gt 0 ]]; then
+      local line kept="" indexed="" cur add cap cap_lines cur_lines add_lines
+      [[ -f "$staging/__memory_index_append.md" ]] || : > "$staging/__memory_index_append.md"
       while IFS= read -r line; do
         case "$line" in '- ['*) ;; *) continue ;; esac
         # Keep the line only if EVERY link target on it resolves — to a file we
@@ -568,18 +573,21 @@ EOF
         # At least one link must be a file this sweep promoted: a line whose
         # targets all existed already re-indexes a memory (the model trying to
         # revise one, whose file write was refused above) and would duplicate it.
-        local _all_ok=1 _t _seen=0 _new=0
+        local _all_ok=1 _t _seen=0 _hits=""
         while IFS= read -r _t; do
           [[ -n "$_t" ]] || continue
           _seen=1
           _t="${_t#./}"
           case " $promoted_slugs " in
-            *" $_t "*) _new=1; continue ;;
+            *" $_t "*) _hits="$_hits $_t"; continue ;;
           esac
           [[ -e "$memdir/$_t" ]] || { _all_ok=0; break; }
         done < <(printf '%s\n' "$line" | grep -oE '\]\([^)]+\.md\)' | sed -E 's/^\]\(//; s/\)$//')
         # A line with no link at all is not an index line; drop it.
-        [[ $_seen -eq 1 && $_all_ok -eq 1 && $_new -eq 1 ]] && kept="${kept}${line}"$'\n'
+        if [[ $_seen -eq 1 && $_all_ok -eq 1 && -n "$_hits" ]]; then
+          kept="${kept}${line}"$'\n'
+          indexed="$indexed$_hits"
+        fi
       done < "$staging/__memory_index_append.md"
       cap="${deep_memory_md_max_bytes:-24000}"
       cap_lines="${deep_memory_md_max_lines:-190}"
@@ -619,6 +627,11 @@ EOF
           else
             printf '%s' "$kept" >> "$memdir/MEMORY.md"
             log "  deep: appended ${add_lines} index line(s) to MEMORY.md (now ~$((cur_lines + add_lines))L/$((cur + add))B)"
+            local _s unindexed=""
+            for _s in $promoted_slugs; do
+              case " $indexed " in *" $_s "*) ;; *) unindexed="$unindexed $_s" ;; esac
+            done
+            _dream_unpromote "$memdir" "$unindexed" "no appended index line"
           fi
         fi
       fi

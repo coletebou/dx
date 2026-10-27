@@ -64,7 +64,7 @@ INDEX = Path(os.environ.get("REFLECTIONS_INDEX")
              or HOME / ".local/state/agent-reflections/index.sqlite")
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
 CLAUDE_PROJECTS = Path(os.environ.get("REFLECTIONS_CLAUDE_PROJECTS") or HOME / ".claude/projects")
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"  # 3: memory and analysis ids carry their home (home_tag)
 
 # kind → default status. Actionable kinds start open; knowledge is a note.
 KINDS = {
@@ -486,6 +486,17 @@ def doc_sources():
     return out
 
 
+def home_tag(home):
+    """A memory home's namespace in document ids: its identity under identities/, else a short hash
+    of its path. Without it two homes with one repo name (a personal and a work tree, say) would
+    index into one row, and each would replace the other."""
+    home = Path(home)
+    try:
+        return home.resolve().relative_to((DOTFILES / "identities").resolve()).parts[0]
+    except (ValueError, OSError, IndexError):
+        return hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:8]
+
+
 def parse_doc(path, kind_repo):
     source, repo = kind_repo
     if repo and repo.startswith("slug:"):
@@ -501,11 +512,12 @@ def parse_doc(path, kind_repo):
         mtype = mtype or (m.group(1) if m else "")
         title = meta.get("description") or meta.get("name") or path.stem
         kind = "handoff" if "handoff" in path.stem else "memory"
-        return [{**base, "id": f"m:{repo}/{path.name}", "kind": kind,
+        return [{**base, "id": f"m:{home_tag(path.parent)}/{repo}/{path.name}", "kind": kind,
                  "title": f"{meta.get('name', path.stem)} — {title}"[:MAX_TITLE],
                  "body": body[:MAX_BODY], "tags": [mtype] if mtype else []}]
     if source == "analysis":
-        return [{**base, "id": f"a:{repo}/{path.parent.name}/{path.name}", "kind": "analysis",
+        return [{**base, "id": f"a:{home_tag(path.parents[2])}/{repo}/{path.parent.name}/{path.name}",
+                 "kind": "analysis",
                  "title": f"{repo} {path.stem} ({path.parent.name})", "body": text[:MAX_BODY],
                  "host": path.parent.name}]
     if source == "codex":

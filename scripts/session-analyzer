@@ -188,13 +188,25 @@ for entry in "${CANONICALS[@]}"; do
       # Build per-session task state map, then count non-terminal entries.
       # Output: open_count<TAB>pipe-separated subjects
       result=$(jq -r -s '
+        # A created task'"'"'s id comes back in the TaskCreate result (the entry'"'"'s
+        # toolUseResult.task.id, or "Task #N created" in its text), and that is the
+        # id TaskUpdate names, not the tool-use id. Map one to the other first.
+        . as $all
+        | ([$all[] | . as $e | (.message.content // []) | arrays | .[] | objects
+            | select(.type == "tool_result" and (.tool_use_id | type) == "string")
+            | {key: .tool_use_id,
+               value: ((($e.toolUseResult | objects | .task.id) // null)
+                       // ((if (.content | type) == "string" then .content
+                           else ([.content[]? | objects | select(.type == "text") | .text] | join(" ")) end)
+                          | (capture("^Task #(?<n>[0-9]+) created") | .n) // null))}
+            | select(.value != null) | .value |= tostring] | from_entries) as $created
         # Flatten content blocks across all entries; pick out tool_use of
         # TaskCreate / TaskUpdate / TodoWrite.
-        [.[] | (.message.content // []) | .[]?
+        | [$all[] | (.message.content // []) | .[]?
           | select(.type == "tool_use" and (.name | IN("TaskCreate","TaskUpdate","TodoWrite")))]
         | reduce .[] as $tu ({};
             if   $tu.name == "TaskCreate" then
-              .[($tu.id // ($tu.input.subject // "anon") )] = {
+              .[($created[$tu.id // ""] // $tu.id // ($tu.input.subject // "anon") )] = {
                 status: "pending",
                 subject: ($tu.input.subject // "?")
               }
@@ -386,9 +398,12 @@ PROMPT
     fi
     inputs+=(--input "$raw_tips")
 
+    # --isolated: the inputs are captured prompts, text anyone could have pasted
+    # into a session, so the model gets no tools, MCP servers or hooks to act with.
     if "$CONSOLIDATE" \
         --prompt "$prompt" \
         --output "$workflow_tips" \
+        --isolated \
         "${inputs[@]}" 2>&1 | tail -3 >&2; then
       log "  wrote $(wc -l < "$workflow_tips") lines to workflow-tips.md"
     else
@@ -485,6 +500,7 @@ PROMPT
     "$CONSOLIDATE" \
         --prompt "$prompt" \
         --output "$mem_candidates" \
+        --isolated \
         "${inputs[@]}" 2>&1 | tail -3 >&2 || log "  consolidate for candidates failed; keeping raw only"
     rm -f "$prompt"
     # Drop anything before the heading. The prompt asks for no preamble, but a

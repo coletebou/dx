@@ -150,6 +150,18 @@ class ReflectionsTest(unittest.TestCase):
         show = self.run_cli("show", mem[0]["id"]).stdout
         self.assertIn("WAL needs shared memory", show)
 
+    def test_one_filename_in_both_identities_homes_indexes_as_two_memories(self):
+        work_home = self.dot / "identities/work/claude/memory/webapp"
+        work_home.mkdir(parents=True)
+        (work_home / "gotcha_sqlite_locks.md").write_text(
+            "---\nname: work-locks\ndescription: the work copy\n---\nWork lockfiles live on the shared volume.\n")
+        mine = json.loads(self.run_cli("search", "WAL", "NFS", "--json").stdout)
+        self.assertEqual([h["source"] for h in mine], ["memory"], "this identity's memory is still found")
+        both = json.loads(self.run_cli("search", "WAL", "NFS", "--any-identity", "--json").stdout)
+        both += json.loads(self.run_cli("search", "lockfiles", "shared", "volume", "--any-identity", "--json").stdout)
+        self.assertEqual(len({h["id"] for h in both if h["source"] == "memory"}), 2, "neither replaced the other")
+        self.assertIn("WAL needs shared memory", self.run_cli("show", mine[0]["id"]).stdout)
+
     def test_secrets_are_redacted_before_they_reach_git(self):
         self.add("Token handling", "--body", "used sk-ant-api03-" + "x" * 40 + " and AKIA" + "A" * 16)
         body = self.log_lines()[0]["body"]
@@ -257,7 +269,7 @@ class ReflectionsTest(unittest.TestCase):
         self.assertIsNone(row["checkout"])
         with sqlite3.connect(self.env["REFLECTIONS_INDEX"]) as db:
             self.assertIn("checkout", [r[1] for r in db.execute("PRAGMA table_info(items)")])
-            self.assertEqual(db.execute("SELECT v FROM meta WHERE k='schema'").fetchone()[0], "2")
+            self.assertEqual(db.execute("SELECT v FROM meta WHERE k='schema'").fetchone()[0], "3", "the current schema")
 
     def test_batch_cannot_spoof_checkout_provenance(self):
         out = self.run_cli("add", "--batch", "-", "--json", cwd=self.worktree,

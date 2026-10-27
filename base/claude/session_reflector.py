@@ -337,8 +337,10 @@ def consolidate(prompt_text, model):
         prompt = Path(tmp) / "prompt.md"
         out = Path(tmp) / "reply.md"
         prompt.write_text(prompt_text)
+        # --isolated: the prompt is a condensed transcript, so the model gets no tools,
+        # MCP servers or hooks that text inside it could talk into acting.
         r = subprocess.run([CONSOLIDATE, "--prompt", str(prompt), "--output", str(out), "--model", model,
-                            "--timeout", os.environ.get("REFLECTOR_TIMEOUT", "600")],
+                            "--timeout", os.environ.get("REFLECTOR_TIMEOUT", "600"), "--isolated"],
                            cwd=tmp, env=child_env(), capture_output=True, text=True, timeout=900)
         if r.returncode != 0 or not out.exists():
             raise RuntimeError(f"claude-consolidate exit {r.returncode}: {clip(r.stderr, 400)}")

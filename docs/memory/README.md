@@ -77,6 +77,9 @@ to Jev, and a restricted session gets its advice without them.
 Every model call goes through `claude-consolidate`, which runs `claude -p` with a short prompt and
 returns the answer. Models are aliases (`haiku`, `sonnet`) by default, so they follow your normal
 Claude Code login; provider ids work too (Bedrock is optional, see [docs/infra/aws.md](../infra/aws.md)).
+Every call runs isolated (no tools, MCP servers, hooks or settings files, since what it reads came
+from sessions), so a route or `apiKeyHelper` set only in a settings file does not reach it: export
+the route's variables or use a provider id.
 The knobs: `CLAUDE_CONSOLIDATE_MODEL`, the reflector's `REFLECTOR_*_MODEL`, dreaming's per-phase
 models. Nothing here calls a model without one of these tools being run or scheduled.
 
