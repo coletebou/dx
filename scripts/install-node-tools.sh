@@ -9,7 +9,7 @@
 # NODE_TOOLS_PREFIX (default ~/.npm-global) holds node-tools-installs/<lock-sha256>-node-v<x.y.z>-<platform>/,
 # node-tools-current (a link to the install in use) and bin/<command> (links into it); put its bin/ on
 # PATH. A changed lock or a different Node version gets a fresh install directory, published with an
-# atomic rename; older ones are removed once no running process uses them. Installs run `npm ci`:
+# atomic rename; older ones are removed once no running process may use them. Installs run `npm ci`:
 # exactly the locked versions, nothing newer, with npm's usual install scripts.
 #
 # Needs Node NODE_TOOLS_NODE_MAJOR (default 24) and npm. To change the tools, edit
@@ -207,42 +207,81 @@ delete_owned_path() {
     fi
 }
 
-# Remove installs other than the current one, unless a running process still uses one (a running
-# Codex, for instance, may start helpers from its original bundle). When the processes or their
-# executables cannot be listed, nothing is removed.
+# The installs a running process may still use, one per line, or "*" for all of them. A process
+# uses an install when an argument names a path inside it (directly, or through another symlink:
+# realpath), or its working directory or executable is inside it (a running Codex, for instance,
+# starts helpers from its own bundle). A process started through the published commands or
+# node-tools-current may use ANY older install: node resolves bin/<cmd> when the process starts,
+# and the links have pointed elsewhere since, so the link path in its argv no longer tells which.
+# Fails when the processes cannot be listed.
+installs_in_use() {
+    # The paths go in the environment: in argv, this helper would count as a process using them.
+    NT_ROOT="$INSTALL_ROOT" NT_BIN="$BIN_DIR" NT_TARGET="$TARGET" node - <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const { NT_ROOT: root, NT_BIN: binDir, NT_TARGET: target } = process.env;
+const real = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+const installs = fs.readdirSync(root).filter((n) => !n.startsWith(".")).map((n) => path.join(root, n));
+const homes = installs.map((i) => [i, real(i) || i]);
+const argvs = [], places = [];
+if (fs.existsSync("/proc/self/cmdline")) {  // Linux: exact argv, cwd and executable per process
+  for (const pid of fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n))) {
+    try { argvs.push(fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0")); } catch {}
+    for (const link of ["cwd", "exe"]) { try { places.push(fs.readlinkSync(`/proc/${pid}/${link}`)); } catch {} }
+  }
+} else {  // macOS: ps for argv (split on spaces), lsof for working directories and executables
+  for (const line of execFileSync("ps", ["-A", "-ww", "-o", "command="], { encoding: "utf8" }).split("\n")) {
+    argvs.push(line.trim().split(/\s+/));
+  }
+  let out;
+  try {
+    out = execFileSync("lsof", ["-nP", "-F", "n", "-d", "cwd,txt"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch (e) {
+    if (!e.stdout) throw e;  // lsof exits 1 when some processes are unreadable, but still lists the rest
+    out = String(e.stdout);
+  }
+  for (const line of out.split("\n")) if (line.startsWith("n")) places.push(line.slice(1));
+}
+const inside = (p, dir) => p === dir || p.startsWith(dir + "/");
+const used = new Set();
+let all = false;
+for (const argv of argvs) {
+  for (const arg of argv) {
+    for (const tok of arg.split("=")) {  // --require=/path and the like
+      if (!tok.startsWith("/")) continue;
+      if (inside(tok, binDir) || inside(tok, target)) all = true;
+      const r = real(tok);
+      for (const [i, ir] of homes) if (inside(tok, i) || inside(tok, ir) || (r && inside(r, ir))) used.add(i);
+    }
+  }
+}
+for (const p of places) for (const [i, ir] of homes) if (inside(p, i) || inside(p, ir)) used.add(i);
+process.stdout.write(all ? "*\n" : [...used].map((i) => i + "\n").join(""));
+NODE
+}
+
+# Remove installs other than the current one that no running process may still use. When the
+# processes cannot be listed, nothing is removed.
 prune_obsolete_node_tools() {
-    local candidate candidate_name candidate_real executable executable_paths processes
-    if ! processes=$(ps -A -ww -o command= 2>/dev/null); then
+    local candidate candidate_name in_use kept=0
+    if ! in_use=$(installs_in_use 2>/dev/null); then
         printf 'skipping Node tool pruning: could not inspect running processes\n' >&2
-        return 0
-    fi
-    executable_paths=""
-    if command -v lsof >/dev/null 2>&1; then
-        if ! executable_paths=$(lsof -nP -F n -d txt 2>/dev/null); then
-            printf 'skipping Node tool pruning: could not inspect executables\n' >&2
-            return 0
-        fi
-    elif [[ -d /proc ]]; then
-        for executable in /proc/[0-9]*/exe; do
-            executable_paths+=$'\n'"$(readlink "$executable" 2>/dev/null || :)"
-        done
-    else
-        printf 'skipping Node tool pruning: executable paths are unavailable\n' >&2
         return 0
     fi
     for candidate in "$INSTALL_ROOT"/*; do
         [[ -e "$candidate" && "$candidate" != "$install_dir" ]] || continue
         candidate_name="${candidate##*/}"
         [[ "$candidate_name" =~ ^[0-9a-f]{64}-node-v[0-9]+\.[0-9]+\.[0-9]+-(linux|darwin)-(x64|arm64)$ ]] || continue
-        candidate_real=$(cd "$candidate" && pwd -P) || continue
-        if [[ "$processes" == *"$candidate/"* \
-            || "$processes" == *"$candidate_real/"* \
-            || "$executable_paths" == *"$candidate/"* \
-            || "$executable_paths" == *"$candidate_real/"* ]]; then
+        if [[ "$in_use" == "*" ]] || grep -qxF -- "$candidate" <<<"$in_use"; then
+            kept=$((kept + 1))
             continue
         fi
         delete_owned_path "$candidate"
     done
+    if (( kept > 0 )); then
+        printf 'kept %d older Node tool install(s) a running process may still use; a later run removes them\n' "$kept"
+    fi
 }
 
 if (( CHECK_ONLY == 1 )); then

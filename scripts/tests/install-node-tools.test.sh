@@ -17,7 +17,8 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 tmp="$(mktemp -d)"
 tmp="$(cd "$tmp" && pwd -P)"
-trap 'rm -rf "$tmp"' EXIT
+consumers=()   # background stand-ins for running tools, killed on exit
+trap 'for c in "${consumers[@]}"; do kill "$c" 2>/dev/null; done; rm -rf "$tmp"' EXIT
 
 pass=0 fail=0
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass + 1)); }
@@ -184,6 +185,36 @@ lacks "...into a new directory" "$first" "$second"
 equal "...that the commands now run from" "@scope/beta 4.5.7" "$("$p/bin/beta" 2>&1)"
 equal "the old install is pruned" "no" "$([[ -e "$p/$first" ]] && echo yes || echo no)"
 equal "...leaving only the current one" "1" "$(cd "$p/node-tools-installs" && ls -A | wc -l | tr -d ' ')"
+
+echo "a running consumer"
+# A stand-in for a tool still running: its argv holds PATH, as node's does for a CLI started
+# through the published link (node resolves the link itself; ps shows the link).
+consume() {  # consume PATH: start it, and wait until the process list shows it
+  sh -c 'sleep 120' "$1" & consumers+=("$!")
+  local tries=0
+  while (( tries++ < 10 )); do
+    ps -A -ww -o command= | grep -qF -- "$1" && return 0
+    sleep 0.2
+  done
+}
+stop_consumers() { local c; for c in "${consumers[@]}"; do kill "$c" 2>/dev/null; wait "$c" 2>/dev/null; done; consumers=(); }
+consume "$p/bin/beta"
+write_source "$tmp/src" 4.5.8
+run "$tmp/src" "$p"
+equal "an install while a tool started through its link runs succeeds" 0 "$rc"
+equal "...and keeps the install that tool may be running" "yes" "$([[ -e "$p/$second" ]] && echo yes || echo no)"
+check "...saying so" "kept 1 older Node tool install(s) a running process may still use" "$out"
+third="$(readlink "$p/node-tools-current")"
+stop_consumers
+run "$tmp/src" "$p"
+equal "once it exits, the next run prunes it" "no" "$([[ -e "$p/$second" ]] && echo yes || echo no)"
+ln -s "$p/$third/node_modules/@scope/beta/cli.js" "$tmp/beta-elsewhere"
+consume "$tmp/beta-elsewhere"
+write_source "$tmp/src" 4.5.9
+run "$tmp/src" "$p"
+equal "an install reached through another symlink is kept while its tool runs" "yes" \
+  "$([[ -e "$p/$third" ]] && echo yes || echo no)"
+stop_consumers
 
 echo "usage"
 run "$tmp/src" "$p" --bogus
