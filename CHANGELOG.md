@@ -14,6 +14,17 @@
   described commit messages through a command, the Anthropic API or Amazon Bedrock, off by
   default. An hourly timer comes with `--with schedules`.
 - `install.sh --installed` reruns the components a machine installed (each real run records them).
+- **codesync** (also in `sync`): every repository under `~/code` committed as WIP, pulled and
+  pushed with a guarded force-with-lease, then the same on your other machines; it runs only
+  when you run it.
+- **bootstrap**: `curl -fsSL https://raw.githubusercontent.com/coletebou/dx/master/bootstrap.sh | bash`
+  installs git, clones dx and dry-runs the installer (the real install takes `--install`);
+  `--provision` sets up a fresh Ubuntu or Debian server: a timed step harness with a fast path
+  for baked images, system tuning, checksum-pinned toolchains, Docker with binfmt, opt-in
+  instance-store NVMe, cloud-init mode, opt-in AWS CLI, Terraform and Tailscale modules, and
+  overlays of ordered phase hooks for your own extras.
+- **claude-backup** (a private tarball of `~/.claude`, with an optional prune) and
+  **agent-skills-sync** (a guarded updater for a skills checkout), with the `claude` component.
 - **Plugins:** `toolbox` (disk-reclaim, a bounded disk survey and cleanup protocol for macOS
   and Linux; shipped-but-open, open GitLab issues whose work already merged) and `music-video`
   (an original song and its music video, end to end; vendored OFL fonts).
