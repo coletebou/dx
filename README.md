@@ -62,12 +62,13 @@ installer stops and tells you your options.
 | `claude` | Claude Code: a generated `settings.json` (hooks, statusline), a `CLAUDE.md` rules stub, MCP servers |
 | `codex` | Codex: global rules (`AGENTS.md`) and hooks, a provider-neutral `config.toml` copied once (Codex writes to it), the Codex skills |
 | `session`, `worktrees`, `memory`, `review`, `toolbox` | each plugin's CLIs in `~/.local/bin` and its skills in `~/.claude/skills` |
+| `sync` | [`dotsync`](docs/dotsync.md): this checkout in sync across your machines (commit behind a secret scan, pull, push, rerun the installer, then update every peer of the same identity over ssh), with `dotsync status` and `dotsync doctor` |
 | `ghostty` | the Ghostty config, and the `xterm-ghostty` terminfo for your user where it is missing |
 | `vscode` | VS Code user settings (Prettier off); `vscode/extensions.json` lists the recommended extensions |
 | `brew` | `~/.Brewfile`, a commented developer Brewfile for `brew bundle --global` |
 | `music-video` | the `music-video` skill. Not part of `--all`: it drives paid APIs. |
 | `node-tools` | the pinned global Node CLIs (Codex, pnpm, tsx, language servers, ...) from `node-tools/`'s lock, with `npm ci` into `~/.npm-global`. Needs Node 24. Not part of `--all`. |
-| `schedules` | launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, the nightly dream sweep, tmux autosave. Not part of `--all`. |
+| `schedules` | launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, the nightly dream sweep, tmux autosave, and the hourly `dotsync` where `sync` is installed. Not part of `--all`. |
 | `github-kit` | the [GitHub repo kit](github-kit/README.md) (issue forms, a PR template and its rules, a label set with a sync script, PR-labeling, secret-scan, Claude Code and CI-lane workflows), copied into the `.github/` of the repository `--target` names. Not part of `--all`. |
 | `manager` | a Drover setting that points its OpenClaw fleet manager at your identity's overlay (below). Not part of `--all`. |
 
@@ -124,6 +125,7 @@ install.sh                        the installer
 
 | Doc | What it covers |
 |---|---|
+| [dotsync](docs/dotsync.md) | keeping one dotfiles checkout in sync across machines: setup for two machines, the peers file, hooks, commit-message providers, status and doctor, safety properties |
 | [Running fleets of agents](docs/workflow/README.md) | coordinator and worker roles, briefs and handoffs, lane terms, parallel worktrees, review before ship, publishing through a scrub gate |
 | [Handoff chains](docs/handoff.md) | how `cc-handoff` moves a long session into a fresh one, on this machine or another |
 | [Claude Code hooks](docs/claude-hooks.md) | every hook, event by event |
@@ -135,8 +137,8 @@ install.sh                        the installer
 - macOS or Linux (WSL works), zsh, git, and bash (macOS's stock 3.2 is fine for the installer
   and most scripts; `session-analyzer` and `tmux-apply-plan` need bash 4 or newer).
 - tmux 3.4 or newer, jq, Python 3, and [Claude Code](https://code.claude.com).
-- Optional: Codex CLI, [gitleaks](https://github.com/gitleaks/gitleaks) (the git hooks refuse to
-  run without it), starship, fzf, and Node 24 for `mcp-agent-safety` and the `node-tools`
+- Optional: Codex CLI, [gitleaks](https://github.com/gitleaks/gitleaks) (the git hooks and dotsync refuse
+  to run without it), starship, fzf, and Node 24 for `mcp-agent-safety` and the `node-tools`
   component. On a Mac, the `Brewfile` covers most of these.
 - Claude Code on Amazon Bedrock is optional and documented in [docs/infra/aws.md](docs/infra/aws.md).
 
