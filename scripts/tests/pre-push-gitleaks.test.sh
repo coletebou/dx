@@ -76,6 +76,7 @@ fi
 # fixture tree finds a stub gate the way the real hook finds scripts/.
 mkdir -p "$TMP/tree/base/git/hooks" "$TMP/tree/scripts" "$TMP/hook-tmp"
 cp "$HOOK" "$TMP/tree/base/git/hooks/pre-push"
+cp "$(dirname "$HOOK")/run-repo-hook" "$TMP/tree/base/git/hooks/"  # pre-push runs it last
 cat > "$TMP/tree/scripts/pre-push-memory" <<'GATE'
 #!/usr/bin/env bash
 [[ -z "${GITLEAKS_RENDEZVOUS:-}" ]] || : >"$GITLEAKS_RENDEZVOUS"

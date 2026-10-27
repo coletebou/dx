@@ -4,8 +4,10 @@
 # core.hooksPath points at this directory (base/gitconfig.base), so it guards
 # every repository on the machine. This hook deliberately fails closed when
 # gitleaks is missing or when an old remote tip is unavailable locally (the
-# history-rewrite case scans the full new tip). A repo-local hook of the same
-# name is NOT run: core.hooksPath replaces .git/hooks.
+# history-rewrite case scans the full new tip). core.hooksPath replaces
+# .git/hooks, so once the scan passes this runs what git otherwise would have:
+# the repo's own pre-push, or Git LFS's, which uploads the LFS objects the push
+# needs (run-repo-hook). It gets the same arguments and ref lines.
 #
 # Optional: if scripts/pre-push-memory exists in this checkout it also runs,
 # alongside the scan, for repositories that commit agent memory.
@@ -84,6 +86,9 @@ load_advertised() {
 
 memory_gate="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/pre-push-memory"
 
+# The ref lines, kept for the repo's own hook after the scan.
+refs="$(cat)"
+
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   [[ -n "${local_sha:-}" ]] || continue
   is_zero_oid "$local_sha" && continue
@@ -154,10 +159,13 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     [[ "$memory_rc" -eq 0 ]] || exit "$memory_rc"
   fi
   scanned=1
-done
+done <<<"$refs"
 
 if [[ "$scanned" -eq 0 ]]; then
   echo "pre-push: no outgoing commits to scan" >&2
 else
   echo "pre-push: clean" >&2
 fi
+
+{ [[ -z "$refs" ]] || printf '%s\n' "$refs"; } |
+  "$(dirname "${BASH_SOURCE[0]}")/run-repo-hook" pre-push "$@"

@@ -5,8 +5,9 @@
 # never runs a repo's own .git/hooks, and `pre-commit install` refuses to
 # install while core.hooksPath is set. Without this hook no repo's pre-commit
 # suite would run on any commit from these machines, even in a repo whose
-# suite is its only pre-merge gate. Repos without a .pre-commit-config.yaml
-# are untouched.
+# suite is its only pre-merge gate. In a repo without a .pre-commit-config.yaml
+# the repo's own .git/hooks/pre-commit runs instead, if it has one
+# (run-repo-hook): what git would have run without core.hooksPath.
 #
 # One deliberate difference from the hook pre-commit generates: the files are
 # passed with --files, so pre-commit does not stash. Its stash runs
@@ -63,7 +64,7 @@ if ! skip_hook gitleaks && [[ ! -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; 
   fi
 fi
 
-[[ -f .pre-commit-config.yaml ]] || exit 0
+[[ -f .pre-commit-config.yaml ]] || exec "$(dirname "${BASH_SOURCE[0]}")/run-repo-hook" pre-commit "$@"
 
 PRE_COMMIT_BIN="${PRE_COMMIT_BIN:-$(command -v pre-commit || true)}"
 if [[ -z "$PRE_COMMIT_BIN" || ! -x "$PRE_COMMIT_BIN" ]]; then

@@ -17,8 +17,10 @@
 	; Universal git hooks shared across every repo (base/git/hooks): pre-commit
 	; scans the staged diff with gitleaks and runs the repo's own pre-commit
 	; suite; pre-push scans the outgoing commits with gitleaks, fail-closed.
-	; Per-repo hooks in .git/hooks do not run while core.hooksPath is set; the
-	; pre-commit hook runs the repo's .pre-commit-config.yaml instead.
+	; git never looks in .git/hooks while core.hooksPath is set, so every client
+	; hook here runs the repo's own one of the same name (or Git LFS's, in an LFS
+	; repo) through run-repo-hook; pre-commit runs a .pre-commit-config.yaml
+	; suite instead when the repo has one.
 	;
 	; MUST stay `~`-relative, never an absolute home path: git SILENTLY skips a
 	; hooksPath that does not exist, so a path that is right on one machine and

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# run-repo-hook: what git would have run for a hook if core.hooksPath did not point at this
+# directory (base/gitconfig.base sets it for every repo, and then git never looks in
+# .git/hooks). That is the repository's own hook of the same name, or else, for the hooks
+# Git LFS installs, `git lfs <hook>` in a repository whose attributes send files through the
+# lfs filter: without it a push uploads LFS pointers but not the objects they point to.
+#
+#   run-repo-hook NAME [ARG...]   from the shared hooks (pre-commit, pre-push)
+#   <NAME> [ARG...]               as a symlink named for the hook: the other client hooks
+#
+# stdin passes through, and the exit status is that hook's, so a pre-* hook still blocks.
+# Nothing to run: exit 0.
+set -uo pipefail
+
+name="$(basename "${BASH_SOURCE[0]}")"
+if [[ "$name" == run-repo-hook ]]; then
+    name="${1:?usage: run-repo-hook NAME [ARG...]}"
+    shift
+fi
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# A linked worktree shares the main checkout's hooks.
+common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || exit 0
+own="$common/hooks/$name"
+# -ef: a repo whose hooks dir is this one (or links into it) must not loop.
+if [[ -f "$own" && -x "$own" && ! "$own" -ef "$here/$name" ]]; then
+    exec "$own" "$@"
+fi
+
+case "$name" in
+    pre-push|post-checkout|post-commit|post-merge) ;;
+    *) exit 0 ;;
+esac
+uses_lfs() {
+    grep -qs 'filter=lfs' "$common/info/attributes" && return 0
+    git grep -q -F 'filter=lfs' -- .gitattributes ':(glob)**/.gitattributes' 2>/dev/null
+}
+uses_lfs || exit 0
+if command -v git-lfs >/dev/null 2>&1; then
+    exec git lfs "$name" "$@"
+fi
+# The message and status Git LFS's own hooks give in the same case.
+printf '\n%s\n\n' "This repository is configured for Git LFS but 'git-lfs' was not found on your path." >&2
+exit 2
