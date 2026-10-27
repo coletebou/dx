@@ -3,7 +3,7 @@
 //   node render.mjs --stills=6.5,42.5 --out=out/stills                            full-res PNG stills
 //   node render.mjs --clip=40:48 [--fps=30] --out=out/clip.mp4                    short clip with the song
 //   node render.mjs --frames=0:180 --workers=4                                    all frames -> out/frames (resumable)
-//   node render.mjs --encode --out=out/breakout-search.mp4                        frames + song -> MP4
+//   node render.mjs --encode --out=out/final.mp4                                  frames + song -> MP4
 //   node render.mjs --shots                                                       print the shot list
 //   --page=bts.html renders another page; --dir=<frames dir>; --audio=mix.wav; --force skips the disk preflight
 import puppeteer from 'puppeteer-core';
@@ -45,7 +45,7 @@ const run = (cmd, a) => new Promise((ok, bad) => { const p = spawn(cmd, a, { std
 
 if (args.frames || args.encode || args.clip) preflight(dirname(resolve(args.out || FRAMES + '/x')));
 if (args.encode) {
-  const out = args.out || 'out/breakout-search.mp4', n = readdirSync(FRAMES).filter(f => f.endsWith('.jpg')).length;
+  const out = args.out || 'out/final.mp4', n = readdirSync(FRAMES).filter(f => f.endsWith('.jpg')).length;
   console.log(`encoding ${n} frames -> ${out}`);
   await run('ffmpeg', ['-y', '-loglevel', 'error', '-stats', '-framerate', String(fps), '-i', `${FRAMES}/f%05d.jpg`, '-i', SONG,
     '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'slow', '-crf', '16', '-pix_fmt', 'yuv420p', '-profile:v', 'high',
@@ -56,7 +56,10 @@ if (args.encode) {
 const browser = await puppeteer.launch({
   executablePath: CHROME, headless: true, protocolTimeout: 0,
   userDataDir: resolve(`out/chrome-profile-${process.pid}`),
-  args: ['--allow-file-access-from-files', '--ignore-gpu-blocklist', '--enable-gpu-rasterization', '--use-angle=metal', '--window-size=1920,1080',
+  // WebGL: Metal on a Mac; elsewhere the GPU, or SwiftShader (software, far slower) on a box without one,
+  // which Chrome only falls back to when asked.
+  args: ['--allow-file-access-from-files', '--ignore-gpu-blocklist', '--enable-gpu-rasterization',
+    ...(process.platform === 'darwin' ? ['--use-angle=metal'] : ['--enable-unsafe-swiftshader']), '--window-size=1920,1080',
     '--disable-renderer-backgrounding', '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows'],
 });
 let errors = 0;

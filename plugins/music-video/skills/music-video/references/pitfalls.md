@@ -11,7 +11,9 @@
   preflight. If the shell dies with ENOSPC, a streaming/monitor tool can still run cleanup commands.
 - **ffmpeg without `drawtext`.** Some Homebrew builds lack freetype. Draw all text in the canvas renderer.
 - **WebGL in headless Chrome.** Chrome for Testing gives WebGL2; on Apple silicon pass `--use-angle=metal`
-  (the template does). Verify with a one-frame still before writing scenes.
+  (the template does). On a Linux box without a GPU, WebGL fails (`window.GL` never appears) unless Chrome may
+  fall back to SwiftShader (`--enable-unsafe-swiftshader`, which the template passes off macOS), and 3D frames
+  then render in software, minutes apart on a busy machine. Verify with a one-frame still before writing scenes.
 - **A sheet label can cover text.** A heading that looks clipped on a contact sheet may be fine; check a full-res
   still before moving layouts.
 
