@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# claude-backup: Backup and optionally prune Claude conversation history
+# Usage: claude-backup [--prune-days N] [--clear-debug]   (BACKUP_DIR picks where; --help)
+
+set -euo pipefail
+
+CLAUDE_DIR="$HOME/.claude"
+BACKUP_DIR="${BACKUP_DIR:-$HOME/Archives/claude-history}"
+PRUNE_DAYS=""
+CLEAR_DEBUG=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --prune-days)
+            PRUNE_DAYS="$2"
+            shift 2
+            ;;
+        --clear-debug)
+            CLEAR_DEBUG=true
+            shift
+            ;;
+        -h|--help)
+            cat <<'EOF'
+Usage: claude-backup [OPTIONS]
+
+Writes all of ~/.claude except debug/ to $BACKUP_DIR/claude-backup-<time>.tar.gz
+(default BACKUP_DIR: ~/Archives/claude-history), then optionally prunes. The backup is
+always made first, so whatever a prune removes is in it.
+
+Options:
+  --prune-days N   After the backup, delete sessions older than N days. A session is old
+                   when any of its entries in ~/.claude/history.jsonl is older than N days
+                   (needs jq). For each old session it deletes:
+                     - its entries older than N days, from ~/.claude/history.jsonl;
+                     - directories named by its session id, under ~/.claude/projects/ and
+                       ~/.claude/file-history/;
+                     - files whose names contain its session id, under ~/.claude/todos/ and
+                       ~/.claude/plans/.
+                   Nothing else: transcript files (projects/*/<id>.jsonl) and everything
+                   outside those four directories stay.
+  --clear-debug    Delete ~/.claude/debug/ (logs only; never in the backup)
+  -h, --help       Show this help
+
+Environment:
+  BACKUP_DIR       where backups go (default: ~/Archives/claude-history; never inside ~/.claude)
+EOF
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# A backup inside ~/.claude would end up in every later backup.
+case "$BACKUP_DIR/" in /*) ;; *) BACKUP_DIR="$PWD/$BACKUP_DIR" ;; esac
+case "$BACKUP_DIR/" in
+    "$CLAUDE_DIR"/*)
+        echo "BACKUP_DIR must be outside $CLAUDE_DIR: $BACKUP_DIR"
+        exit 1
+        ;;
+esac
+
+# Ensure backup directory exists
+mkdir -p "$BACKUP_DIR"
+case "$(cd "$BACKUP_DIR" && pwd -P)/" in
+    "$(cd "$CLAUDE_DIR" 2>/dev/null && pwd -P)/"*)
+        echo "BACKUP_DIR must be outside $CLAUDE_DIR: $BACKUP_DIR"
+        exit 1
+        ;;
+esac
+
+# Show current state
+echo "=== Current ~/.claude state ==="
+du -sh "$CLAUDE_DIR"
+echo ""
+
+# Create timestamped backup
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_FILE="$BACKUP_DIR/claude-backup-$TIMESTAMP.tar.gz"
+
+echo "=== Creating backup ==="
+echo "Destination: $BACKUP_FILE"
+
+# Backup everything except debug/ (it's just logs)
+tar -czf "$BACKUP_FILE" \
+    --exclude='debug' \
+    -C "$HOME" .claude
+
+BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+echo "Backup complete: $BACKUP_SIZE"
+echo ""
+
+# Clear debug if requested
+if $CLEAR_DEBUG; then
+    if [[ -d "$CLAUDE_DIR/debug" ]]; then
+        DEBUG_SIZE=$(du -sh "$CLAUDE_DIR/debug" | cut -f1)
+        echo "=== Clearing debug/ ($DEBUG_SIZE) ==="
+        rm -rf "$CLAUDE_DIR/debug"
+        echo "Cleared."
+        echo ""
+    fi
+fi
+
+# Prune old sessions if requested
+if [[ -n "$PRUNE_DAYS" ]]; then
+    echo "=== Pruning sessions older than $PRUNE_DAYS days ==="
+
+    CUTOFF_TS=$(( $(date +%s) - PRUNE_DAYS * 24 * 60 * 60 ))000
+    HISTORY_FILE="$CLAUDE_DIR/history.jsonl"
+
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        echo "No history.jsonl found, skipping prune"
+    else
+        # Get old session IDs
+        OLD_SESSIONS=$(jq -r --argjson cutoff "$CUTOFF_TS" \
+            'select(.timestamp < $cutoff) | .sessionId' \
+            "$HISTORY_FILE" | sort -u)
+
+        OLD_COUNT=$(echo "$OLD_SESSIONS" | grep -c . || true)
+
+        if [[ "$OLD_COUNT" -eq 0 ]]; then
+            echo "No sessions older than $PRUNE_DAYS days"
+        else
+            echo "Found $OLD_COUNT old sessions to prune"
+
+            # Remove from history.jsonl
+            TEMP_HISTORY=$(mktemp)
+            jq -c --argjson cutoff "$CUTOFF_TS" \
+                'select(.timestamp >= $cutoff)' \
+                "$HISTORY_FILE" > "$TEMP_HISTORY"
+            mv "$TEMP_HISTORY" "$HISTORY_FILE"
+
+            # Remove session directories from projects/
+            for SESSION_ID in $OLD_SESSIONS; do
+                # Find and remove session directories
+                find "$CLAUDE_DIR/projects" -type d -name "$SESSION_ID" -exec rm -rf {} + 2>/dev/null || true
+                # Remove from file-history
+                find "$CLAUDE_DIR/file-history" -type d -name "$SESSION_ID" -exec rm -rf {} + 2>/dev/null || true
+                # Remove from todos
+                find "$CLAUDE_DIR/todos" -name "*$SESSION_ID*" -delete 2>/dev/null || true
+                # Remove from plans
+                find "$CLAUDE_DIR/plans" -name "*$SESSION_ID*" -delete 2>/dev/null || true
+            done
+
+            echo "Pruned $OLD_COUNT sessions"
+        fi
+    fi
+    echo ""
+fi
+
+# Show final state
+echo "=== Final state ==="
+du -sh "$CLAUDE_DIR"
+
+# List recent backups
+echo ""
+echo "=== Recent backups ==="
+ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null | tail -5
