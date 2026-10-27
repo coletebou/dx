@@ -3,6 +3,7 @@
 # install.test.sh: install.sh into a throwaway HOME. A dry run changes nothing; a real run links
 # every component, moves what it replaces into the backup with a change log, generates valid
 # Claude Code settings, carries an existing git identity over, and a second run changes nothing.
+# The opt-in manager component names the identity's OpenClaw manager overlay in Drover's settings.
 # It refuses a foreign ~/.dotfiles and never writes into the checkout. Fake claude, launchctl and
 # systemctl only log, so nothing real is registered or scheduled.
 #
@@ -94,6 +95,8 @@ for s in cc-park fresh-session-handoff parallel-worktrees tmux-archive reflect c
 done
 ok "the skills are linked into ~/.claude/skills"
 lacks "schedules are not part of --all" "systemctl" "$(cat "$tmp/calls" 2>/dev/null)"
+equal "the manager overlay setting is not part of --all" "absent" \
+  "$([[ -e "$HOME/.config/drover/dx-openclaw-manager.env" ]] && echo present || echo absent)"
 
 echo "idempotent"
 out="$(inst --all)"; rc=$?
@@ -128,6 +131,31 @@ case "$(uname -s)" in
   *)      ok "# SKIP no launchd or systemd" ;;
 esac
 equal "...writing nothing" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
+
+echo "the manager overlay"
+newhome 10
+out="$(inst --with manager --dry-run)"; rc=$?
+equal "a manager dry run succeeds" 0 "$rc"
+check "...naming the setting it would write" "would create ~/.config/drover/dx-openclaw-manager.env" "$out"
+equal "...writing nothing" "" "$(cd "$HOME" && find . -mindepth 1 | head -3)"
+out="$(inst --with manager)"; rc=$?
+equal "the manager install succeeds" 0 "$rc"
+equal "...naming the identity's overlay through ~/.dotfiles" \
+  "DROVER_OPENCLAW_OVERLAY=~/.dotfiles/identities/example/openclaw-manager" \
+  "$(grep -v '^#' "$HOME/.config/drover/dx-openclaw-manager.env" 2>&1)"
+overlay="$HOME/.dotfiles/identities/example/openclaw-manager"
+for f in profiles/mine.json roles/manager/role.json roles/manager/AGENTS.md roles/manager/MEMORY.md \
+  workspace/SOUL.md workspace/USER.md; do
+  [[ -f "$overlay/$f" ]] || bad "the overlay has $f" "a file" "$(ls -l "$overlay/$f" 2>&1)"
+done
+ok "...which resolves to the overlay's files"
+equal "...whose role defaults to the overlay's profile" "mine" "$(jq -r .profile "$overlay/roles/manager/role.json" 2>&1)"
+out="$(inst --with manager)"; rc=$?
+check "a second manager run changes nothing" "Everything was already in place." "$out"
+newhome 11
+out="$(DROVER_CONFIG_DIR="$HOME/drover-config" inst --with manager)"; rc=$?
+equal "DROVER_CONFIG_DIR moves the setting" "moved" \
+  "$([[ -f "$HOME/drover-config/dx-openclaw-manager.env" && ! -e "$HOME/.config/drover" ]] && echo moved || echo "rc $rc: $out")"
 
 echo "a git identity split across files"
 newhome 5
@@ -212,6 +240,14 @@ out="$("$run_bash" "$copy/install.sh" --with github-kit --target "$copy" 2>&1)";
 equal "a --target that is the checkout itself succeeds" 0 "$rc"
 check "...leaving it alone, said so" "is this checkout (or inside it); leaving it alone" "$out"
 equal "...its .github/ unchanged" "$before" "$(cd "$copy" && find .github -type f | LC_ALL=C sort | xargs cksum 2>&1)"
+echo "an identity without a manager overlay"
+cp -R "$copy/identities/example" "$copy/identities/bare"
+rm -rf "$copy/identities/bare/openclaw-manager"
+newhome 9
+out="$("$run_bash" "$copy/install.sh" --with manager --identity bare 2>&1)"; rc=$?
+equal "the install succeeds" 0 "$rc"
+check "...saying how to add one" "copy identities/example/openclaw-manager" "$out"
+equal "...and writes no setting" "absent" "$([[ -e "$HOME/.config/drover" ]] && echo present || echo absent)"
 
 echo "the checkout"
 equal "nothing was written into the repo" "$before_status" "$(git -C "$root" status --porcelain)"

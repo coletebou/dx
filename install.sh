@@ -5,10 +5,11 @@
 #
 #   ./install.sh --list                       the components, and what each installs
 #   ./install.sh --all --dry-run              every change it would make, making none
-#   ./install.sh --all                        every component except schedules and github-kit
+#   ./install.sh --all                        every component except schedules, github-kit and manager
 #   ./install.sh --with shell,git,claude      just these
 #   ./install.sh --with schedules             the background jobs (cc-park, dream, tmux autosave)
 #   ./install.sh --with github-kit --target ~/code/repo   the GitHub repo kit into that repo's .github/
+#   ./install.sh --with manager               point Drover's fleet manager at this identity's overlay
 #
 # Options:
 #   --identity ID   identities/<ID>/ supplies your git identity, host labels, Claude rules and
@@ -25,7 +26,7 @@
 set -euo pipefail
 
 DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review schedules github-kit"
+ALL_COMPONENTS="shell git tmux claude codex session worktrees memory review schedules github-kit manager"
 DEFAULT_ALL="shell git tmux claude codex session worktrees memory review"
 
 describe() {
@@ -41,6 +42,7 @@ describe() {
         review)    echo "autoreview-pair and the adversarial-review, mcp-agent-safety and fable-second-opinion skills" ;;
         schedules) echo "launchd (macOS) or systemd user (Linux) jobs: cc-park autopark, nightly dream, tmux autosave (not in --all)" ;;
         github-kit) echo "issue forms, a PR template, labels and workflows, copied into the .github/ of the repo --target names (not in --all)" ;;
+        manager)   echo "a Drover setting naming identities/<id>/openclaw-manager as its fleet manager's overlay (not in --all)" ;;
     esac
 }
 
@@ -510,6 +512,22 @@ c_github_kit() {
     done < <(cd "$kit" && find . -type f ! -name README.md ! -name sync-labels.sh | sed 's|^\./||' | LC_ALL=C sort)
     [ -n "$slug" ] || say "  note: $(tilde "$top") has no github.com origin: replace OWNER/REPO in .github/ISSUE_TEMPLATE/config.yml"
     say "  next: commit the files, then sync the labels: $(tilde "$kit")/sync-labels.sh --repo ${slug:-OWNER/NAME} --dry-run"
+}
+
+# Drover reads its settings from ~/.config/drover/*.env (DROVER_CONFIG_DIR moves it), in name order, with the
+# first file to set a name winning, so a 00-*.env of your own overrides this one. The overlay is named through
+# ~/.dotfiles, which is why ~/.dotfiles must point at this checkout.
+c_manager() {
+    local rel="identities/$IDENTITY/openclaw-manager" tmp
+    if [ ! -d "$DOTFILES_DIR/$rel" ]; then
+        say "  note: $rel does not exist; copy identities/example/openclaw-manager there to give this identity an overlay"
+        return 0
+    fi
+    tmp="$(mktemp)"
+    printf '%s\n' "# Written by ~/.dotfiles/install.sh: the OpenClaw manager overlay of identity '$IDENTITY'." \
+        "DROVER_OPENCLAW_OVERLAY=~/.dotfiles/$rel" > "$tmp"
+    generate "${DROVER_CONFIG_DIR:-$HOME/.config/drover}/dx-openclaw-manager.env" "$tmp"
+    need drover "drover manager setup reads the overlay (https://github.com/coletebou/drover)"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────
