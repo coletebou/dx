@@ -18,7 +18,7 @@ import tempfile
 import time
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[2] / 'plugins/session/skills/cc-park/bin/cc-park'
+SCRIPT = Path(__file__).resolve().parents[2] / 'plugins/session/bin/cc-park'
 LOADER = importlib.machinery.SourceFileLoader('cc_park', str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 assert SPEC is not None

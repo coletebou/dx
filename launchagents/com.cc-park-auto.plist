@@ -13,7 +13,7 @@
          install.sh renders __HOME__ (launchd expands neither ~ nor $HOME). -->
     <key>ProgramArguments</key>
     <array>
-        <string>__HOME__/.dotfiles/plugins/session/skills/cc-park/bin/cc-park</string>
+        <string>__HOME__/.dotfiles/plugins/session/bin/cc-park</string>
         <string>auto</string>
     </array>
     <key>StartInterval</key>

@@ -1,0 +1,10 @@
+{
+  "name": "session",
+  "description": "Session lifecycle for Claude Code in tmux: park idle sessions to free memory and resume them with one keypress (cc-park), and hand a long session off to a fresh one through a written brief (fresh-session-handoff, driving the cc-handoff CLI)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cole Tebou"
+  },
+  "license": "MIT",
+  "keywords": ["claude-code", "tmux", "sessions", "handoff", "memory"]
+}

@@ -6,8 +6,8 @@ description: Use when the context advisor says this is a good point for a fresh 
 # fresh-session-handoff
 
 A long session hands its open work to a new Claude Code session, as the next generation
-of a handoff chain, with `cc-handoff` (in dotfiles: `~/.dotfiles/scripts/cc-handoff`;
-design in `~/.dotfiles/docs/handoff.md`):
+of a handoff chain, with `cc-handoff` (`scripts/cc-handoff` in this repo, which
+`install.sh --with session` puts on `PATH`; design in `docs/handoff.md`):
 
 - You write a brief with a fixed structure; `cc-handoff init` fills in every live fact.
 - `cc-handoff launch` opens a new tmux window right after yours. It echoes the chain's
