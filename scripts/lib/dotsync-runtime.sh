@@ -302,6 +302,45 @@ dotsync_scan_outgoing() {
   fi
 }
 
+# dotsync_push_route BRANCH: where dotsync pushes BRANCH, as remote<TAB>ref: its upstream's
+# remote and branch, and nowhere else. The outgoing scan compares against that upstream, so a
+# push git would route elsewhere (pushRemote, pushDefault, a pushurl or pushInsteadOf rule,
+# several URLs) is refused, with the reason: it could publish commits the scan never saw.
+dotsync_push_route() {
+  local b="$1" remote merge pushremote pushdefault urls pushurls
+  remote="$(git config "branch.$b.remote" 2>/dev/null || true)"
+  merge="$(git config "branch.$b.merge" 2>/dev/null || true)"
+  if [[ -z "$remote" || "$merge" != refs/heads/* ]]; then
+    echo "dotsync: refusing to push: branch $b has no upstream branch to push to" >&2
+    return 1
+  fi
+  pushremote="$(git config "branch.$b.pushRemote" 2>/dev/null || true)"
+  pushdefault="$(git config remote.pushDefault 2>/dev/null || true)"
+  if [[ -n "$pushremote" && "$pushremote" != "$remote" ]]; then
+    printf 'dotsync: refusing to push: branch.%s.pushRemote sends pushes to %s, but the secret scan compares against the upstream %s (unset it, or make %s the upstream)\n' \
+      "$b" "$pushremote" "$remote" "$pushremote" >&2
+    return 1
+  fi
+  if [[ -z "$pushremote" && -n "$pushdefault" && "$pushdefault" != "$remote" ]]; then
+    printf 'dotsync: refusing to push: remote.pushDefault sends pushes to %s, but the secret scan compares against the upstream %s (unset it, or set branch.%s.pushRemote to %s)\n' \
+      "$pushdefault" "$remote" "$b" "$remote" >&2
+    return 1
+  fi
+  if [[ "$remote" != . ]]; then
+    urls="$(git remote get-url --all "$remote" 2>/dev/null)" || { echo "dotsync: refusing to push: no URL for remote $remote" >&2; return 1; }
+    pushurls="$(git remote get-url --push --all "$remote" 2>/dev/null)" || pushurls=""
+    if [[ "$(printf '%s\n' "$urls" | wc -l | tr -d ' ')" -ne 1 ]]; then
+      echo "dotsync: refusing to push: remote $remote has several URLs, and a push would go to each one; the secret scan compares against the first only" >&2
+      return 1
+    fi
+    if [[ "$pushurls" != "$urls" ]]; then
+      echo "dotsync: refusing to push: pushes to $remote go to another URL than its fetches (remote.$remote.pushurl, or a pushInsteadOf rule), which the secret scan never compared against" >&2
+      return 1
+    fi
+  fi
+  printf '%s\t%s\n' "$remote" "$merge"
+}
+
 # ── commit messages ──────────────────────────────────────────────────────
 # The generic subject: who changed which top-level areas.
 dotsync_commit_message() {

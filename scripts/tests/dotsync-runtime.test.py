@@ -621,6 +621,7 @@ echo "ordinary detail"
             '#!/bin/sh\ncmd="$1"; [ "$cmd" = -c ] && cmd="$3"; [ "$cmd" = -C ] && cmd="$3"\n'
             'printf "%%s\\n" "$cmd" >> %s\n'
             'if [ "${DOTSYNC_TEST_FETCH_FAIL:-0}" = 1 ] && [ "$cmd" = fetch ]; then exit 42; fi\n'
+            'if [ "${DOTSYNC_TEST_FETCH_NOOP:-0}" = 1 ] && [ "$cmd" = fetch ]; then exit 0; fi\n'
             'exec %s "$@"\n' % (log, GIT))
         (bin_dir / "git").chmod(0o755)
         env = self.guard_env(DOTSYNC_NO_INSTALL="1")
@@ -673,6 +674,67 @@ echo "ordinary detail"
         self.assertIn("phase=git-fetch", result.stdout)
         self.assertEqual(self.git("show", "HEAD:payload"), "local work awaiting publication")
         self.assertEqual(self.git("rev-parse", "master", repo=origin), before)
+
+    def test_a_push_routed_away_from_the_scanned_upstream_is_refused(self):
+        # The scan covers what the upstream lacks; a push that goes somewhere else would publish
+        # what is upstream already (old secrets included) without a scan.
+        origin, env, log = self.full_fixture()
+        public = self.root / "public.git"
+        self.git("init", "-q", "--bare", str(public), repo=self.root)
+        self.git("remote", "add", "public", str(public))
+        routes = (("branch.master.pushRemote", "public", "branch.master.pushRemote"),
+                  ("remote.pushDefault", "public", "remote.pushDefault"),
+                  ("remote.origin.pushurl", str(public), "another URL"),
+                  ("url.%s.pushInsteadOf" % public, str(origin), "another URL"))
+        for number, (key, value, named) in enumerate(routes):
+            with self.subTest(route=key):
+                self.git("config", key, value)
+                (self.repo / "payload").write_text("change %d\n" % number)
+                before = self.git("rev-parse", "master", repo=origin)
+                result, heartbeat, diagnostic = self.run_full(env)
+                self.git("config", "--unset", key)
+                self.assertEqual((result.returncode, heartbeat["phase"]), (1, "push-route"), diagnostic)
+                self.assertIn(named, diagnostic)
+                self.assertEqual(self.git("for-each-ref", "refs/heads", repo=public), "", "something was published")
+                self.assertEqual(self.git("rev-parse", "master", repo=origin), before)
+        self.git("config", "--add", "remote.origin.url", str(public))
+        result, heartbeat, diagnostic = self.run_full(env)
+        self.assertEqual((result.returncode, heartbeat["phase"]), (1, "push-route"), diagnostic)
+        self.assertIn("several URLs", diagnostic)
+        self.git("config", "--unset-all", "remote.origin.url")
+        self.git("config", "remote.origin.url", str(origin))
+        result, heartbeat, diagnostic = self.run_full(env)
+        self.assertEqual(result.returncode, 0, diagnostic)
+        self.assertEqual(self.git("rev-parse", "master", repo=origin), self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.git("for-each-ref", "refs/heads", repo=public), "")
+
+    def test_the_scan_covers_what_the_destination_lacks_not_a_stale_tracking_ref(self):
+        origin, env, log = self.full_fixture()
+        writer = self.root / "writer"
+        self.git("clone", "-q", str(origin), str(writer), repo=self.root)
+        (writer / "incoming").write_text("published, then withdrawn\n")
+        self.git("add", "incoming", repo=writer)
+        self.git("commit", "-qm", "incoming", repo=writer)
+        self.git("push", "-q", "origin", "master", repo=writer)
+        self.git("pull", "-q", "--ff-only")
+        withdrawn = self.git("rev-parse", "HEAD")
+        # The remote drops that commit; this checkout's tracking ref still has it.
+        self.git("push", "-q", "--force", "origin", "HEAD~1:master", repo=writer)
+        destination = self.git("rev-parse", "master", repo=origin)
+        scans = self.root / "scans"
+        scanner_dir = self.root / "scan-log-bin"
+        scanner_dir.mkdir()
+        (scanner_dir / "gitleaks").write_text('#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexit 0\n' % scans)
+        (scanner_dir / "gitleaks").chmod(0o755)
+        (self.repo / "payload").write_text("local work\n")
+        env = dict(env, DOTSYNC_TEST_FETCH_NOOP="1", PATH=str(scanner_dir) + os.pathsep + env["PATH"])
+        result, heartbeat, diagnostic = self.run_full(env)
+        self.assertEqual(result.returncode, 0, diagnostic)
+        outgoing = [line for line in scans.read_text().splitlines() if "--log-opts" in line]
+        self.assertEqual(len(outgoing), 1, outgoing)
+        self.assertIn("--log-opts=%s..HEAD" % destination, outgoing[0], "the commit the remote lacks was not scanned")
+        republished = subprocess.run([GIT, "-C", str(origin), "merge-base", "--is-ancestor", withdrawn, "master"], env=self.env)
+        self.assertEqual(republished.returncode, 0, "the push sends the withdrawn commit, so the scan had to cover it")
 
     def test_pull_only_never_commits_or_pushes(self):
         origin, env, log = self.full_fixture()

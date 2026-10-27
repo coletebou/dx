@@ -234,6 +234,13 @@ heartbeat and timing record. It prints no file contents, and exit 0 means the re
   change stays in your working tree, unstaged, and the scanner's output (which holds the value)
   is never printed. Ignored files are never staged, and staged content that an ignore rule
   matches, an unmerged path, or a conflict marker refuses the commit too.
+- **A push goes only where the scan looked.** dotsync pushes to the branch's upstream by name
+  (`git push <remote> HEAD:<branch>`), and scans what that destination's branch lacks, as its
+  own `ls-remote` reports it (all of history when it has no such branch). A branch whose pushes
+  git would route elsewhere (`branch.<b>.pushRemote` or `remote.pushDefault` naming another
+  remote, a `pushurl` or `pushInsteadOf` rule, a remote with several URLs) is refused, with the
+  reason: such a push could publish commits the upstream already had, old secrets included,
+  without a scan.
 - **A conflict loses nothing.** A rebase that conflicts is aborted: your commits stay on this
   machine, unpushed, the tree clean, and the run fails at `git-rebase`. Uncommitted changes that
   conflict while being put back after the pull stay in `git stash list`.
@@ -294,6 +301,10 @@ Logs, in the state directory: `dotsync-timing.log` (each run's phases and durati
 - **`gitleaks found a potential secret`**: run the command dotsync prints to see the finding
   (redacted). Remove the secret, or, for a false positive, add its fingerprint to the
   repository's `.gitleaksignore`.
+- **`refusing to push: ... pushRemote` (or `pushDefault`, `another URL`, `several URLs`)**: this
+  branch publishes somewhere other than its upstream. Make that destination the upstream
+  (`git branch --set-upstream-to <remote>/<branch>`), or remove the routing; dotsync never pushes
+  past a scan of a different repository.
 - **`the rebase onto origin/master conflicted`**: your commits are kept. Resolve it the git way
   (`git pull --rebase`, fix, `git rebase --continue`), then rerun dotsync.
 - **A peer is `unreachable (ssh rc=255)`**: `ssh -o BatchMode=yes <alias> true` must succeed

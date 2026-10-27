@@ -698,41 +698,54 @@ else
     log_step git-rebase
 
     # ── 3. push ──────────────────────────────────────────────────────────
+    # The push goes, explicitly, to the upstream's remote and branch (push_remote, push_ref):
+    # the secret scan compares against that destination, and an unqualified `git push` could
+    # follow pushRemote, pushDefault or a pushurl somewhere the scan never looked.
+    # push_preflight_ls_remote prints the destination's tip; exit 2: it has no such branch.
     push_preflight_ls_remote() {
       dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
-        ls-remote "${upstream%%/*}" "refs/heads/${upstream#*/}" 2>/dev/null </dev/null 9>&- | awk 'NR == 1 { print $1 }'
+        ls-remote --exit-code "$push_remote" "$push_ref" 2>/dev/null </dev/null 9>&- | awk 'NR == 1 { print $1 }'
     }
     push_preflight_start() {
-      [[ -n "$upstream" ]] || return 0
       preflight_out="$TIMING_LOG_DIR/preflight.$$"
-      ( push_preflight_ls_remote >"$preflight_out" || true ) &
+      ( rc=0; push_preflight_ls_remote >"$preflight_out" || rc=$?
+        printf '%s\n' "$rc" >"$preflight_out.rc" ) &
       preflight_pid="$!"
     }
     # Another machine often pushes between this fetch and this push. One ls-remote catches the
-    # race before the push (and before a pre-push secret scan of a doomed push).
+    # race before the push, and names what the destination has: push_base, its tip once that is
+    # an ancestor of HEAD (empty: unknown), or push_new_branch=1 when it has no such branch.
     push_preflight() {
-      local remote_tip=""
-      [[ -n "$upstream" ]] || return 0
+      local remote_tip="" tip_rc=0
+      push_base="" push_new_branch=0
       if [[ -n "${preflight_pid:-}" ]]; then
         wait "$preflight_pid" 2>/dev/null || true
         preflight_pid=""
         IFS= read -r remote_tip <"$preflight_out" 2>/dev/null || true
-        rm -f "$preflight_out"
+        tip_rc="$(cat "$preflight_out.rc" 2>/dev/null || echo 1)"
+        rm -f "$preflight_out" "$preflight_out.rc"
         preflight_out=""
       else
-        remote_tip="$(push_preflight_ls_remote)"
+        remote_tip="$(push_preflight_ls_remote)" || tip_rc=$?
       fi
-      [[ -n "$remote_tip" ]] || return 0
-      git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null && return 0
-      dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
-        fetch --quiet </dev/null 9>&- || return 0
-      git rebase --quiet "$upstream" </dev/null || { git rebase --abort 2>/dev/null; return 1; }
+      case "$tip_rc" in
+        0) [[ -n "$remote_tip" ]] || return 0 ;;
+        2) push_new_branch=1; return 0 ;;
+        *) return 0 ;;
+      esac
+      if ! git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null; then
+        dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
+          fetch --quiet </dev/null 9>&- || return 0
+        git rebase --quiet "$upstream" </dev/null || { git rebase --abort 2>/dev/null; return 1; }
+        git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null || return 0
+      fi
+      push_base="$remote_tip"
     }
-    # Each lost race needs a fresh fetch, rebase and push; two in a row are common when several
-    # machines sync together. A recovered race prints a note, not git's rejection block.
+    # push_with_retry [FIRST]: each lost race needs a fresh fetch, rebase and push; two in a row
+    # are common when several machines sync together. FIRST=1 starts with that (the race check's
+    # rebase failed). A recovered race prints a note, not git's rejection block.
     push_with_retry() {
-      local q=--quiet attempt err rc first=0
-      push_preflight || first=1
+      local q=--quiet attempt err rc first="${1:-0}"
       [[ "$verbose" -eq 0 ]] || q=""
       err="$(dotsync_mktemp)" || return 1
       for attempt in 0 1 2 3; do
@@ -749,7 +762,7 @@ else
         fi
         rc=0
         dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
-          push ${q:+"$q"} 2>"$err" </dev/null 9>&- || rc=$?
+          push ${q:+"$q"} "$push_remote" "HEAD:$push_ref" 2>"$err" </dev/null 9>&- || rc=$?
         if [[ "$rc" -eq 0 ]]; then
           cat "$err" >&2; rm -f "$err"; return 0
         fi
@@ -767,27 +780,47 @@ else
     if [[ "$pull_only" -eq 1 ]]; then
       :
     elif [[ "$rebase_failed" -eq 0 && -n "$upstream" ]] && [[ "$(git rev-list --count "$upstream..HEAD" 2>/dev/null || echo 0)" -gt 0 ]]; then
-      push_preflight_start
-      # Last chance to describe generic commits while they are still local only.
-      if [[ "$one_line" -eq 1 ]]; then
-        dotsync_reword_unpublished "$_DOTSYNC_HOST" >/dev/null
-      else
-        dotsync_reword_unpublished "$_DOTSYNC_HOST" | sed 's/^/dotsync: /'
-      fi
-      DOTSYNC_PHASE=secret-scan
-      if ! dotsync_scan_outgoing "$upstream..HEAD"; then
+      DOTSYNC_PHASE=push-route
+      if ! push_route="$(dotsync_push_route "$branch")"; then
         push_failed=1
-        dotsync_fail secret-scan
+        dotsync_fail push-route
+        echo "dotsync: nothing was pushed; local commits kept" >&2
       else
+        push_remote="${push_route%%$'\t'*}" push_ref="${push_route#*$'\t'}"
         DOTSYNC_PHASE=git-push
-        if push_with_retry; then
-          pushed_commits="$(git rev-list --count "$start_head..HEAD" 2>/dev/null || echo 0)"
-          pushed_commits=$(( pushed_commits - pulled_commits ))
-          [[ "$pushed_commits" -ge 0 ]] || pushed_commits=0
+        push_preflight_start
+        # Last chance to describe generic commits while they are still local only.
+        if [[ "$one_line" -eq 1 ]]; then
+          dotsync_reword_unpublished "$_DOTSYNC_HOST" >/dev/null
         else
+          dotsync_reword_unpublished "$_DOTSYNC_HOST" | sed 's/^/dotsync: /'
+        fi
+        push_first=0
+        push_preflight || push_first=1
+        # Scan exactly what the push publishes: what the destination's branch lacks; all of HEAD
+        # when it has no such branch; what the upstream lacks when it could not say.
+        if [[ "$push_new_branch" -eq 1 ]]; then
+          scan_range=HEAD
+        elif [[ -n "$push_base" ]]; then
+          scan_range="$push_base..HEAD"
+        else
+          scan_range="$upstream..HEAD"
+        fi
+        DOTSYNC_PHASE=secret-scan
+        if ! dotsync_scan_outgoing "$scan_range"; then
           push_failed=1
-          dotsync_fail git-push
-          echo "dotsync: the push failed after retries; local commits kept" >&2
+          dotsync_fail secret-scan
+        else
+          DOTSYNC_PHASE=git-push
+          if push_with_retry "$push_first"; then
+            pushed_commits="$(git rev-list --count "$start_head..HEAD" 2>/dev/null || echo 0)"
+            pushed_commits=$(( pushed_commits - pulled_commits ))
+            [[ "$pushed_commits" -ge 0 ]] || pushed_commits=0
+          else
+            push_failed=1
+            dotsync_fail git-push
+            echo "dotsync: the push failed after retries; local commits kept" >&2
+          fi
         fi
       fi
     fi

@@ -60,7 +60,7 @@ done
 
 cd "$TMP/local"
 # shellcheck disable=SC2034  # read by the functions eval'd above
-verbose=0 upstream=origin/master DOTSYNC_GIT_TIMEOUT=5 dotsync_ssh_command=""
+verbose=0 upstream=origin/master push_remote=origin push_ref=refs/heads/master DOTSYNC_GIT_TIMEOUT=5 dotsync_ssh_command=""
 # shellcheck disable=SC2034
 TIMING_LOG_DIR="$TMP" preflight_pid="" preflight_out=""
 push_with_retry 2>"$TMP/stderr"
@@ -79,7 +79,10 @@ peer_push
 local_pushes=2
 push_preflight_start
 [[ -n "$preflight_pid" ]] || { echo "FAIL: the race check did not start" >&2; exit 1; }
-push_with_retry 2>/dev/null
+first=0; push_preflight || first=1
+# shellcheck disable=SC2154  # push_base is set by the push_preflight eval'd above
+[[ "$first" -eq 0 && "$push_base" == "$(git rev-parse origin/master)" ]] || { echo "FAIL: the race check did not rebase onto the peer and name its tip" >&2; exit 1; }
+push_with_retry "$first" 2>/dev/null
 [[ "$local_pushes" -eq 3 ]] || { echo "FAIL: expected one push, got $((local_pushes - 2))" >&2; exit 1; }
 [[ -z "$preflight_pid" && ! -e "$TMP/preflight.$$" ]] || { echo "FAIL: the race check's result was left behind" >&2; exit 1; }
 git fetch -q
@@ -93,7 +96,10 @@ git -C "$TMP/peer" pull -q --rebase origin master
 peer_push
 fail_rebases=2
 local_pushes=2
-push_with_retry 2>"$TMP/stderr"
+: >"$TMP/stderr"
+first=0; push_preflight 2>>"$TMP/stderr" || first=1
+[[ "$first" -eq 1 ]] || { echo "FAIL: the race check's failed rebase was not reported" >&2; exit 1; }
+push_with_retry "$first" 2>>"$TMP/stderr"
 [[ "$local_pushes" -eq 3 && "$fail_rebases" -eq 0 ]] || { echo "FAIL: expected one push after the failed rebases" >&2; cat "$TMP/stderr" >&2; exit 1; }
 git fetch -q
 [[ "$(git log -1 --format=%s origin/master)" == "local 3" ]] || { echo "FAIL: local 3 is not on the remote" >&2; exit 1; }
