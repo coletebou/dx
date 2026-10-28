@@ -52,7 +52,8 @@ if section harness "the step harness"; then
 out="$(harness 'BOOTSTRAP_TIMINGS="$PWD/t.tsv"
     a() { :; }; b() { step_skip off "not asked for"; }; c() { sub_begin part; sub_end; }
     run_step one a; run_step two b; run_step three c
-    printf "%s\n" "${STEP_ROWS[@]}" | cut -f1,2; timing_table; echo "tsv $(wc -l < "$PWD/t.tsv")"' )"
+    printf "%s\n" "${STEP_ROWS[@]}" | cut -f1,2; timing_table
+    echo "tsv $(wc -l < "$PWD/t.tsv" | tr -d "[:space:]")"' )"
 check "a step gets an ok row" "one	ok" "$out"
 check "a skipped step still gets its row" "two	skip-off" "$out"
 check "...and says why" "skipped: not asked for" "$out"
@@ -61,6 +62,21 @@ three > part	ok" "$out"
 check "the timing table lists the steps" "one                                ok" "$out"
 check "...and the total" "total" "$out"
 check "each row is appended to the TSV" "tsv 4" "$out"
+
+# BSD/macOS wc -l < FILE right-pads its count ("       4", no filename), unlike GNU's bare "4";
+# the row count above must read the same regardless. A fake wc stands in for it here.
+wcbin="$tmp/harness/bin"
+mkdir -p "$wcbin"
+cat > "$wcbin/wc" <<'EOF'
+#!/bin/sh
+n=$(/usr/bin/wc -l | tr -d '[:space:]')
+printf '%8s\n' "$n"
+EOF
+chmod +x "$wcbin/wc"
+out="$(PATH="$wcbin:$PATH" harness 'BOOTSTRAP_TIMINGS="$PWD/t2.tsv"
+    a() { :; }; run_step one a
+    echo "tsv $(wc -l < "$PWD/t2.tsv" | tr -d "[:space:]")"' )"
+check "...reading it the same with a padded (BSD-style) wc" "tsv 1" "$out"
 
 out="$(harness 'trap "rc=\$?; harness_on_exit \$rc; printf \"%s\n\" \"\${STEP_ROWS[@]}\" | cut -f1,2" EXIT
     good() { :; }; broken() { false; touch "$PWD/after"; }

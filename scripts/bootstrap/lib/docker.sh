@@ -69,7 +69,7 @@ step_nvme_apply() {
     cache="$(printf '%s\n' "$out" | sed -n 's/^cache://p' | tail -n 1)"
     log "  on the instance store: ${bound:-nothing}${cache:+, cache at $cache}"
     [ -z "$cache" ] || _nvme_cache_env_snippet "$cache"
-    as_root install -D -m 0755 "$BOOTSTRAP_LIB/nvme.sh" "$(sysf /usr/local/sbin/dx-nvme-setup)"
+    install_file "$BOOTSTRAP_LIB/nvme.sh" "$(sysf /usr/local/sbin/dx-nvme-setup)" 0755
     root_write "$(sysf /etc/default/dx-nvme)" "$(printf '# Written by dx provision; read by /usr/local/sbin/dx-nvme-setup at boot.\nNVME_MODELS=%q\nNVME_LABEL=%q\nNVME_MOUNT=%q\nNVME_BINDS=%q\nNVME_CACHE_USER=%q\nNVME_SWAP_GB=%q\n' \
         "$NVME_MODELS" "$NVME_LABEL" "$NVME_MOUNT" "$bound" "${cache:+$TARGET_USER}" "$NVME_SWAP_GB")"
     if has_systemd; then

@@ -176,6 +176,15 @@ as_root() {
     sudo "$@"
 }
 
+# install_file SRC DST MODE: SRC installed as root at DST (mode MODE), making DST's directory
+# first. `install -D` does this in one step on GNU coreutils, but BSD/macOS install has no -D;
+# this works on both, and is what the provisioner itself only ever needs (SRC and DST, no `-D`
+# multi-source form).
+install_file() {
+    as_root mkdir -p "$(dirname -- "$2")"
+    as_root install -m "$3" -- "$1" "$2"
+}
+
 # The environment a per-user command gets: a clean one, plus proxies when set.
 _user_env() {
     local v

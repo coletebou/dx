@@ -29,7 +29,7 @@ fetch_release_binary() {
     if [ -w "${dest%/*}" ] || { [ ! -e "${dest%/*}" ] && mkdir -p "${dest%/*}" 2>/dev/null; }; then
         install -m 0755 "$found" "$dest"
     else
-        as_root install -D -m 0755 "$found" "$dest"
+        install_file "$found" "$dest" 0755
     fi
 }
 
@@ -75,7 +75,7 @@ step_tmux() {
         && make DESTDIR="$TMPD/stage" install >"$TMPD/install.log" 2>&1 ) \
         || { tail -n 20 "$TMPD"/*.log >&2; die "the tmux $PIN_TMUX_VERSION build failed"; }
     as_root install -m 0755 "$TMPD/stage/usr/local/bin/tmux" "$dest"
-    as_root install -D -m 0644 "$TMPD/stage/usr/local/share/man/man1/tmux.1" /usr/local/share/man/man1/tmux.1
+    install_file "$TMPD/stage/usr/local/share/man/man1/tmux.1" /usr/local/share/man/man1/tmux.1 0644
     sub_end
     ready_mark tmux "$p" "$dest"
     log "  $("$dest" -V) -> $dest"
