@@ -114,6 +114,11 @@ run BACKUP_DIR="$tmp/via-link/sub"
 equal "...also through a symlink" 1 "$rc"
 rm -rf "$tmp/via-link" "$c/sub"
 
+echo "two backups in one second"
+newhome_backups="$tmp/same-second"
+run BACKUP_DIR="$newhome_backups"; run BACKUP_DIR="$newhome_backups"
+equal "...are two archives, the first not overwritten" 2 "$(tars "$newhome_backups" | wc -l | tr -d ' ')"
+
 echo "a prune"
 outside_before="$(outside)"
 run BACKUP_DIR="$tmp/backups" --prune-days 30
