@@ -16,18 +16,25 @@
 # the one with the lowest serial is used and the rest are left untouched.
 #
 # Settings (environment, or /etc/default/dx-nvme for the boot unit):
-#   NVME_MODELS    exact model strings that mean instance store, separated by | (default: EC2's)
-#   NVME_LABEL     the ext4 label this tool formats with and recognizes (default: dx-nvme)
-#   NVME_MOUNT     where the disk is mounted (default: /srv/nvme)
-#   NVME_BINDS     directories bound onto the disk (default: /var/lib/docker /var/lib/containerd);
-#                  DIR:USER makes DIR and its place on the disk USER's, for a per-user cache
-#   NVME_SWAP_GB   a swap file of this size on the disk; 0 for none (default: 8)
+#   NVME_MODELS     exact model strings that mean instance store, separated by | (default: EC2's)
+#   NVME_LABEL      the ext4 label this tool formats with and recognizes (default: dx-nvme)
+#   NVME_MOUNT      where the disk is mounted (default: /srv/nvme)
+#   NVME_BINDS      root-owned directories bound onto the disk (default: /var/lib/docker
+#                   /var/lib/containerd). Every target here is resolved and created as root, so
+#                   this list holds only paths root already owns outright — never one a user
+#                   could have replaced with a symlink (a user's home, for instance).
+#   NVME_CACHE_USER a user to give a cache directory on the disk, at
+#                   NVME_MOUNT/users/<user>/cache (0700, owned by them). The directory is made
+#                   entirely under NVME_MOUNT, which only root can write to, so creating it never
+#                   resolves anything inside the user's own home; nothing here ever binds onto a
+#                   path under a user's home.
+#   NVME_SWAP_GB    a swap file of this size on the disk; 0 for none (default: 8)
 # Where a disk is mounted comes from /proc/self/mountinfo, which tells the disk's own mount (root
 # "/") from the bind mounts made from it; lsblk's MOUNTPOINT column names only one of them.
 # Tests point NVME_SYSFS, NVME_DEV and NVME_MOUNTINFO at a fake /sys, /dev and mountinfo, put fake
-# lsblk, nvme, blkid, wipefs, mkfs.ext4, mount, umount, chown, getent and swapon first on PATH,
-# and set NVME_ROOT (a prefix for every path apply writes) with NVME_TEST_MODE=1, which accepts a
-# file as a device.
+# lsblk, nvme, blkid, wipefs, mkfs.ext4, mount, umount, chown and swapon first on PATH, and set
+# NVME_ROOT (a prefix for every path apply writes) with NVME_TEST_MODE=1, which accepts a file as
+# a device.
 
 NVME_SYSFS="${NVME_SYSFS:-/sys}"
 NVME_DEV="${NVME_DEV:-/dev}"
@@ -36,6 +43,7 @@ NVME_EBS_MODEL="Amazon Elastic Block Store"
 NVME_LABEL="${NVME_LABEL:-dx-nvme}"
 NVME_MOUNT="${NVME_MOUNT:-/srv/nvme}"
 NVME_BINDS="${NVME_BINDS:-/var/lib/docker /var/lib/containerd}"
+NVME_CACHE_USER="${NVME_CACHE_USER:-}"
 NVME_SWAP_GB="${NVME_SWAP_GB:-8}"
 NVME_ROOT="${NVME_ROOT:-}"
 NVME_TEST_MODE="${NVME_TEST_MODE:-0}"
@@ -220,81 +228,23 @@ _nvme_format() {
 
 _nvme_bind_name() { local p="${1#/}"; printf '%s' "${p//\//_}"; }
 
-# _nvme_as_user USER CMD...: CMD with USER's own privileges (root never acts on USER's paths).
-_nvme_as_user() {
-    local user="$1"
-    shift
-    if [ "$(id -un)" = "$user" ]; then "$@"
-    elif [ "$(id -u)" -eq 0 ] && command -v runuser >/dev/null 2>&1; then runuser -u "$user" -- "$@"
-    else return 1
-    fi
-}
-
-# _nvme_user_dir DIR USER: DIR is a real directory of USER's inside USER's home, reached through no
-# symlink below the home; a missing DIR is created by USER. Anything else is refused: as root, a
-# bind mount onto a path the user controls would follow a symlink they put there (say to /etc) and
-# lay a directory they own over a system one.
-_nvme_user_dir() {
-    local t="$1" user="$2" home real_home real owner
-    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
-    [ -n "$home" ] || { nvme_log "warning: no user $user; not binding $t"; return 1; }
-    home="$(_nvme_path "$home")"
-    case "$t" in "$home"/*) ;; *) nvme_log "warning: $t is not inside $user's home; not binding it"; return 1 ;; esac
-    if [ ! -e "$t" ] && [ ! -L "$t" ]; then
-        _nvme_as_user "$user" mkdir -m 700 -- "$t" \
-            || { nvme_log "warning: $user could not create $t; not binding it"; return 1; }
-    fi
-    if [ -L "$t" ] || [ ! -d "$t" ]; then
-        nvme_log "warning: $t is a symlink or not a directory; not binding it"
-        return 1
-    fi
-    real_home="$(realpath -- "$home" 2>/dev/null)" && real="$(realpath -- "$t" 2>/dev/null)" \
-        || { nvme_log "warning: cannot resolve $t; not binding it"; return 1; }
-    if [ "$real" != "$real_home/${t#"$home"/}" ]; then
-        nvme_log "warning: $t leads through a symlink (to $real); not binding it"
-        return 1
-    fi
-    owner="$(stat -c %U -- "$t" 2>/dev/null || stat -f %Su -- "$t" 2>/dev/null || true)"
-    if [ "$owner" != "$user" ]; then
-        nvme_log "warning: $t belongs to ${owner:-nobody}, not $user; not binding it"
-        return 1
-    fi
-}
-
-# _nvme_disk_devno: the major:minor of the disk mounted at NVME_MOUNT (its own mount, root "/").
-_nvme_disk_devno() {
-    awk -v m="$(_nvme_path "$NVME_MOUNT")" '$5 == m && $4 == "/" { print $3; exit }' "$NVME_MOUNTINFO" 2>/dev/null
-}
-
-# _nvme_bind ENTRY PROVISIONING: bind MOUNT/binds/<name> onto ENTRY's directory. ENTRY is DIR, or
-# DIR:USER for a directory of USER's (a cache in their home): DIR must pass _nvme_user_dir, and its
-# place on the disk is given to USER on every run, a run that finds the bind already there
-# included, because after a stop and start that place is new again (root's), and an older run may
-# have left it root's. A plain DIR's place copies DIR's owner and mode. While provisioning, a DIR
-# with content is skipped (binding would hide it); at boot it is bound anyway, which hides what was
-# written to the root disk while the instance store was missing, without deleting it. After the
-# bind it checks where the mount really landed, and undoes one that landed anywhere else.
+# _nvme_bind TARGET PROVISIONING: bind MOUNT/binds/<name> onto TARGET, a root-owned system
+# directory (NVME_BINDS lists only such paths: never one inside a user's home, which a user could
+# replace with a symlink before root resolves or mounts onto it). While provisioning, a TARGET
+# with content is skipped (binding would hide it); at boot it is bound anyway, which hides what
+# was written to the root disk while the instance store was missing, without deleting it. After
+# the bind it checks, by the resolved path, where the mount really landed, and undoes one that
+# landed anywhere else (a path swapped for a symlink between the checks and the mount).
 _nvme_bind() {
-    local target="${1%%:*}" user="" provisioning="$2" t src name owner mode devno landed p
-    case "$1" in *:*) user="${1#*:}" ;; esac
+    local target="$1" provisioning="$2" t src name owner mode landed p realt realp
     t="$(_nvme_path "$target")"
     name="$(_nvme_bind_name "$target")"
     src="$(_nvme_path "$NVME_MOUNT")/binds/$name"
-    devno="$(_nvme_disk_devno)"
     if _nvme_mounted_at "$t"; then
-        if [ -n "$user" ] && [ -n "$devno" ] \
-            && awk -v m="$t" -v r="/binds/$name" -v d="$devno" '$5 == m && $4 == r && $3 == d { f = 1 } END { exit !f }' "$NVME_MOUNTINFO"; then
-            chown "$user:" "$src" || nvme_die "could not give $src to $user"
-            chmod 700 "$src"
-            nvme_log "$target is already bound; its place on the disk is $user's"
-        else
-            nvme_log "$target is already a mount point; leaving it"
-        fi
+        nvme_log "$target is already a mount point; leaving it"
         return 0
     fi
-    if [ -n "$user" ]; then
-        _nvme_user_dir "$t" "$user" || return 1
-    elif [ -L "$t" ]; then
+    if [ -L "$t" ]; then
         nvme_log "warning: $target is a symlink; not binding it"
         return 1
     fi
@@ -306,25 +256,36 @@ _nvme_bind() {
         nvme_log "warning: $target has data on the root disk; the bind hides it until unmounted"
     fi
     mkdir -p "$t" "$src"
-    if [ -n "$user" ]; then
-        chown "$user:" "$src" || nvme_die "could not give $src to $user"
-        chmod 700 "$src"
-    else
-        owner="$(stat -c '%u:%g' "$t" 2>/dev/null || echo 0:0)"
-        mode="$(stat -c '%a' "$t" 2>/dev/null || echo 755)"
-        chown "$owner" "$src" 2>/dev/null || true
-        chmod "$mode" "$src" 2>/dev/null || true
-    fi
+    owner="$(stat -c '%u:%g' "$t" 2>/dev/null || echo 0:0)"
+    mode="$(stat -c '%a' "$t" 2>/dev/null || echo 755)"
+    chown "$owner" "$src" 2>/dev/null || true
+    chmod "$mode" "$src" 2>/dev/null || true
     mount --bind "$src" "$t" || nvme_die "could not bind $src onto $target"
-    # A path swapped for a symlink between the checks and the mount would take the bind elsewhere.
     landed="$(awk -v r="/binds/$name" '$4 == r { print $5 }' "$NVME_MOUNTINFO" 2>/dev/null || true)"
+    realt="$(realpath -- "$t" 2>/dev/null || printf '%s' "$t")"
     for p in $landed; do
-        if [ "$p" != "$t" ]; then
+        realp="$(realpath -- "$p" 2>/dev/null || printf '%s' "$p")"
+        if [ "$realp" != "$realt" ]; then
             umount -l -- "$p" 2>/dev/null || true
             nvme_die "the bind for $target landed on $p instead; undone"
         fi
     done
-    nvme_log "bound $target onto the instance store${user:+ (owned by $user)}"
+    nvme_log "bound $target onto the instance store"
+}
+
+# _nvme_user_cache USER: a cache directory for USER at NVME_MOUNT/users/USER/cache, 0700 and
+# owned by USER, created as root. Every path component up to and including "users" lives directly
+# under NVME_MOUNT, a tree only root can write to (a fresh ext4 root directory, or the directories
+# this function itself created with root's default mode): nothing here ever resolves a path a
+# user controls, so a user's own home, and anything they could symlink there, is never touched.
+# Prints the created directory's logical path (without NVME_ROOT's test prefix) on success.
+_nvme_user_cache() {
+    local user="$1" path="$NVME_MOUNT/users/$1/cache" dir
+    dir="$(_nvme_path "$path")"
+    mkdir -p "$dir" || nvme_die "could not create $path"
+    chown "$user:" "$dir" || nvme_die "could not give $path to $user"
+    chmod 700 "$dir"
+    printf '%s\n' "$path"
 }
 
 _nvme_swap() {
@@ -349,7 +310,7 @@ _nvme_swap() {
 # does nothing and succeeds (the machine runs from its root disk); with instance stores that are
 # all unusable it fails, so the boot unit keeps Docker from starting on the root disk unnoticed.
 nvme_apply() {
-    local provisioning=0 found sel dev action mnt target bound=""
+    local provisioning=0 found sel dev action mnt target bound="" cache=""
     [ "${1:-}" != --provisioning ] || provisioning=1
     found="$(nvme_detect)"
     if [ -z "$found" ]; then
@@ -374,7 +335,9 @@ nvme_apply() {
         if _nvme_bind "$target" "$provisioning"; then bound="$bound $target"; fi
     done
     _nvme_swap
+    [ -z "${NVME_CACHE_USER:-}" ] || cache="$(_nvme_user_cache "$NVME_CACHE_USER")"
     echo "binds:$bound"
+    [ -z "$cache" ] || echo "cache:$cache"
 }
 
 nvme_main() {

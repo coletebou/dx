@@ -131,7 +131,8 @@ line), `BOOTSTRAP_UPGRADE`, `BOOTSTRAP_NVME`, `BOOTSTRAP_EC2`, `BOOTSTRAP_DOCKER
 `BOOTSTRAP_CLOUD_INIT`, `BOOTSTRAP_TRACE` (all `1` to turn on). Tuning without a flag:
 `BOOTSTRAP_APT_EXTRA`, `BOOTSTRAP_APT_PACKAGES` (replaces the base set), `BOOTSTRAP_APT_LOCK_TIMEOUT`
 (seconds to wait for the dpkg lock, default 900), `BOOTSTRAP_INOTIFY_WATCHES`, `_INSTANCES`,
-`_EVENTS`, `BOOTSTRAP_SWAP_GB`, `BOOTSTRAP_NVME_CACHE=0` (keep `~/.cache` off the instance store),
+`_EVENTS`, `BOOTSTRAP_SWAP_GB`, `BOOTSTRAP_NVME_CACHE=0` (no per-user cache directory on the
+instance store),
 `BOOTSTRAP_STATE_DIR` (default `/var/lib/dx-bootstrap`).
 
 ## Instance-store NVMe
@@ -150,19 +151,25 @@ finds; with `--nvme` (or `--ec2`) it uses one.
   mount anywhere else is left alone. With several usable disks it takes the one with the lowest
   serial and leaves the rest. Right before formatting, it probes the disk directly (`blkid -p`,
   `wipefs`) and refuses if either finds anything.
-- **What goes there.** `/srv/nvme` holds bind mounts for `/var/lib/docker`, `/var/lib/containerd`
-  and the user's `~/.cache` (`NVME_BINDS` lists them; an entry `DIR:USER` is a directory of USER's,
-  created by them when missing, with its place on the disk given to them on every run, a run that
-  finds it already bound included), and an 8 GB swap file (`NVME_SWAP_GB`, 0 for none). The phase
-  runs before Docker is installed, so Docker's data starts out there. A target that already holds
-  data is left on the root disk, with a warning.
-- **A user's directory is never trusted as a path.** Root binding onto a path the user controls
-  would follow a symlink they put there (say `~/.cache` pointing at `/etc`) and lay a directory they
-  own over a system one. So a `DIR:USER` target is bound only when it is a real directory inside the
-  user's home, reached through no symlink below the home and owned by the user; otherwise it is
-  skipped with a warning. After the bind, where the mount really landed is checked in mountinfo,
-  and a bind that landed anywhere else (a symlink swapped in between the check and the mount) is
-  undone and the run fails.
+- **What goes there.** `/srv/nvme` holds bind mounts for root-owned system directories only
+  (`NVME_BINDS`, default `/var/lib/docker /var/lib/containerd`) and an 8 GB swap file
+  (`NVME_SWAP_GB`, 0 for none). The phase runs before Docker is installed, so Docker's data starts
+  out there. A target that already holds data is left on the root disk, with a warning.
+- **Never a bind onto a path a user controls.** Root resolving or mounting onto a path inside a
+  user's home would follow whatever symlink is there at the time: a user could point `~/.cache` at
+  `/etc` (or anything else) and have root plant a user-writable directory over a system one, or,
+  worse, swap the symlink in between root's checks and the `mount` call and have root bind over
+  a path like `/etc` directly. So `NVME_BINDS` holds only paths root already owns outright, never
+  one under a user's home, and the bind's landing place is still checked against the resolved
+  mountinfo path afterwards (undone, failing the run, if it landed anywhere else).
+- **A user's cache, without ever touching their home as root.** With `--nvme` (unless
+  `BOOTSTRAP_NVME_CACHE=0`), the target user gets a cache directory *on the instance store*, at
+  `/srv/nvme/users/<user>/cache` (`0700`, owned by them) — created entirely under `/srv/nvme`,
+  a tree only root can write to, so creating it never resolves anything under the user's own home.
+  The user is pointed at it non-invasively: `~/.config/dx-nvme-cache.sh` (`export
+  XDG_CACHE_HOME=...`) is written *as the user*, through `as_user`, so writing it follows only
+  symlinks the user already chose for their own home — the same as anything else they could do
+  there themselves. Source it (from `~/.zshenv.local`, say) to use it.
 - **Where it is mounted** is read from `/proc/self/mountinfo`, which tells the disk's own mount from
   the bind mounts made from it (lsblk names only one of the places a disk is mounted), so a second
   run, or the boot unit run again, finds its disk in place.
@@ -329,6 +336,9 @@ downloads every asset for both architectures and compares (it changes nothing el
 - Install Homebrew, or anything else on macOS beyond git.
 - Overwrite, merge into or reset an existing checkout, or clobber a directory that is not dx.
 - Format a disk that is not a blank instance store, or touch an EBS volume.
+- Bind-mount, as root, onto any path under a user's home, or otherwise have root resolve or
+  create a path there — a cache for the user lives on the instance store instead, and the one file
+  pointing at it is written by the user, not root.
 - Put an auth key in an argument, a trace or a child's environment, or turn Tailscale SSH on
   unasked.
 - Change sshd, the firewall, users or passwords ([infra/vps.md](infra/vps.md) does that by hand).

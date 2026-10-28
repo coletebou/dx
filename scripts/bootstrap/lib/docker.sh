@@ -38,21 +38,40 @@ EOF
 # step_nvme_apply: with --nvme, format (a blank disk only), mount, bind and swap now, and install
 # the boot unit that does it again at every boot. Docker and containerd then require that unit,
 # so a box whose instance store cannot be set up does not start Docker on the root disk unnoticed.
+# _nvme_cache_env_snippet PATH: tell TARGET_USER about their cache directory without ever
+# touching their home as root. Written (and its ~/.config created, if missing) entirely with
+# as_user, so it follows only symlinks the user already chose for their own home — the same as
+# anything else they could do there themselves.
+_nvme_cache_env_snippet() {
+    local path="$1" snippet="$TARGET_HOME/.config/dx-nvme-cache.sh"
+    if as_user mkdir -p "$TARGET_HOME/.config" \
+        && printf '# Written by dx provision: your cache lives on the instance store, not the root disk.\nexport XDG_CACHE_HOME=%q\n' "$path" \
+            | as_user tee "$snippet" >/dev/null; then
+        log "  wrote $snippet: source it (e.g. . $snippet from ~/.zshenv.local) to use it as \$XDG_CACHE_HOME"
+    else
+        warn "could not write $snippet as $TARGET_USER; set XDG_CACHE_HOME=$path yourself to use it"
+    fi
+}
+
 step_nvme_apply() {
-    local binds out bound unit
+    local out bound cache unit cache_user=""
     if [ "${BOOTSTRAP_NVME:-0}" != 1 ]; then step_skip off "no --nvme"; return 0; fi
     if [ "${NVME_PRESENT:-0}" != 1 ]; then step_skip none "no instance-store disk here"; return 0; fi
-    binds="$NVME_BINDS"
-    # The user's cache, as theirs: nvme.sh creates it and its place on the disk owned by them.
-    [ "${BOOTSTRAP_NVME_CACHE:-1}" != 1 ] || [ "$TARGET_USER" = root ] || binds="$binds $TARGET_HOME/.cache:$TARGET_USER"
+    # A user to get a cache directory ON THE INSTANCE STORE (never a bind onto anything under
+    # their home): nvme.sh creates it entirely under NVME_MOUNT, which only root can write to,
+    # so nothing here ever resolves a path the user controls.
+    [ "${BOOTSTRAP_NVME_CACHE:-1}" != 1 ] || [ "$TARGET_USER" = root ] || cache_user="$TARGET_USER"
     out="$(as_root env NVME_MODELS="$NVME_MODELS" NVME_LABEL="$NVME_LABEL" NVME_MOUNT="$NVME_MOUNT" \
-        NVME_BINDS="$binds" NVME_SWAP_GB="$NVME_SWAP_GB" bash "$BOOTSTRAP_LIB/nvme.sh" apply --provisioning)"
+        NVME_BINDS="$NVME_BINDS" NVME_SWAP_GB="$NVME_SWAP_GB" NVME_CACHE_USER="$cache_user" \
+        bash "$BOOTSTRAP_LIB/nvme.sh" apply --provisioning)"
     bound="$(printf '%s\n' "$out" | sed -n 's/^binds://p' | tail -n 1)"
     bound="${bound# }"
-    log "  on the instance store: ${bound:-nothing}"
+    cache="$(printf '%s\n' "$out" | sed -n 's/^cache://p' | tail -n 1)"
+    log "  on the instance store: ${bound:-nothing}${cache:+, cache at $cache}"
+    [ -z "$cache" ] || _nvme_cache_env_snippet "$cache"
     as_root install -D -m 0755 "$BOOTSTRAP_LIB/nvme.sh" "$(sysf /usr/local/sbin/dx-nvme-setup)"
-    root_write "$(sysf /etc/default/dx-nvme)" "$(printf '# Written by dx provision; read by /usr/local/sbin/dx-nvme-setup at boot.\nNVME_MODELS=%q\nNVME_LABEL=%q\nNVME_MOUNT=%q\nNVME_BINDS=%q\nNVME_SWAP_GB=%q\n' \
-        "$NVME_MODELS" "$NVME_LABEL" "$NVME_MOUNT" "$bound" "$NVME_SWAP_GB")"
+    root_write "$(sysf /etc/default/dx-nvme)" "$(printf '# Written by dx provision; read by /usr/local/sbin/dx-nvme-setup at boot.\nNVME_MODELS=%q\nNVME_LABEL=%q\nNVME_MOUNT=%q\nNVME_BINDS=%q\nNVME_CACHE_USER=%q\nNVME_SWAP_GB=%q\n' \
+        "$NVME_MODELS" "$NVME_LABEL" "$NVME_MOUNT" "$bound" "${cache:+$TARGET_USER}" "$NVME_SWAP_GB")"
     if has_systemd; then
         root_write "$(sysf /etc/systemd/system/dx-nvme-setup.service)" "$(_nvme_unit)"
         for unit in docker containerd; do
