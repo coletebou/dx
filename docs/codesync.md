@@ -79,8 +79,9 @@ would mark its conflicts resolved, markers and all):
 2. **What origin has and it lacks is pulled**: one fetch, then a rebase onto exactly the tip
    that fetch brought, so its commits go on top.
 3. **It pushes**, unless it is level with that tip: first `gitleaks git` scans every commit the
-   push would publish (one you made by hand with hooks skipped too), then a real commit is pushed
-   normally and a WIP commit is force-pushed under the rules below.
+   push would publish (one you made by hand with hooks skipped too, and a merge diffed against
+   each parent, so a secret only its conflict resolution added is found), then a real commit is
+   pushed normally and a WIP commit is force-pushed under the rules below.
 4. **Its own WIP commit is unwrapped again**: a soft reset puts the changes back in the working
    tree, uncommitted (staged versus unstaged is not kept). The commit stays on origin.
 
@@ -209,7 +210,10 @@ command. The peer reads its own `~/.config/codesync/config`: nothing of this mac
 environment travels. `--local` means the peer syncs its repositories and stops; it never fans out
 further. `--peer` says nobody is at that machine: its dotsync step runs as `dotsync --local
 --peer`, so while that machine is paused (`dotsync pause`) or someone (or an agent) is editing its
-dotfiles, its dotsync defers instead of committing, rebasing and pushing.
+dotfiles, its dotsync defers instead of committing, rebasing and pushing. A peer whose codesync
+is older than `--peer` (its `--help` does not list it) gets plain `--local` instead, and the run
+says so (`codesync: note: codesync here predates --peer`), so the machines still converge while
+you upgrade them one by one.
 
 Each peer is cut off after `CODESYNC_PEER_TIMEOUT` seconds (default 300), with GNU `timeout` (or
 `gtimeout`) when there is one and a built-in watchdog otherwise, and the run goes on to the next.

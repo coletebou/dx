@@ -175,7 +175,7 @@ echo "the profile is data"
 peer_script="$(cs_fn codesync_peer_script example box-a codesync)"
 ph="$tmp/profile-host"
 mkdir -p "$ph/.local/bin"
-printf '#!/bin/sh\nprintf "ran %%s\\n" "$*" >> "%s/runs"\n' "$ph" > "$ph/.local/bin/codesync"
+printf '#!/bin/sh\n[ "$1" = --help ] && { echo "  --peer          a run another machine started"; exit 0; }\nprintf "ran %%s\\n" "$*" >> "%s/runs"\n' "$ph" > "$ph/.local/bin/codesync"
 chmod +x "$ph/.local/bin/codesync"
 peer_run() { printf '%s\n' "$1" > "$ph/.df-profile"; env -i HOME="$ph" PATH="$clean_path" sh -s <<<"$peer_script" >/dev/null 2>&1; echo $?; }
 for p in 'DF_IDENTITY=example' 'export DF_IDENTITY="example"' "DF_IDENTITY='example'" $'export DF_MACHINE=box-q\nexport DF_IDENTITY=example'; do
@@ -193,6 +193,21 @@ equal "a peer without a profile refuses" 77 "$(env -i HOME="$ph" PATH="$clean_pa
 equal "no profile content was executed" "no" "$(if [[ -e "$ph/executed" ]]; then echo yes; else echo no; fi)"
 equal "...and codesync never ran for a refused profile" 4 "$(wc -l < "$ph/runs" | tr -d ' ')"
 equal "a peer that is the starting machine steps aside" 78 "$(peer_run $'DF_IDENTITY=example\nDF_MACHINE=Box-A')"
+# An older codesync, without --peer (its --help does list --peers): it gets plain --local.
+cat > "$ph/.local/bin/codesync" <<EOF
+#!/bin/sh
+case "\$1" in
+  --help) printf 'Usage: codesync [--dry-run] [--local] [--peers]\n  --peers   list the peers\n'; exit 0 ;;
+  --local) [ "\$2" = --peer ] && { echo "codesync: unknown option: --peer" >&2; exit 2; }
+           printf 'old ran %s\n' "\$*" >> "$ph/runs"; exit 0 ;;
+esac
+exit 2
+EOF
+chmod +x "$ph/.local/bin/codesync"
+old_err="$(printf 'DF_IDENTITY=example\n' > "$ph/.df-profile"; env -i HOME="$ph" PATH="$clean_path" sh -s <<<"$peer_script" 2>&1 >/dev/null; echo "rc=$?")"
+equal "a peer with an older codesync runs it with plain --local" "old ran --local" "$(tail -n 1 "$ph/runs")"
+check "...and succeeds" "rc=0" "$old_err"
+check "...saying so" "codesync: note: codesync here predates --peer" "$old_err"
 rm "$ph/.local/bin/codesync"
 equal "a peer without codesync says so" 127 "$(peer_run 'DF_IDENTITY=example')"
 run_on box-a DF_IDENTITY=other --peers
@@ -444,6 +459,25 @@ check "...saying so" "Remote has commits you don't have" "$guard_out"
 equal "...and the remote keeps them" "$remote_only" "$(tip r7)"
 retire r7
 
+echo "a peer still on an older codesync"
+machine box-e example
+rm "$tmp/box-e/.local/bin/codesync"
+cat > "$tmp/box-e/.local/bin/codesync" <<EOF
+#!/bin/sh
+case "\$1" in
+  --help) printf 'Usage: codesync [--dry-run] [--local] [--peers]\n  --peers   list the peers\n'; exit 0 ;;
+  --local) [ "\$2" = --peer ] && { echo "codesync: unknown option: --peer" >&2; exit 2; }
+           printf '%s\n' "\$*" >> "$tmp/old-runs"; echo "[codesync] Done: 0 synced, 0 skipped, 0 failed"; exit 0 ;;
+esac
+exit 2
+EOF
+chmod +x "$tmp/box-e/.local/bin/codesync"
+peers box-a box-e
+run_on box-a
+check "box-e's older codesync still syncs" "box-e: synced" "$out"
+equal "...run as plain --local" "--local" "$(cat "$tmp/old-runs" 2>&1)"
+check "...and the run says why" "box-e| codesync: note: codesync here predates --peer" "$out"
+
 echo "an unfinished operation"
 # conflict_on NAME: the seed pushes "seed side" to f; box-a commits "box-a side" to f.
 conflict_on() {
@@ -625,6 +659,25 @@ equal "a commit holding a secret, made by hand, is not pushed" "$s1_before" "$(t
 check "...refused at the outgoing scan" "refusing to push" "$out"
 lacks "...without printing the secret" "$token" "$out"
 retire s1
+# A merge made here whose conflict resolution alone adds the secret (neither parent has it), in a
+# clean checkout: only the outgoing scan stands between it and the remote.
+new_remote s4
+clone_on box-a s4
+printf 'seed side\n' > "$tmp/seed/s4/f"
+sg -C "$tmp/seed/s4" commit -qam "seed side"; sg -C "$tmp/seed/s4" push -q origin master
+printf 'box-a side\n' > "$tmp/box-a/code/s4/f"
+at box-a s4 commit -qam "box-a side" >/dev/null
+at box-a s4 pull -q --no-rebase origin master >/dev/null
+printf 'resolved\nGITHUB_TOKEN=%s\n' "$token" > "$tmp/box-a/code/s4/f"
+at box-a s4 add f >/dev/null
+at box-a s4 commit -q --no-edit --no-verify >/dev/null
+s4_before="$(tip s4)"
+equal "the merge is made, the tree clean" "2 " "$(at box-a s4 log -1 --format=%p | wc -w | tr -d ' ') $(at box-a s4 status --porcelain)"
+run_on box-a --local
+equal "a merge whose resolution adds a secret is not pushed" "$s4_before" "$(tip s4)"
+check "...refused at the outgoing scan" "refusing to push" "$out"
+lacks "...without printing the secret" "$token" "$out"
+retire s4
 # Without gitleaks nothing is committed or pushed, but a clean repository still pulls.
 nogl="$tmp/no-gitleaks"
 mkdir -p "$nogl"

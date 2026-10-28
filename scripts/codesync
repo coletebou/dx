@@ -342,14 +342,16 @@ codesync_scan_staged() {
 }
 
 # codesync_scan_outgoing RANGE: the commits a push would publish, ones made by hand included.
+# -m diffs a merge against each parent: plain `git log -p` shows no diff for a merge, so a
+# secret that only its conflict resolution added would pass.
 codesync_scan_outgoing() {
     if ! command -v gitleaks >/dev/null 2>&1; then
         log "  ${RED}gitleaks is required to push (https://github.com/gitleaks/gitleaks); refusing to push${NC}"
         return 1
     fi
-    if ! gitleaks git --redact --no-banner --log-opts="$1" . >/dev/null 2>&1; then
+    if ! gitleaks git --redact --no-banner --log-opts="-m $1" . >/dev/null 2>&1; then
         log "  ${RED}gitleaks found a potential secret in the commits to push, or could not finish; refusing to push${NC}"
-        log "    (see it with: gitleaks git --redact --verbose --log-opts='$1' .)"
+        log "    (see it with: gitleaks git --redact --verbose --log-opts='-m $1' .)"
         return 1
     fi
 }
@@ -800,7 +802,8 @@ codesync_peers() {
 
 # The POSIX sh a peer runs, on its standard input. It refuses (77) unless the peer's own
 # profile names IDENTITY, steps aside (78) when the peer is the machine the sync started on,
-# then runs COMMAND --local from the peer's PATH, with ~/.local/bin added.
+# then runs COMMAND --local --peer from the peer's PATH, with ~/.local/bin added. A codesync
+# there too old for --peer gets plain --local, with a note, so a rolling upgrade still converges.
 codesync_peer_script() {  # IDENTITY MACHINE COMMAND
     cat <<EOF
 profile="\$HOME/.df-profile"
@@ -820,7 +823,11 @@ if ! command -v $3 >/dev/null 2>&1; then
     printf 'codesync: %s is not on PATH here\n' '$3' >&2
     exit 127
 fi
-exec $3 --local --peer
+if $3 --help 2>/dev/null | grep -q -- '--peer '; then
+    exec $3 --local --peer
+fi
+printf 'codesync: note: codesync here predates --peer; running it with --local (its dotsync step runs as if started here)\n' >&2
+exec $3 --local
 EOF
 }
 
@@ -854,7 +861,7 @@ codesync_sync_peer() {
     if $VERBOSE || [[ "$rc" -ne 0 ]]; then
         [[ -z "$out" ]] || printf '%s\n' "$out" | sed "s/^/    $host| /"
     else
-        printf '%s\n' "$out" | grep -E 'Done:' | sed "s/^/    $host| /" || true
+        printf '%s\n' "$out" | grep -E 'Done:|^codesync: note:' | sed "s/^/    $host| /" || true
     fi
     case "$rc" in
         0)   log "  $host: ${GREEN}synced${NC}"; peers_synced=$((peers_synced + 1)) ;;
