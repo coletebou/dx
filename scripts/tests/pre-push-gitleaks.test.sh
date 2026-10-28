@@ -215,6 +215,7 @@ if command -v gitleaks >/dev/null 2>&1; then
   w checkout octo-b -- other.txt
   octo_tree=$(w write-tree)
   octo_commit=$(w commit-tree "$octo_tree" -p "$deploy_tip" -p "$octo_a_tip" -p "$octo_b_tip" -m 'octopus merge')
+  w config log.diffMerges remerge   # -m alone would follow this and skip the octopus
   w update-ref HEAD "$octo_commit"
   [[ "$(w log -1 --format=%P | wc -w)" -eq 3 ]] || { echo "pre-push test: the octopus merge fixture did not keep three parents" >&2; exit 1; }
   if push_deploy; then

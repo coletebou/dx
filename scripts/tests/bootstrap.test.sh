@@ -528,7 +528,7 @@ out="$(cd "$tmp/harness" && PATH="$r/bin:$PATH" NVME_SYSFS="$r/sys" NVME_DEV="$r
     BOOTSTRAP_SYSROOT="$2" BOOTSTRAP_LIB="$1" BOOTSTRAP_NVME=1 NVME_PRESENT=1 TARGET_USER="$3" TARGET_HOME="$4"
     TOUCHED="$5"
     as_root() {
-        for a in "$@"; do case "$a" in "$TARGET_HOME"*) printf "%s\n" "as_root touched a home path: $a" >> "$TOUCHED"; return 1 ;; esac; done
+        for a in "$@"; do case "$a" in *"$TARGET_HOME"*) printf "%s\n" "as_root touched a home path: $a" >> "$TOUCHED"; return 1 ;; esac; done
         "$@"
     }
     has_systemd() { return 1; }

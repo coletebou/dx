@@ -845,6 +845,7 @@ echo "ordinary detail"
         env = dict(env, PATH=os.pathsep.join((str(self.root / "log-bin"), str(self.root / "guard-bin"), self.env["PATH"])))
         before = self.git("rev-parse", "master", repo=origin)
         self.git("config", "rebase.rebaseMerges", "true")
+        self.git("config", "log.diffMerges", "remerge")  # -m alone would follow this and skip the octopus
         (self.repo / "notes").write_text("base\n")
         self.git("add", "notes")
         self.git("commit", "-qm", "notes")

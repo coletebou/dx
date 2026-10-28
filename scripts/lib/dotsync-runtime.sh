@@ -330,6 +330,8 @@ dotsync_merge_diffs() {
   if git log -1 --format= --diff-merges=remerge HEAD >/dev/null 2>&1 &&
       [[ -z "$(git rev-list --merges --min-parents=3 "$1" 2>/dev/null)" ]]; then
     echo --diff-merges=remerge
+  elif git log -1 --format= --diff-merges=separate HEAD >/dev/null 2>&1; then
+    echo --diff-merges=separate   # -m would follow log.diffMerges, which can say remerge
   else
     echo -m
   fi

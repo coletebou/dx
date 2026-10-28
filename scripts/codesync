@@ -349,9 +349,12 @@ codesync_scan_outgoing() {
         log "  ${RED}gitleaks is required to push (https://github.com/gitleaks/gitleaks); refusing to push${NC}"
         return 1
     fi
-    if ! gitleaks git --redact --no-banner --log-opts="-m $1" . >/dev/null 2>&1; then
+    # A diff per parent of every merge: -m alone follows log.diffMerges, which can say remerge.
+    local md=-m
+    git log -1 --format= --diff-merges=separate HEAD >/dev/null 2>&1 && md=--diff-merges=separate
+    if ! gitleaks git --redact --no-banner --log-opts="$md $1" . >/dev/null 2>&1; then
         log "  ${RED}gitleaks found a potential secret in the commits to push, or could not finish; refusing to push${NC}"
-        log "    (see it with: gitleaks git --redact --verbose --log-opts='-m $1' .)"
+        log "    (see it with: gitleaks git --redact --verbose --log-opts='$md $1' .)"
         return 1
     fi
 }
