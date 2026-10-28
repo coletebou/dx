@@ -642,15 +642,22 @@ check "...and the run goes on to the next repository" "goes through" "$(git -C "
 retire r11; retire r12
 
 echo "the secret scan"
+echo "TRACE a $(date +%s)" >&2
 token="ghp_$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 36)"
+echo "TRACE b $(date +%s) token_len=${#token}" >&2
 new_remote s1
+echo "TRACE c $(date +%s)" >&2
 clone_on box-a s1
+echo "TRACE d $(date +%s)" >&2
 # A repository-local hooks directory (husky, lefthook) with no secret hook: codesync scans anyway.
 mkdir -p "$tmp/empty-hooks"
 at box-a s1 config core.hooksPath "$tmp/empty-hooks" >/dev/null
+echo "TRACE e $(date +%s)" >&2
 printf 'GITHUB_TOKEN=%s\n' "$token" > "$tmp/box-a/code/s1/.env"
 s1_before="$(tip s1)"
+echo "TRACE f $(date +%s) s1_before=$s1_before" >&2
 run_on box-a --local
+echo "TRACE g $(date +%s) rc=$rc" >&2
 equal "an untracked file holding a secret fails the run" 1 "$rc"
 check "...at codesync's own scan of the changes" "gitleaks found a potential secret in the changes" "$out"
 lacks "...before any commit is made" "committed WIP" "$out"
