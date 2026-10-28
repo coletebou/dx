@@ -35,7 +35,39 @@ if [[ -z "$py" ]] || ! new_enough "$py"; then
   echo "autoreview.test.sh: needs Python 3.10 or newer (set AUTOREVIEW_TEST_PYTHON)" >&2; exit 1
 fi
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/autoreview-test.XXXXXX")"
+# The skill writes its private diagnostics only where, walking down from /, no directory other users can
+# write comes before one only its owner can enter (scripts/autoreview: persist_engine_stage), and its
+# tests expect them under HOME. So the sandbox goes in the first candidate that passes that same walk:
+# TMPDIR (macOS: a private /var/folders/.../T), else the caller's cache directory; never under a shared
+# /tmp, where every one of those tests would fail.
+private_base() { # private_base DIR: DIR is a directory, and the walk to it passes
+  "$py" - "$1" <<'PY'
+import os, stat, sys
+path, me = os.path.realpath(sys.argv[1]), os.geteuid()
+if not os.path.isdir(path):
+    sys.exit(1)
+root_owner, private, here = os.stat("/").st_uid, False, "/"
+for part in [""] + [p for p in path.split("/") if p]:
+    here = os.path.join(here, part)
+    info = os.stat(here)
+    if info.st_uid not in {root_owner, me} or (not private and info.st_mode & 0o022):
+        sys.exit(1)
+    private = private or (info.st_uid == me and stat.S_IMODE(info.st_mode) == 0o700)
+PY
+}
+cache="${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}"
+base=""
+for c in "${TMPDIR:-}" "$cache"; do
+  [[ -n "$c" ]] || continue
+  [[ "$c" != "$cache" ]] || mkdir -p "$c" 2>/dev/null
+  if private_base "$c"; then base="$c"; break; fi
+done
+if [[ -z "$base" ]]; then
+  echo "autoreview.test.sh: no sandbox directory that only its owner can write above (TMPDIR, then $cache);" \
+    "set TMPDIR to one" >&2
+  exit 1
+fi
+work="$(mktemp -d "$base/autoreview-test.XXXXXX")"
 work="$(cd "$work" && pwd -P)"
 trap 'rm -rf "$work"' EXIT
 
