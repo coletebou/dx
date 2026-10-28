@@ -88,11 +88,12 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      # gitleaks: dotsync's suites run its secret gate for real (the sum is the v8.30.1 release's).
-      - name: Install tmux, zsh, jq and gitleaks
+      # gitleaks: dotsync's and codesync's suites run their secret gate for real; trufflehog: the
+      # autoreview skill's suites refuse a review pack without it (each sum is its release's own).
+      - name: Install tmux, zsh, jq, gitleaks and trufflehog
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then
-            brew install tmux jq gitleaks
+            brew install tmux jq gitleaks trufflehog
           else
             sudo apt-get update && sudo apt-get install -y tmux zsh jq
             tgz="$RUNNER_TEMP/gitleaks.tar.gz"
@@ -100,6 +101,11 @@ jobs:
               https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
             echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $tgz" | sha256sum -c -
             tar -xzf "$tgz" -C "$RUNNER_TEMP" gitleaks
+            tgz="$RUNNER_TEMP/trufflehog.tar.gz"
+            curl -fsSL --retry 3 -o "$tgz" \
+              https://github.com/trufflesecurity/trufflehog/releases/download/v3.99.7/trufflehog_3.99.7_linux_amd64.tar.gz
+            echo "bdbea0508e439b144f49de14e775908de5f902f3d14ea7ae8354bae72b0b72ef  $tgz" | sha256sum -c -
+            tar -xzf "$tgz" -C "$RUNNER_TEMP" trufflehog
             echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
           fi
           # Suites that commit set their own identity; this covers any that rely on the global one.

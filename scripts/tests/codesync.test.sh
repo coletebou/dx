@@ -51,6 +51,12 @@ for _p in "${_parts[@]}"; do
   case "$_p" in ""|.|"$real_home"|"$real_home"/*) continue ;; esac
   clean_path="${clean_path:+$clean_path:}$_p"
 done
+# gitleaks may live under the real HOME (CI unpacks it in $RUNNER_TEMP, under the runner's
+# HOME): every machine gets it through a directory of its own that holds nothing else.
+if _gl="$(command -v gitleaks 2>/dev/null)"; then
+  mkdir -p "$tmp/gitleaks-bin" && ln -sf "$_gl" "$tmp/gitleaks-bin/gitleaks"
+  clean_path="${clean_path:+$clean_path:}$tmp/gitleaks-bin"
+fi
 for _c in codesync dotsync; do
   if PATH="$clean_path" command -v "$_c" >/dev/null 2>&1; then
     echo "refusing to run: a $_c outside this checkout is on PATH ($(PATH="$clean_path" command -v "$_c"))" >&2
