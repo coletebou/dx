@@ -387,6 +387,17 @@ codesync_scan_outgoing() {
     fi
 }
 
+# codesync_safety_tag PREFIX: a codesync-backup-* or codesync-unwrap-* name `git tag` is sure
+# to create. The timestamp alone collides within the same second: two separate codesync
+# processes can both force-push in the same repo inside one second (as the test suite does,
+# back to back), and a single run can unwrap twice (integrating a remote WIP, then its own at
+# the end). `git tag NAME COMMIT` silently fails on an existing name, which is why this needs
+# to be unique, not just readable; $RANDOM twice covers it without needing GNU date's %N (no
+# equivalent on BSD/macOS date).
+codesync_safety_tag() {
+    printf '%s-%s-%04x%04x' "$1" "$(date +%Y%m%d-%H%M%S)" "$RANDOM" "$RANDOM"
+}
+
 # The machine a WIP commit names in its trailer, lowercased (empty for one without it).
 wip_machine() {
     codesync_lower "$(git log -1 --format=%b "$1" 2>/dev/null | sed -n "s/^$MACHINE_TRAILER: //p" | tail -n 1)"
@@ -510,7 +521,7 @@ safe_force_push() {
         return 1
     fi
 
-    backup_tag="codesync-backup-$(date +%Y%m%d-%H%M%S)"
+    backup_tag="$(codesync_safety_tag codesync-backup)"
     git tag "$backup_tag" "$remote_head" 2>/dev/null || true
     vlog "Created backup tag: $backup_tag"
 
@@ -555,7 +566,7 @@ unwrap_wip() {
     is_wip_commit "$msg" || return 1
 
     vlog "Detected WIP commit, unwrapping..."
-    backup_tag="codesync-unwrap-$(date +%Y%m%d-%H%M%S)"
+    backup_tag="$(codesync_safety_tag codesync-unwrap)"
     git tag "$backup_tag" HEAD 2>/dev/null || true
     vlog "Created backup tag: $backup_tag"
     git reset --soft HEAD~1 --quiet 2>/dev/null || return 1
