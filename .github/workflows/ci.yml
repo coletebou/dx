@@ -125,7 +125,11 @@ jobs:
       - name: Every suite
         env:
           RUN_ALL_LOG_DIR: ${{ runner.temp }}/suite-logs
-        run: bash scripts/tests/run-all.sh
+          RUN_ALL_SUITE_TIMEOUT: 150
+        run: bash scripts/tests/run-all.sh codesync
+      - name: DEBUG dump processes (temporary, removed before merge)
+        if: always()
+        run: ps -ef || ps aux
       - name: Keep the failing suites' whole output
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
