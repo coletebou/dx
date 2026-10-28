@@ -738,7 +738,8 @@ else
       if ! git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null; then
         dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
           fetch --quiet </dev/null 9>&- || { push_unknown="could not fetch its new tip"; return 0; }
-        git rebase --quiet "$upstream" </dev/null || { git rebase --abort 2>/dev/null; return 1; }
+        git rebase --quiet "$upstream" </dev/null ||
+          { git rebase --abort 2>/dev/null; push_unknown="the rebase onto its new tip conflicted"; return 1; }
         git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null ||
           { push_unknown="its tip is not in this branch after a rebase"; return 0; }
       fi
@@ -805,8 +806,14 @@ else
         # upstream ref is no stand-in (its branch may be gone, and with it what was withdrawn).
         if [[ "$push_new_branch" -eq 1 ]]; then
           scan_range=HEAD
-        else
+        elif [[ -n "$push_base" ]]; then
           scan_range="$push_base..HEAD"
+        else
+          # Neither a known base nor a new branch: the scan range can never be empty, so
+          # treat this as the same refusal push_preflight itself reports on every other
+          # path where it cannot place the destination tip.
+          scan_range=HEAD
+          : "${push_unknown:=could not place the destination tip}"
         fi
         if [[ -n "$push_unknown" ]]; then
           push_failed=1

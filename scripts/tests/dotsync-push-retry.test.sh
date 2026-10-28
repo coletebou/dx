@@ -97,8 +97,12 @@ peer_push
 fail_rebases=2
 local_pushes=2
 : >"$TMP/stderr"
-first=0; push_preflight 2>>"$TMP/stderr" || first=1
+first=0; push_unknown=""; push_preflight 2>>"$TMP/stderr" || first=1
 [[ "$first" -eq 1 ]] || { echo "FAIL: the race check's failed rebase was not reported" >&2; exit 1; }
+# A live-writer race is recovered by the retry loop below, not refused outright, but
+# push_preflight itself must never leave both push_base and push_unknown empty: that would
+# make scan_range "..HEAD" (empty) back in dotsync, which gitleaks would scan nothing for.
+[[ -n "$push_unknown" ]] || { echo "FAIL: push_preflight's failed rebase set neither push_base nor push_unknown" >&2; exit 1; }
 push_with_retry "$first" 2>>"$TMP/stderr"
 [[ "$local_pushes" -eq 3 && "$fail_rebases" -eq 0 ]] || { echo "FAIL: expected one push after the failed rebases" >&2; cat "$TMP/stderr" >&2; exit 1; }
 git fetch -q
