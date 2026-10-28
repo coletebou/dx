@@ -193,6 +193,35 @@ if command -v gitleaks >/dev/null 2>&1; then
     exit 1
   fi
   w reset -q --hard HEAD~2
+  # Variant 2c: a finding that only an octopus (3-parent) merge's conflict resolution
+  # adds still blocks. remerge only diffs two-parent merges, so this needs -m. git's
+  # octopus strategy itself refuses outright on any conflict, so the merge commit is
+  # built by hand: a plain two-way merge to resolve the conflict, the third parent's
+  # tree folded in, then commit-tree names all three parents.
+  w switch -qc octo-a deploy
+  printf 'a\n' > "$R/work/notes.txt"
+  w add notes.txt && w commit -qm 'octo-a: notes'
+  w switch -q deploy
+  w switch -qc octo-b deploy
+  printf 'b\n' > "$R/work/other.txt"
+  w add other.txt && w commit -qm 'octo-b: other'
+  w switch -q deploy
+  deploy_tip=$(w rev-parse HEAD)
+  octo_a_tip=$(w rev-parse octo-a)
+  octo_b_tip=$(w rev-parse octo-b)
+  w merge --no-commit octo-a >/dev/null 2>&1 || true
+  printf 'resolved = "%s"\n' "$(token)" > "$R/work/notes.txt"
+  w add notes.txt
+  w checkout octo-b -- other.txt
+  octo_tree=$(w write-tree)
+  octo_commit=$(w commit-tree "$octo_tree" -p "$deploy_tip" -p "$octo_a_tip" -p "$octo_b_tip" -m 'octopus merge')
+  w update-ref HEAD "$octo_commit"
+  [[ "$(w log -1 --format=%P | wc -w)" -eq 3 ]] || { echo "pre-push test: the octopus merge fixture did not keep three parents" >&2; exit 1; }
+  if push_deploy; then
+    echo "pre-push test: a finding added only by an octopus merge resolution did not block" >&2
+    exit 1
+  fi
+  w reset -q --hard "$deploy_tip"
   # Variant 3: stale tracking ref. The remote was reset to drop a leaked commit
   # but this clone still tracks it; re-publishing it must still be scanned.
   w switch -qc leak master

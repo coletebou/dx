@@ -837,6 +837,52 @@ echo "ordinary detail"
         self.assertNotIn(token, result.stdout + diagnostic)
         self.assertEqual(self.git("rev-parse", "master", repo=origin), before, "the merge was published")
 
+    @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks is not installed")
+    def test_a_token_only_an_octopus_merge_resolution_adds_is_never_pushed(self):
+        # --diff-merges=remerge only diffs two-parent merges; a 3+-parent (octopus) merge needs
+        # -m instead, or a token its resolution alone adds would reach the remote unscanned.
+        origin, env, log = self.full_fixture()
+        env = dict(env, PATH=os.pathsep.join((str(self.root / "log-bin"), str(self.root / "guard-bin"), self.env["PATH"])))
+        before = self.git("rev-parse", "master", repo=origin)
+        self.git("config", "rebase.rebaseMerges", "true")
+        (self.repo / "notes").write_text("base\n")
+        self.git("add", "notes")
+        self.git("commit", "-qm", "notes")
+        self.git("switch", "-qc", "side1")
+        (self.repo / "notes").write_text("side1\n")
+        self.git("commit", "-qam", "side1")
+        self.git("switch", "-q", "master")
+        self.git("switch", "-qc", "side2")
+        (self.repo / "other").write_text("side2\n")
+        self.git("add", "other")
+        self.git("commit", "-qm", "side2")
+        self.git("switch", "-q", "master")
+        (self.repo / "notes").write_text("main\n")
+        self.git("commit", "-qam", "main")
+        master_tip = self.git("rev-parse", "master")
+        side1_tip = self.git("rev-parse", "side1")
+        side2_tip = self.git("rev-parse", "side2")
+        # git's octopus strategy refuses outright on any conflict (no partial state to resolve),
+        # so a real conflicting 3-parent merge is built by hand: a plain two-way merge to resolve
+        # the conflict, side2's tree added in, then commit-tree names all three parents.
+        self.git("merge", "--no-commit", "side1", check=False)
+        import secrets
+        import string
+        token = "gh" + "p_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36))
+        (self.repo / "notes").write_text("export GITHUB_TOKEN=%s\n" % token)
+        self.git("add", "notes")
+        self.git("checkout", "side2", "--", "other")
+        tree = self.git("write-tree")
+        commit = self.git("commit-tree", tree, "-p", master_tip, "-p", side1_tip, "-p", side2_tip,
+                           "-m", "octopus merge")
+        self.git("update-ref", "HEAD", commit)
+        self.assertEqual(len(self.git("log", "-1", "--format=%P").split()), 3,
+                          "the merge did not keep three parents")
+        result, heartbeat, diagnostic = self.run_full(env)
+        self.assertEqual((result.returncode, heartbeat["phase"]), (1, "secret-scan"), diagnostic)
+        self.assertNotIn(token, result.stdout + diagnostic)
+        self.assertEqual(self.git("rev-parse", "master", repo=origin), before, "the merge was published")
+
     def test_pull_only_never_commits_or_pushes(self):
         origin, env, log = self.full_fixture()
         writer = self.root / "writer"

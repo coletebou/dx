@@ -319,12 +319,16 @@ dotsync_scan_staged() {
   fi
 }
 
-# dotsync_merge_diffs: the git log option that shows gitleaks what each merge commit adds. Plain
-# `git log -p` shows no diff for a merge, so a conflict resolution could add a secret unseen.
-# remerge (git 2.36+) shows only what the resolution changed against git's own merge of the
-# parents; -m, the fallback, shows each parent's whole side again (safe, but noisier).
+# dotsync_merge_diffs RANGE: the git log option that shows gitleaks what each merge commit in
+# RANGE adds. Plain `git log -p` shows no diff for a merge, so a conflict resolution could add a
+# secret unseen. remerge (git 2.36+) shows only what the resolution changed against git's own
+# merge of the parents, without re-flagging an already-published two-parent merge; but it only
+# diffs two-parent merges, so an octopus merge (3+ parents) would still pass unseen. -m, used
+# whenever RANGE holds an octopus merge (or on git before 2.36), shows each parent's whole side
+# again instead (safe, but noisier, and it would re-flag an already-published two-parent merge).
 dotsync_merge_diffs() {
-  if git log -1 --format= --diff-merges=remerge HEAD >/dev/null 2>&1; then
+  if git log -1 --format= --diff-merges=remerge HEAD >/dev/null 2>&1 &&
+      [[ -z "$(git rev-list --merges --min-parents=3 "$1" 2>/dev/null)" ]]; then
     echo --diff-merges=remerge
   else
     echo -m
@@ -339,7 +343,7 @@ dotsync_scan_outgoing() {
     echo 'dotsync: gitleaks is required to push; refusing to push' >&2
     return 1
   fi
-  opts="$(dotsync_merge_diffs) $1"
+  opts="$(dotsync_merge_diffs "$1") $1"
   if ! gitleaks git --redact --no-banner --log-opts="$opts" . >/dev/null 2>&1; then
     echo "dotsync: gitleaks found a potential secret in the commits to push ($1), or could not finish; refusing to push" >&2
     echo "dotsync:   run: gitleaks git --redact --verbose --log-opts='$opts' ." >&2

@@ -147,9 +147,12 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
   # conflict resolution adds would pass. remerge (git 2.36+) shows just what the
   # resolution changed against git's own merge of the parents, so a clean merge
   # of published commits is not rescanned; older git falls back to -m (each
-  # parent's whole side: safe, but noisier).
+  # parent's whole side: safe, but noisier). remerge only diffs two-parent
+  # merges, so an octopus merge (3+ parents) in range also falls back to -m.
   merge_diffs=-m
-  if git log -1 --format= --diff-merges=remerge "$local_sha" >/dev/null 2>&1; then
+  # shellcheck disable=SC2086  # log_opts is a deliberately unquoted set of rev-list arguments
+  if git log -1 --format= --diff-merges=remerge "$local_sha" >/dev/null 2>&1 &&
+      [[ -z "$(git rev-list --merges --min-parents=3 $log_opts 2>/dev/null)" ]]; then
     merge_diffs=--diff-merges=remerge
   fi
   echo "pre-push: scanning outgoing history with gitleaks" >&2
