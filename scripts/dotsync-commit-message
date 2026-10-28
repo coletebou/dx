@@ -455,14 +455,21 @@ class Cancelled(Exception):
         self.signum = signum
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
 def stop_group(process):
     """TERM the provider's process group, then KILL whatever is left of it, and reap the leader.
 
     A provider is a shell that may start an agent, which may start more: all of them share the
-    group, and none may outlive the call (paid work included)."""
+    group, and none may outlive the call (paid work included). TERM, INT and HUP are ignored from
+    here on (the caller restores its handlers): GNU timeout follows its TERM to this helper with
+    a second one to the helper's group, and that must not cut the cleanup short of the KILL."""
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     try:
         process.wait(timeout=2)
@@ -470,7 +477,7 @@ def stop_group(process):
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     process.wait()
 
@@ -489,7 +496,7 @@ def ask_command(summary, timeout):
 
     def cancelled(signum, _frame):
         raise Cancelled(signum)
-    previous = {signum: signal.signal(signum, cancelled) for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    previous = {signum: signal.signal(signum, cancelled) for signum in STOP_SIGNALS}
     try:
         output, _ = process.communicate(input=prompt.encode(), timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -498,14 +505,11 @@ def ask_command(summary, timeout):
     except Cancelled:
         stop_group(process)
         raise
+    else:
+        stop_group(process)  # the leader exited; anything it left behind in its group goes too
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-    # The leader exited; anything it left behind in its group goes too.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
     if process.returncode != 0:
         raise ModelError("command exited %d" % process.returncode)
     return parse_text(output.decode("utf-8", "replace")[:8192])

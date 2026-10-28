@@ -350,6 +350,28 @@ class CommitMessageTest(unittest.TestCase):
         self.assertEqual(out, b"")
         self.assertTrue(self.gone_within(pid), "the provider's child outlived the cancelled helper")
 
+    def test_a_second_term_during_the_cleanup_does_not_spare_the_provider(self):
+        # GNU timeout sends TERM to the helper, then again to its group. The provider's shell
+        # (the group leader, through exec) takes a second to exit on TERM, so the second one
+        # lands while the helper waits for it, before the KILL that stops the child.
+        self.write("scripts/tool", "change\n")
+        self.git("add", "-A")
+        pidfile = self.root / "provider-child.pid"
+        script = self.root / "slow-exit-provider.sh"
+        script.write_text("#!/bin/sh\ncat >/dev/null\ntrap 'trap \"\" TERM; sleep 1; exit 1' TERM\n"
+                          "( trap '' TERM; exec sleep 120 ) &\necho $! > %s\nwait\nsleep 120\n" % pidfile)
+        script.chmod(0o755)
+        env = dict(self.env, DOTSYNC_COMMIT_MESSAGE_PROVIDER="command", DOTSYNC_COMMIT_MESSAGE_CMD="exec %s" % script)
+        helper = subprocess.Popen([sys.executable, str(HELPER), "describe", "--host", "box-a", "--staged", "--timeout", "100"],
+                                  cwd=self.repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pid = self.child_pid(pidfile)
+        helper.terminate()
+        time.sleep(0.4)
+        helper.terminate()
+        helper.communicate(timeout=30)
+        self.assertNotEqual(helper.returncode, 0)
+        self.assertTrue(self.gone_within(pid), "a second TERM during the cleanup left the provider's child running")
+
     # ── composing and redaction ──
     def test_generic_subjects_and_hosts(self):
         self.assertTrue(cm.is_generic("chore(sync): box-a update base, scripts"))
