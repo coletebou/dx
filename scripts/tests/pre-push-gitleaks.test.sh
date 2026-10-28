@@ -41,16 +41,16 @@ run_hook() {
 }
 
 GITLEAKS_FAKE_EXIT=0 run_hook "$zero_sha"
-grep -qF -- "--log-opts=$head_sha --not --remotes=origin ." "$TMP/args"
+grep -qF -- "--log-opts=--diff-merges=remerge $head_sha --not --remotes=origin ." "$TMP/args"
 
 
 GITLEAKS_FAKE_EXIT=0 run_hook "$first_sha"
 # $2 is not a reachable URL here, so the advertisement is unavailable and
 # the existing-ref scan keeps its original range.
-grep -qF -- "--log-opts=$first_sha..$head_sha ." "$TMP/args"
+grep -qF -- "--log-opts=--diff-merges=remerge $first_sha..$head_sha ." "$TMP/args"
 
 GITLEAKS_FAKE_EXIT=0 run_hook "$unknown_sha"
-grep -qF -- "--log-opts=$head_sha ." "$TMP/args"
+grep -qF -- "--log-opts=--diff-merges=remerge $head_sha ." "$TMP/args"
 if grep -qF -- '--not' "$TMP/args"; then
   echo "pre-push test: missing remote tip did not scan the full tip" >&2
   exit 1
@@ -96,7 +96,7 @@ if ! GITLEAKS_RENDEZVOUS="$TMP/gate-started" run_tree_hook; then
   exit 1
 fi
 grep -qF "stub gate checked $head_sha" "$TMP/hook-err"
-grep -qF -- "--log-opts=$first_sha..$head_sha ." "$TMP/args"
+grep -qF -- "--log-opts=--diff-merges=remerge $first_sha..$head_sha ." "$TMP/args"
 rc=0; GATE_EXIT=3 run_tree_hook || rc=$?
 if [[ "$rc" -ne 3 ]] || ! grep -qF "stub gate checked" "$TMP/hook-err"; then
   echo "pre-push test: a failing memory gate did not block with its status and output (rc=$rc)" >&2
@@ -117,7 +117,7 @@ if ! run_tree_hook; then
   echo "pre-push test: a missing (optional) memory gate blocked the push" >&2
   exit 1
 fi
-grep -qF -- "--log-opts=$first_sha..$head_sha ." "$TMP/args"
+grep -qF -- "--log-opts=--diff-merges=remerge $first_sha..$head_sha ." "$TMP/args"
 if grep -qF "stub gate" "$TMP/hook-err"; then
   echo "pre-push test: a removed memory gate still ran" >&2
   exit 1
@@ -177,6 +177,22 @@ if command -v gitleaks >/dev/null 2>&1; then
     exit 1
   fi
   w reset -q --hard HEAD~1
+  # Variant 2b: a finding that only a merge's conflict resolution adds (in neither
+  # parent) still blocks; plain `git log -p` shows no diff for a merge.
+  w switch -qc resolve-side deploy
+  printf 'side\n' > "$R/work/notes.txt"
+  w add notes.txt && w commit -qm 'resolve-side: notes'
+  w switch -q deploy
+  printf 'deploy\n' > "$R/work/notes.txt"
+  w add notes.txt && w commit -qm 'deploy: notes'
+  w merge -q resolve-side >/dev/null 2>&1 || true
+  printf 'resolved = "%s"\n' "$(token)" > "$R/work/notes.txt"
+  w add notes.txt && w commit -q --no-edit
+  if push_deploy; then
+    echo "pre-push test: a finding added only by a merge resolution did not block" >&2
+    exit 1
+  fi
+  w reset -q --hard HEAD~2
   # Variant 3: stale tracking ref. The remote was reset to drop a leaked commit
   # but this clone still tracks it; re-publishing it must still be scanned.
   w switch -qc leak master

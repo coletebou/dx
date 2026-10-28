@@ -143,9 +143,18 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     fi
   fi
 
+  # Plain `git log -p` shows no diff for a merge, so a secret that only a
+  # conflict resolution adds would pass. remerge (git 2.36+) shows just what the
+  # resolution changed against git's own merge of the parents, so a clean merge
+  # of published commits is not rescanned; older git falls back to -m (each
+  # parent's whole side: safe, but noisier).
+  merge_diffs=-m
+  if git log -1 --format= --diff-merges=remerge "$local_sha" >/dev/null 2>&1; then
+    merge_diffs=--diff-merges=remerge
+  fi
   echo "pre-push: scanning outgoing history with gitleaks" >&2
   if ! "$GITLEAKS_BIN" git --no-banner --no-color --redact \
-      --log-opts="$log_opts" .; then
+      --log-opts="$merge_diffs $log_opts" .; then
     echo "pre-push: gitleaks found a potential secret; push blocked" >&2
     exit 1
   fi
