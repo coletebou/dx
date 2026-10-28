@@ -233,8 +233,30 @@ codesync_machine() {
 }
 
 # ── timeouts ─────────────────────────────────────────────────────────────
+# codesync_kill_tree SIGNAL PID: that process and every descendant it has forked, deepest
+# first. A plain `kill PID` leaves grandchildren running (ssh, or a shell it spawned) as
+# orphans once PID dies, and an orphan that still holds this script's stdout or stderr open
+# (a pane, a CI step's log pipe) can block whoever is reading it long after PID is gone.
+# `ps -A -o pid=,ppid=` is the one table format POSIX guarantees on both GNU and BSD ps (BSD's
+# `-e` means something else, so `-A` is used for "every process"; the empty `=` suppresses the
+# header on both).
+codesync_kill_tree() {
+    local sig="$1" pid="$2" table kid
+    # Find descendants on a best-effort basis: without ps (a minimal PATH, a sandboxed peer),
+    # there is nothing to walk, but PID itself must still be signaled either way.
+    table="$(ps -A -o pid=,ppid= 2>/dev/null)" || table=""
+    if [[ -n "$table" ]]; then
+        while IFS= read -r kid; do
+            [[ -n "$kid" && "$kid" != "$pid" ]] || continue
+            codesync_kill_tree "$sig" "$kid"
+        done <<<"$(printf '%s\n' "$table" | awk -v p="$pid" '$2 == p { print $1 }')"
+    fi
+    kill -s "$sig" "$pid" 2>/dev/null || true
+}
+
 # codesync_timeout SECONDS COMMAND...: exit 124 when COMMAND outlives SECONDS. GNU timeout (or
-# gtimeout) when there is one, else a watchdog. Standard input reaches COMMAND either way.
+# gtimeout) when there is one, else a watchdog. Standard input reaches COMMAND either way. Every
+# path kills COMMAND's whole process tree, not just the one pid it started as.
 codesync_timeout() {
     local secs="$1" pid watchdog rc=0 marker
     shift
@@ -256,17 +278,23 @@ codesync_timeout() {
         wait "$s"
         if kill -0 "$pid" 2>/dev/null; then
             echo timeout > "$marker"
-            kill -TERM "$pid" 2>/dev/null
+            codesync_kill_tree TERM "$pid"
             sleep 5 & s=$!
             wait "$s"
-            kill -KILL "$pid" 2>/dev/null
+            codesync_kill_tree KILL "$pid"
         fi
     ) </dev/null >/dev/null 2>&1 &
     watchdog=$!
-    wait "$pid" || rc=$?
+    # bash 3.2 reports a job it waited on and that died by signal ("Terminated") on its own
+    # stderr, even outside an interactive shell; braces keep that out of the caller's capture.
+    { wait "$pid" || rc=$?; } 2>/dev/null
     kill -TERM "$watchdog" 2>/dev/null || true
-    wait "$watchdog" 2>/dev/null || true
-    if [[ -s "$marker" ]]; then rc=124; fi
+    { wait "$watchdog" || true; } 2>/dev/null
+    if [[ -s "$marker" ]]; then
+        rc=124
+        # The watchdog signaled the tree already; a straggler it raced past still gets the kill.
+        codesync_kill_tree KILL "$pid"
+    fi
     rm -f "$marker"
     return "$rc"
 }
