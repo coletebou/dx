@@ -674,6 +674,7 @@ echo "ordinary detail"
             'printf "%%s\\n" "$cmd" >> %s\n'
             'if [ "${DOTSYNC_TEST_FETCH_FAIL:-0}" = 1 ] && [ "$cmd" = fetch ]; then exit 42; fi\n'
             'if [ "${DOTSYNC_TEST_FETCH_NOOP:-0}" = 1 ] && [ "$cmd" = fetch ]; then exit 0; fi\n'
+            'if [ "${DOTSYNC_TEST_LSREMOTE_FAIL:-0}" = 1 ] && [ "$cmd" = ls-remote ]; then exit 128; fi\n'
             'exec %s "$@"\n' % (log, GIT))
         (bin_dir / "git").chmod(0o755)
         env = self.guard_env(DOTSYNC_NO_INSTALL="1")
@@ -784,9 +785,57 @@ echo "ordinary detail"
         self.assertEqual(result.returncode, 0, diagnostic)
         outgoing = [line for line in scans.read_text().splitlines() if "--log-opts" in line]
         self.assertEqual(len(outgoing), 1, outgoing)
-        self.assertIn("--log-opts=%s..HEAD" % destination, outgoing[0], "the commit the remote lacks was not scanned")
+        self.assertIn("--log-opts=--diff-merges=remerge %s..HEAD" % destination, outgoing[0], "the commit the remote lacks was not scanned")
         republished = subprocess.run([GIT, "-C", str(origin), "merge-base", "--is-ancestor", withdrawn, "master"], env=self.env)
         self.assertEqual(republished.returncode, 0, "the push sends the withdrawn commit, so the scan had to cover it")
+
+    def test_a_push_whose_destination_cannot_be_read_is_refused(self):
+        # The remote deleted the branch (dropping a commit); this clone's tracking ref still has
+        # it, and ls-remote fails. A push would recreate the branch with that commit unscanned.
+        origin, env, log = self.full_fixture()
+        writer = self.root / "writer"
+        self.git("clone", "-q", str(origin), str(writer), repo=self.root)
+        (writer / "withdrawn").write_text("published, then withdrawn\n")
+        self.git("add", "withdrawn", repo=writer)
+        self.git("commit", "-qm", "withdrawn", repo=writer)
+        self.git("push", "-q", "origin", "master", repo=writer)
+        self.git("pull", "-q", "--ff-only")
+        self.git("update-ref", "-d", "refs/heads/master", repo=origin)
+        (self.repo / "payload").write_text("local work\n")
+        env = dict(env, DOTSYNC_TEST_FETCH_NOOP="1", DOTSYNC_TEST_LSREMOTE_FAIL="1")
+        result, heartbeat, diagnostic = self.run_full(env)
+        self.assertEqual((result.returncode, heartbeat["phase"]), (1, "push-destination"), diagnostic)
+        self.assertIn("could not read", diagnostic)
+        self.assertEqual(self.git("for-each-ref", "refs/heads", repo=origin), "", "the branch was recreated unscanned")
+
+    @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks is not installed")
+    def test_a_token_only_a_merge_resolution_adds_is_never_pushed(self):
+        origin, env, log = self.full_fixture()
+        env = dict(env, PATH=os.pathsep.join((str(self.root / "log-bin"), str(self.root / "guard-bin"), self.env["PATH"])))
+        before = self.git("rev-parse", "master", repo=origin)
+        # With rebase.rebaseMerges a merge survives dotsync's rebase (without it git flattens the
+        # history), so the merge itself reaches the push.
+        self.git("config", "rebase.rebaseMerges", "true")
+        (self.repo / "notes").write_text("base\n")
+        self.git("add", "notes")
+        self.git("commit", "-qm", "notes")
+        self.git("switch", "-qc", "side")
+        (self.repo / "notes").write_text("side\n")
+        self.git("commit", "-qam", "side")
+        self.git("switch", "-q", "master")
+        (self.repo / "notes").write_text("main\n")
+        self.git("commit", "-qam", "main")
+        self.git("merge", "-q", "side", check=False)
+        import secrets
+        import string
+        token = "gh" + "p_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36))
+        (self.repo / "notes").write_text("export GITHUB_TOKEN=%s\n" % token)
+        self.git("add", "notes")
+        self.git("commit", "-q", "--no-edit")
+        result, heartbeat, diagnostic = self.run_full(env)
+        self.assertEqual((result.returncode, heartbeat["phase"]), (1, "secret-scan"), diagnostic)
+        self.assertNotIn(token, result.stdout + diagnostic)
+        self.assertEqual(self.git("rev-parse", "master", repo=origin), before, "the merge was published")
 
     def test_pull_only_never_commits_or_pushes(self):
         origin, env, log = self.full_fixture()

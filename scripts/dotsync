@@ -715,10 +715,11 @@ else
     }
     # Another machine often pushes between this fetch and this push. One ls-remote catches the
     # race before the push, and names what the destination has: push_base, its tip once that is
-    # an ancestor of HEAD (empty: unknown), or push_new_branch=1 when it has no such branch.
+    # an ancestor of HEAD, or push_new_branch=1 when it has no such branch. When neither can be
+    # established, push_unknown says why and nothing is pushed: the scan needs a known base.
     push_preflight() {
       local remote_tip="" tip_rc=0
-      push_base="" push_new_branch=0
+      push_base="" push_new_branch=0 push_unknown=""
       if [[ -n "${preflight_pid:-}" ]]; then
         wait "$preflight_pid" 2>/dev/null || true
         preflight_pid=""
@@ -730,15 +731,16 @@ else
         remote_tip="$(push_preflight_ls_remote)" || tip_rc=$?
       fi
       case "$tip_rc" in
-        0) [[ -n "$remote_tip" ]] || return 0 ;;
+        0) [[ -n "$remote_tip" ]] || { push_unknown="could not read its tip"; return 0; } ;;
         2) push_new_branch=1; return 0 ;;
-        *) return 0 ;;
+        *) push_unknown="could not read its tip (ls-remote exit $tip_rc)"; return 0 ;;
       esac
       if ! git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null; then
         dotsync_timeout "$DOTSYNC_GIT_TIMEOUT" git ${dotsync_ssh_command:+-c "core.sshCommand=$dotsync_ssh_command"} \
-          fetch --quiet </dev/null 9>&- || return 0
+          fetch --quiet </dev/null 9>&- || { push_unknown="could not fetch its new tip"; return 0; }
         git rebase --quiet "$upstream" </dev/null || { git rebase --abort 2>/dev/null; return 1; }
-        git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null || return 0
+        git merge-base --is-ancestor "$remote_tip" HEAD 2>/dev/null ||
+          { push_unknown="its tip is not in this branch after a rebase"; return 0; }
       fi
       push_base="$remote_tip"
     }
@@ -798,17 +800,19 @@ else
         fi
         push_first=0
         push_preflight || push_first=1
-        # Scan exactly what the push publishes: what the destination's branch lacks; all of HEAD
-        # when it has no such branch; what the upstream lacks when it could not say.
+        # Scan exactly what the push publishes: what the destination's branch lacks, or all of
+        # HEAD when it has no such branch. A destination that cannot say gets nothing: a stale
+        # upstream ref is no stand-in (its branch may be gone, and with it what was withdrawn).
         if [[ "$push_new_branch" -eq 1 ]]; then
           scan_range=HEAD
-        elif [[ -n "$push_base" ]]; then
-          scan_range="$push_base..HEAD"
         else
-          scan_range="$upstream..HEAD"
+          scan_range="$push_base..HEAD"
         fi
-        DOTSYNC_PHASE=secret-scan
-        if ! dotsync_scan_outgoing "$scan_range"; then
+        if [[ -n "$push_unknown" ]]; then
+          push_failed=1
+          dotsync_fail push-destination
+          echo "dotsync: refusing to push to $push_remote $push_ref: $push_unknown; local commits kept" >&2
+        elif DOTSYNC_PHASE=secret-scan; ! dotsync_scan_outgoing "$scan_range"; then
           push_failed=1
           dotsync_fail secret-scan
         else

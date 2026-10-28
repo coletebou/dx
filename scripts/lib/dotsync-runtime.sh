@@ -319,16 +319,30 @@ dotsync_scan_staged() {
   fi
 }
 
+# dotsync_merge_diffs: the git log option that shows gitleaks what each merge commit adds. Plain
+# `git log -p` shows no diff for a merge, so a conflict resolution could add a secret unseen.
+# remerge (git 2.36+) shows only what the resolution changed against git's own merge of the
+# parents; -m, the fallback, shows each parent's whole side again (safe, but noisier).
+dotsync_merge_diffs() {
+  if git log -1 --format= --diff-merges=remerge HEAD >/dev/null 2>&1; then
+    echo --diff-merges=remerge
+  else
+    echo -m
+  fi
+}
+
 # dotsync_scan_outgoing RANGE: the commits a push would publish, including ones made by hand
-# with hooks skipped.
+# with hooks skipped, and what any merge among them adds.
 dotsync_scan_outgoing() {
+  local opts
   if ! command -v gitleaks >/dev/null 2>&1; then
     echo 'dotsync: gitleaks is required to push; refusing to push' >&2
     return 1
   fi
-  if ! gitleaks git --redact --no-banner --log-opts="$1" . >/dev/null 2>&1; then
+  opts="$(dotsync_merge_diffs) $1"
+  if ! gitleaks git --redact --no-banner --log-opts="$opts" . >/dev/null 2>&1; then
     echo "dotsync: gitleaks found a potential secret in the commits to push ($1), or could not finish; refusing to push" >&2
-    echo "dotsync:   run: gitleaks git --redact --verbose --log-opts='$1' ." >&2
+    echo "dotsync:   run: gitleaks git --redact --verbose --log-opts='$opts' ." >&2
     return 1
   fi
 }
