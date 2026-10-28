@@ -325,6 +325,8 @@ rm -f "$tmp/stub-calls"
 fi
 
 if section nvme "nvme: instance-store detection against a fake /sys, /dev, mountinfo, lsblk and nvme"; then
+me="$(id -un)"   # the user a per-user bind is for: its ownership is checked for real
+me="$(id -un)"   # the user a per-user bind is for: ownership is checked for real
 fake_nvme_tools() {  # fake lsblk, nvme, blkid, wipefs, mkfs.ext4, mount, chown, swapon in $1/bin
     local d="$1"
     mkdir -p "$d/bin" "$d/lsblk" "$d/idctrl"
@@ -340,9 +342,11 @@ EOF
 f="$d/idctrl/\$(basename "\$2").json"
 [ "\$1" = id-ctrl ] && [ -f "\$f" ] && cat "\$f" || exit 1
 EOF
-    for t in mkfs.ext4 swapon fallocate mkswap chown; do
+    for t in mkfs.ext4 swapon fallocate mkswap chown umount; do
         printf '#!/bin/sh\necho "%s $*" >> "%s/calls"\n' "$t" "$d" > "$d/bin/$t"
     done
+    # getent knows one user, the one running the tests, at /home/<name>.
+    printf '#!/bin/sh\n[ "$1 $2" = "passwd %s" ] || exit 2\necho "%s:x:1000:1000::/home/%s:/bin/sh"\n' "$me" "$me" "$me" > "$d/bin/getent"
     printf '#!/bin/sh\necho "blkid $*" >> "%s/calls"\nexit "${FAKE_BLKID_RC:-2}"\n' "$d" > "$d/bin/blkid"
     printf '#!/bin/sh\necho "wipefs $*" >> "%s/calls"\nprintf "%%s" "${FAKE_WIPEFS_OUT:-}"\n' "$d" > "$d/bin/wipefs"
     # mount records what the kernel would: a line of mountinfo, the disk's own mount with root "/",
@@ -354,7 +358,8 @@ for a in "\$@"; do last="\$a"; done
 if [ "\$1" = --bind ]; then
     base="$d/root/srv/nvme"
     devno="\$(awk -v m="\$base" '\$5 == m { print \$3; exit }' "$d/mountinfo")"
-    echo "90 1 \${devno:-0:0} \${2#\$base} \$last rw - ext4 bind rw" >> "$d/mountinfo"
+    # FAKE_MOUNT_LANDS_AT: where a bind lands when its target was swapped for a symlink in time.
+    echo "90 1 \${devno:-0:0} \${2#\$base} \${FAKE_MOUNT_LANDS_AT:-\$last} rw - ext4 bind rw" >> "$d/mountinfo"
 else
     devno="\$(cat "$d/sys/block/\$(basename "\$3")/dev")"
     echo "80 1 \$devno / \$last rw,noatime - ext4 \$3 rw" >> "$d/mountinfo"
@@ -485,33 +490,60 @@ equal "...and its data is still on the root disk" old "$(cat "$r/root/var/lib/do
 
 newroot cache
 disk "$r" nvme1n1 "$IS" AWSA
-mkdir -p "$r/root/home/sam"
-out="$(NVME_BINDS="/var/lib/docker /home/sam/.cache:sam" nv "$r" apply --provisioning)"; rc=$?
+uh="$r/root/home/$me" uc="$r/root/home/$me/.cache" usrc="$r/root/srv/nvme/binds/home_${me}_.cache"
+mkdir -p "$uh"
+out="$(NVME_BINDS="/var/lib/docker /home/$me/.cache:$me" nv "$r" apply --provisioning)"; rc=$?
 calls="$(cat "$r/calls" 2>/dev/null)"
 equal "a per-user cache binds" 0 "$rc"
-check "...a missing cache is created as the user's" "chown sam: $r/root/home/sam/.cache" "$calls"
-check "...and so is its place on the disk, which the bind shows in their home" \
-    "chown sam: $r/root/srv/nvme/binds/home_sam_.cache" "$calls"
-check "...and the owner stays on record for the boot unit" "binds: /var/lib/docker /home/sam/.cache:sam" "$out"
-rm -rf "$r/calls" "$r/root/srv/nvme/binds/home_sam_.cache" && : > "$r/mountinfo"   # a stop and start
-out="$(NVME_BINDS="/var/lib/docker /home/sam/.cache:sam" nv "$r" apply)"
-check "after a stop and start the new place on the disk is the user's again" \
-    "chown sam: $r/root/srv/nvme/binds/home_sam_.cache" "$(cat "$r/calls" 2>/dev/null)"
-lacks "...and a system directory's place is never given to a user" "chown sam: $r/root/srv/nvme/binds/var_lib_docker" "$(cat "$r/calls" 2>/dev/null)"
+equal "...a missing cache is created by the user (theirs, mode 700)" "$me 700" \
+    "$(stat -c '%U %a' "$uc" 2>/dev/null || stat -f '%Su %Lp' "$uc" 2>/dev/null)"
+check "...its place on the disk, which the bind shows in their home, is given to them" "chown $me: $usrc" "$calls"
+check "...and the owner stays on record for the boot unit" "binds: /var/lib/docker /home/$me/.cache:$me" "$out"
+rm -f "$r/calls"
+out="$(NVME_BINDS="/var/lib/docker /home/$me/.cache:$me" nv "$r" apply)"; rc=$?
+equal "a rerun with the cache already bound succeeds" 0 "$rc"
+check "...and gives its place on the disk to the user again (an older run left it root's)" "chown $me: $usrc" "$(cat "$r/calls" 2>/dev/null)"
+rm -rf "$r/calls" "$usrc" && : > "$r/mountinfo"   # a stop and start
+out="$(NVME_BINDS="/var/lib/docker /home/$me/.cache:$me" nv "$r" apply)"
+check "after a stop and start the new place on the disk is the user's again" "chown $me: $usrc" "$(cat "$r/calls" 2>/dev/null)"
+lacks "...and a system directory's place is never given to a user" "chown $me: $r/root/srv/nvme/binds/var_lib_docker" "$(cat "$r/calls" 2>/dev/null)"
+
+newroot symlink
+disk "$r" nvme1n1 "$IS" AWSA
+mkdir -p "$r/root/home/$me" "$r/root/etc" && printf 'root-trusted\n' > "$r/root/etc/passwd"
+ln -s /etc "$r/root/home/$me/.cache"
+out="$(NVME_BINDS="/home/$me/.cache:$me" nv "$r" apply)"; rc=$?
+calls="$(cat "$r/calls" 2>/dev/null)"
+check "a cache the user replaced with a symlink to /etc is refused" "is a symlink or not a directory; not binding it" "$out"
+lacks "...nothing is bound onto it (or through it, onto /etc)" "mount --bind" "$calls"
+lacks "...and nothing is given to the user" "chown $me:" "$calls"
+equal "...and it is not recorded as bound" "binds:" "$(printf '%s\n' "$out" | grep '^binds:')"
+rm -f "$r/root/home/$me/.cache" "$r/calls"
+mkdir -p "$r/root/home/$me/real"
+ln -s real "$r/root/home/$me/via"
+out="$(NVME_BINDS="/home/$me/via/cache:$me" nv "$r" apply)"
+check "a directory reached through a symlink inside the home is refused too" "leads through a symlink" "$out"
+lacks "...unbound" "mount --bind" "$(cat "$r/calls" 2>/dev/null)"
+out="$(NVME_BINDS="/etc/cache:$me" nv "$r" apply)"
+check "so is one outside the user's home" "is not inside $me's home" "$out"
+rm -f "$r/calls" && : > "$r/mountinfo"
+out="$(FAKE_MOUNT_LANDS_AT=/etc NVME_BINDS="/home/$me/.cache:$me" nv "$r" apply)"; rc=$?
+equal "a bind that lands somewhere else (a symlink swapped in after the checks) fails" 1 "$rc"
+check "...and is undone at once" "umount -l -- /etc" "$(cat "$r/calls" 2>/dev/null)"
 
 # step_nvme_apply as provision runs it, as a root that writes under a scratch root.
 newroot provision
 disk "$r" nvme1n1 "$IS" AWSA
-mkdir -p "$r/root/home/sam" "$r/sys-root"
+mkdir -p "$r/root/home/$me" "$r/sys-root"
 out="$(cd "$tmp/harness" && PATH="$r/bin:$PATH" NVME_SYSFS="$r/sys" NVME_DEV="$r/dev" NVME_ROOT="$r/root" \
     NVME_TEST_MODE=1 NVME_MOUNTINFO="$r/mountinfo" NVME_SWAP_GB=0 bash -c '
     set -Eeuo pipefail; . "$1/harness.sh"; . "$1/system.sh"; . "$1/nvme.sh"; . "$1/docker.sh"
     as_root() { "$@"; }; has_systemd() { return 1; }
-    BOOTSTRAP_SYSROOT="$2" BOOTSTRAP_LIB="$1" BOOTSTRAP_NVME=1 NVME_PRESENT=1 TARGET_USER=sam TARGET_HOME=/home/sam
-    run_step nvme.apply step_nvme_apply' bash "$lib" "$r/sys-root" 2>&1)"; rc=$?
+    BOOTSTRAP_SYSROOT="$2" BOOTSTRAP_LIB="$1" BOOTSTRAP_NVME=1 NVME_PRESENT=1 TARGET_USER="$3" TARGET_HOME="/home/$3"
+    run_step nvme.apply step_nvme_apply' bash "$lib" "$r/sys-root" "$me" 2>&1)"; rc=$?
 equal "--nvme as provision runs it succeeds" 0 "$rc"
-check "...giving the user's cache to the user" "chown sam: $r/root/home/sam/.cache" "$(cat "$r/calls" 2>/dev/null)"
-check "...and recording it, with its owner, for the boot unit" '/home/sam/.cache:sam' "$(cat "$r/sys-root/etc/default/dx-nvme" 2>&1)"
+check "...giving the user's cache's place on the disk to the user" "chown $me: $r/root/srv/nvme/binds/home_${me}_.cache" "$(cat "$r/calls" 2>/dev/null)"
+check "...and recording it, with its owner, for the boot unit" "/home/$me/.cache:$me" "$(cat "$r/sys-root/etc/default/dx-nvme" 2>&1)"
 equal "...which it installs" yes "$( [ -x "$r/sys-root/usr/local/sbin/dx-nvme-setup" ] && echo yes)"
 
 newroot unusable

@@ -152,10 +152,17 @@ finds; with `--nvme` (or `--ec2`) it uses one.
   `wipefs`) and refuses if either finds anything.
 - **What goes there.** `/srv/nvme` holds bind mounts for `/var/lib/docker`, `/var/lib/containerd`
   and the user's `~/.cache` (`NVME_BINDS` lists them; an entry `DIR:USER` is a directory of USER's,
-  created as theirs when missing, with its place on the disk given to them on every run), and an
-  8 GB swap file (`NVME_SWAP_GB`, 0 for none). The phase runs before Docker is installed, so
-  Docker's data starts out there. A target that already holds data is left on the root disk, with a
-  warning.
+  created by them when missing, with its place on the disk given to them on every run, a run that
+  finds it already bound included), and an 8 GB swap file (`NVME_SWAP_GB`, 0 for none). The phase
+  runs before Docker is installed, so Docker's data starts out there. A target that already holds
+  data is left on the root disk, with a warning.
+- **A user's directory is never trusted as a path.** Root binding onto a path the user controls
+  would follow a symlink they put there (say `~/.cache` pointing at `/etc`) and lay a directory they
+  own over a system one. So a `DIR:USER` target is bound only when it is a real directory inside the
+  user's home, reached through no symlink below the home and owned by the user; otherwise it is
+  skipped with a warning. After the bind, where the mount really landed is checked in mountinfo,
+  and a bind that landed anywhere else (a symlink swapped in between the check and the mount) is
+  undone and the run fails.
 - **Where it is mounted** is read from `/proc/self/mountinfo`, which tells the disk's own mount from
   the bind mounts made from it (lsblk names only one of the places a disk is mounted), so a second
   run, or the boot unit run again, finds its disk in place.
