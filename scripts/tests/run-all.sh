@@ -23,10 +23,17 @@ selected() {
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 passed=0 failed=0 failures=""
+# A suite that hangs fails after RUN_ALL_SUITE_TIMEOUT seconds (default 30 min) instead of
+# holding the whole run until CI's job timeout. perl's alarm survives the exec on macOS and Linux.
+suite_timeout="${RUN_ALL_SUITE_TIMEOUT:-1800}"
 run() {  # run NAME COMMAND...
-  local name="$1" start=$SECONDS; shift
+  local name="$1" start=$SECONDS rc; shift
   printf '%-48s ' "$name"
-  if "$@" >"$log" 2>&1; then
+  # The braces keep bash's own "Alarm clock" notice out of the summary.
+  { perl -e 'alarm shift @ARGV; exec @ARGV or die "exec: $!\n"' "$suite_timeout" "$@" >"$log" 2>&1; rc=$?; } 2>/dev/null
+  # SIGALRM (14) ends the suite with status 128+14.
+  (( rc == 142 )) && printf '\nrun-all: %s did not finish within %ss; stopped\n' "$name" "$suite_timeout" >>"$log"
+  if (( rc == 0 )); then
     printf 'ok    %3ss\n' "$((SECONDS - start))"; passed=$((passed + 1))
   else
     printf 'FAIL  %3ss\n' "$((SECONDS - start))"; failed=$((failed + 1)); failures="$failures $name"
