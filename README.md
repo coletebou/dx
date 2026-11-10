@@ -168,7 +168,9 @@ scripts/bootstrap/                the server provisioner, its modules and pinned
 
 - macOS or Linux (WSL works), zsh, git, and bash (macOS's stock 3.2 is fine for the installer
   and most scripts; `session-analyzer` and `tmux-apply-plan` need bash 4 or newer).
-- tmux 3.4 or newer, jq, Python 3, and [Claude Code](https://code.claude.com).
+- tmux 3.4 or newer, jq, Python 3, and [Claude Code](https://code.claude.com). `tmux.conf`
+  loads cleanly on 3.4 and turns on what newer releases add: CSI u key encoding from 3.5, and
+  from 3.7 a second status row of recent sessions and a preview line in the window chooser.
 - Optional: Codex CLI, [gitleaks](https://github.com/gitleaks/gitleaks) (the git hooks and dotsync refuse
   to run without it), starship, fzf, and Node 24 for `mcp-agent-safety` and the `node-tools`
   component. On a Mac, the `Brewfile` covers most of these.
