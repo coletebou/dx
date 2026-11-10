@@ -27,7 +27,13 @@ load() { HOME="$tmp/home" tmux source-file "$CONF" >/dev/null 2>&1; }
 count() { tmux show-options -s "$1" | wc -l | tr -d ' '; }
 
 HOME="$tmp/home" tmux -f /dev/null new-session -d -s t -x 156 -y 38 'sleep 300'
-load
+
+printf 'load\n'
+# The README promises tmux 3.4, the floor CI's Ubuntu runner ships, so every
+# newer option must be guarded. An unguarded one prints "invalid option" on
+# every start and reload. TPM's own failure is the only error expected.
+errors=$(HOME="$tmp/home" tmux source-file "$CONF" 2>&1 | grep -vi tpm)
+equal "tmux.conf loads without errors on $(tmux -V)" "" "$errors"
 w=$(tmux display-message -p -t t: '#{window_id}')
 
 printf 'reload\n'
