@@ -67,7 +67,7 @@ installer stops and tells you your options.
 | [`tmux`](plugins/tmux) | `tmux-archive`, `tmux-organize` | Snapshot every pane with links to its agent and transcript; rename and regroup windows from what is in them, without ever killing a pane. |
 | [`memory`](plugins/memory) | `reflect`, `dreaming`, `session-analyzer` | End-of-session retrospectives, nightly memory consolidation, and a transcript scan for unfinished work and repeated corrections. |
 | [`codex`](plugins/codex) | `codex-subagents`, `codex-transcripts` | Fan out Codex subagents through tmux; read what a Codex agent really did from its transcript. |
-| [`review`](plugins/review) | `adversarial-review`, `mcp-agent-safety`, `fable-second-opinion` | Reviews where every finding must survive refuters; a canary harness proving an MCP server cannot leak its secrets; a second-opinion advisor in its own tmux window. |
+| [`review`](plugins/review) | `adversarial-review`, `mcp-agent-safety`, `fable-second-opinion` | Reviews where every finding must survive refuters; a canary harness proving an MCP server cannot leak its secrets; a second-opinion advisor in its own tmux window. Fable is one of Anthropic's Claude models, and here it names that advisor: a second Claude Code session with a fresh context, on Fable or any model you launch it with, that reviews the first session's work independently. |
 | [`toolbox`](plugins/toolbox) | `disk-reclaim`, `shipped-but-open` | Free disk space without touching active work, from a bounded read-only survey; find open GitLab issues whose work already merged. |
 | [`music-video`](plugins/music-video) | `music-video` | An original song and a music video for it, end to end: lyrics, generated takes picked by fidelity, word-timed typography and three.js 3D rendered frame by frame, a mastered mix and social cuts. |
 
@@ -110,6 +110,10 @@ The Claude Code setup in `base/claude/` is the part most people come for:
 - **Statusline** (`statusline.sh`, with its test suite): model, context use, cost, git state,
   host label and the issue the session is about, in one line.
 
+![The statusline under a Claude Code prompt in a tmux window: host label and session, repo and
+branch with one dirty file, issue #12, model and effort, context used, cache hit rate, the time
+the transcript last changed, and cost; tmux's own status bar below it](docs/images/statusline-tmux.png)
+
 ## Identities and roles
 
 Two settings choose what a machine runs, recorded in `~/.df-profile` by the installer:
@@ -128,6 +132,31 @@ An identity can also carry an overlay for [Drover](https://github.com/coletebou/
 
 Machine-local overrides that never get committed go in `claude/settings.local.json`,
 `claude/mcp.local.json`, `~/.gitconfig.local` and `~/.zshenv.local`.
+
+## Docs
+
+| Doc | What it covers |
+|---|---|
+| [Bootstrapping a machine](docs/bootstrap.md) | the one-line install, provisioning a server (phases, pinned tools, modules, instance-store NVMe), cloud-init, overlays |
+| [dotsync](docs/dotsync.md) | keeping one dotfiles checkout in sync across machines: setup for two machines, the peers file, hooks, commit-message providers, status and doctor, safety properties |
+| [Running fleets of agents](docs/workflow/README.md) | coordinator and worker roles, briefs and handoffs, lane terms, parallel worktrees, review before ship, publishing through a scrub gate |
+| [Handoff chains](docs/handoff.md) | how `cc-handoff` moves a long session into a fresh one, on this machine or another |
+| [codesync](docs/codesync.md) | every repository in step across your machines: WIP commits, the force-push rules, peers, `--local`, troubleshooting |
+| [Claude Code hooks](docs/claude-hooks.md) | every hook, event by event |
+| [Agent memory](docs/memory/README.md) | reflections, the session reflector, transcript analysis and the nightly dreaming sweep |
+| [Infrastructure playbooks](docs/infra/README.md) | a fleet over Tailscale, Cloudflare in front of self-hosted services, a production VPS, Claude Code on Bedrock |
+
+## Requirements
+
+- macOS or Linux (WSL works), zsh, git, and bash (macOS's stock 3.2 is fine for the installer
+  and most scripts; `session-analyzer` needs bash 4.4 or newer, `tmux-apply-plan` bash 4).
+- tmux 3.4 or newer, jq, Python 3, and [Claude Code](https://code.claude.com). `tmux.conf`
+  loads cleanly on 3.4 and turns on what newer releases add: CSI u key encoding from 3.5, and
+  from 3.7 a second status row of recent sessions and a preview line in the window chooser.
+- Optional: Codex CLI, [gitleaks](https://github.com/gitleaks/gitleaks) (the git hooks and dotsync refuse
+  to run without it), starship, fzf, and Node 24 for `mcp-agent-safety` and the `node-tools`
+  component. On a Mac, the `Brewfile` covers most of these.
+- Claude Code on Amazon Bedrock is optional and documented in [docs/infra/aws.md](docs/infra/aws.md).
 
 ## Layout
 
@@ -150,31 +179,6 @@ install.sh                        the installer
 bootstrap.sh                      the one-line bootstrap (clone, then install.sh)
 scripts/bootstrap/                the server provisioner, its modules and pinned versions
 ```
-
-## Docs
-
-| Doc | What it covers |
-|---|---|
-| [Bootstrapping a machine](docs/bootstrap.md) | the one-line install, provisioning a server (phases, pinned tools, modules, instance-store NVMe), cloud-init, overlays |
-| [dotsync](docs/dotsync.md) | keeping one dotfiles checkout in sync across machines: setup for two machines, the peers file, hooks, commit-message providers, status and doctor, safety properties |
-| [Running fleets of agents](docs/workflow/README.md) | coordinator and worker roles, briefs and handoffs, lane terms, parallel worktrees, review before ship, publishing through a scrub gate |
-| [Handoff chains](docs/handoff.md) | how `cc-handoff` moves a long session into a fresh one, on this machine or another |
-| [codesync](docs/codesync.md) | every repository in step across your machines: WIP commits, the force-push rules, peers, `--local`, troubleshooting |
-| [Claude Code hooks](docs/claude-hooks.md) | every hook, event by event |
-| [Agent memory](docs/memory/README.md) | reflections, the session reflector, transcript analysis and the nightly dreaming sweep |
-| [Infrastructure playbooks](docs/infra/README.md) | a fleet over Tailscale, Cloudflare in front of self-hosted services, a production VPS, Claude Code on Bedrock |
-
-## Requirements
-
-- macOS or Linux (WSL works), zsh, git, and bash (macOS's stock 3.2 is fine for the installer
-  and most scripts; `session-analyzer` and `tmux-apply-plan` need bash 4 or newer).
-- tmux 3.4 or newer, jq, Python 3, and [Claude Code](https://code.claude.com). `tmux.conf`
-  loads cleanly on 3.4 and turns on what newer releases add: CSI u key encoding from 3.5, and
-  from 3.7 a second status row of recent sessions and a preview line in the window chooser.
-- Optional: Codex CLI, [gitleaks](https://github.com/gitleaks/gitleaks) (the git hooks and dotsync refuse
-  to run without it), starship, fzf, and Node 24 for `mcp-agent-safety` and the `node-tools`
-  component. On a Mac, the `Brewfile` covers most of these.
-- Claude Code on Amazon Bedrock is optional and documented in [docs/infra/aws.md](docs/infra/aws.md).
 
 ## Security notes
 
