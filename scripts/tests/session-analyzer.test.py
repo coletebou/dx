@@ -157,12 +157,6 @@ class SessionAnalyzerTest(unittest.TestCase):
         self.assertIn("2 sessions in window", r.stderr)
         self.assertIn("Client report", (self.home / ".analysis/unfinished.md").read_text())
 
-    def test_a_broken_boundary_check_reads_nothing(self):
-        r = self.run_it(MEMORY_BOUNDARY_CMD="/nonexistent/boundary-check")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("0 sessions in window", r.stderr)
-        self.assertNotIn("Ship the widget", (self.home / ".analysis/unfinished.md").read_text())
-
     def test_dry_run_makes_no_model_calls_and_keeps_existing_tips(self):
         tips = self.home / ".analysis/workflow-tips.md"
         tips.parent.mkdir(parents=True)

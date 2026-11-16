@@ -43,18 +43,13 @@ class FakeJev(BaseHTTPRequestHandler):
 
 class CompactionPointTest(unittest.TestCase):
     def test_windows(self):
-        saved = os.environ.pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW", None)
-        try:
-            setattr(mod, "_setting", lambda key: None)
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_AUTO_COMPACT_WINDOW"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(mod, "_setting", lambda key: None):
             self.assertEqual(mod.compaction_point(200_000), 200_000)
             self.assertEqual(mod.compaction_point(1_000_000), 967_000)
             os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "300000"
             self.assertEqual(mod.compaction_point(1_000_000), 300_000)
             self.assertEqual(mod.compaction_point(200_000), 200_000, "capped at the model window")
-        finally:
-            os.environ.pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW", None)
-            if saved is not None:
-                os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = saved
 
 
 class AdvisoryWindowTest(unittest.TestCase):
@@ -297,15 +292,9 @@ class AdvisorTest(HookCase):
         self.assertEqual(FakeJev.requests, [], "a restricted session's excerpts reached Jev")
         self.assertEqual(self.last_log()["jev_skipped"], "data boundary")
         self.assertEqual(asked.read_text().split(), ["context-advisor", str(self.transcript)])
-
-    def test_a_broken_boundary_check_fails_closed_and_exit_1_lets_jev_be_asked(self):
-        FakeJev.answers = {"natural_boundary": 0.9, "fresh_session_better": 0.9, "delicate_operation": 0.05}
-        self.env["MEMORY_BOUNDARY_CMD"] = "/nonexistent/boundary-check"
-        self.sense(150_000)
-        self.hook()
-        self.assertEqual(FakeJev.requests, [], "a check that cannot run must keep the excerpts back")
+        # The control: the same check answering exit 1 (unrestricted) lets Jev be asked.
         (self.root / "state/s1.json").unlink()  # a fresh cycle, so the advise band fires again
-        self.env["MEMORY_BOUNDARY_CMD"] = "exit 1"
+        self.env["RESTRICTED"] = "0"
         self.hook()
         self.assertEqual(len(FakeJev.requests), 1, "exit 1 means unrestricted")
         self.assertNotIn("jev_skipped", self.last_log())

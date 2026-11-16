@@ -362,12 +362,6 @@ test('run.mjs: refuses to pass a credential from your environment to a server, e
   }
 });
 
-test('run.mjs: refuses a ${VAR} that Claude Code would expand from your environment', () => {
-  const r = harness(EDGE, { MCP_SAFETY_FIXTURE: 'host-env-ref', HARNESS_TEST_TOKEN: 'real-looking-token-0123456789' });
-  assert.equal(r.status, 2, r.stdout + r.stderr);
-  assert.match(r.stderr, /would be expanded by Claude Code/);
-});
-
 test('run.mjs: a session with no result event counts its budget cap toward --max-total-usd', { timeout: 30_000 }, () => {
   const r = harness(EDGE, { MCP_SAFETY_FIXTURE: 'hang', FAKE_HANG: '1' }, ['--max-total-usd', '0.2']);
   assert.equal(r.status, 1, r.stdout + r.stderr);

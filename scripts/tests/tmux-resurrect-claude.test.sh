@@ -150,8 +150,9 @@ check "...it says so instead" "previous codex session $U9 is still live elsewher
   "$(tsb capture-pane -p -J -t "=resurrect:=r-codex-live")"
 check "a codex row with no provider keeps its profile" "codex -p bedrock resume $UA" "$launched"
 # No bash older than 4.4 to run here: on one, an empty "${a[@]}" under set -u is an unbound variable.
-lacks "no bare array copy that dies on an empty array under bash 3.2" '=("${next[@]}")' \
-  "$(cat "$scripts/tmux-resurrect-claude-restore" "$scripts/tmux-resurrect-claude-save")"
+# Any array name: the guard must not pass again once the array is renamed.
+lacks "no bare array copy that dies on an empty array under bash 3.2" '=("${' \
+  "$(grep -hE '=\("\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\)' "$scripts/tmux-resurrect-claude-restore" "$scripts/tmux-resurrect-claude-save")"
 
 printf 'autosave: a backstop that stands down while a snapshot is fresh\n'
 mkdir -p "$HOME/.tmux/plugins/tmux-resurrect/scripts"

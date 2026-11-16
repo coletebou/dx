@@ -117,32 +117,24 @@ class LaunchFlags(unittest.TestCase):
 
 
 class Screens(unittest.TestCase):
-    def test_idle_empty_even_with_numbered_prose(self):
-        self.assertEqual(park.screen_state(IDLE)[0], 'idle-empty')
-
-    def test_named_session_border(self):
-        named = IDLE.replace(RULE, RULE + ' worker-spaces-cleanup ─', 1)
-        self.assertEqual(park.screen_state(named)[0], 'idle-empty')
-
-    def test_dialog(self):
-        self.assertEqual(park.screen_state(DIALOG)[0], 'dialog')
-
-    def test_held_peer_message(self):
-        self.assertEqual(park.screen_state(HELD)[0], 'dialog')
-
-    def test_busy(self):
-        self.assertEqual(park.screen_state(BUSY)[0], 'busy')
+    def test_screen_states(self):
+        cases = {
+            'idle, even with numbered prose': (IDLE, 'idle-empty'),
+            'a named session border': (IDLE.replace(RULE, RULE + ' worker-spaces-cleanup ─', 1), 'idle-empty'),
+            'a permission dialog': (DIALOG, 'dialog'),
+            'a held peer message': (HELD, 'dialog'),
+            'busy': (BUSY, 'busy'),
+            'unsent text in the box': (TYPED, 'typed'),
+            'a plain shell is not claude': ('[work] @macbook ~\n❯\n', 'unknown'),
+        }
+        for name, (screen, state) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(park.screen_state(screen)[0], state)
 
     def test_waiting_on_a_background_agent_is_busy(self):
         # The turn ended and the main transcript went quiet, but /exit would only background it.
         waiting = claude_screen(['⏺ Waiting on the importer fix.', '', '✻ Waiting for 1 background agent to finish'])
         self.assertEqual(park.screen_state(waiting), ('busy', 'a background agent is still running'))
-
-    def test_unsent_text(self):
-        self.assertEqual(park.screen_state(TYPED)[0], 'typed')
-
-    def test_plain_shell_is_not_claude(self):
-        self.assertEqual(park.screen_state('[work] @macbook ~\n❯\n')[0], 'unknown')
 
     def test_typed_command_survives_shell_wrapping(self):
         cmd = 'cd /home/x/film-b && claude --model m --resume 2bb2-efb591e8bf70'
@@ -245,11 +237,13 @@ class Footprints(unittest.TestCase):
             (proc / 'self' / 'status').write_text('VmRSS:\t1 kB\n')
             self.assertEqual(park.linux_footprints(proc), {123: 3.0, 7: 0.0})
 
-    def test_linux_dispatch(self):
+    def test_linux_reads_proc_not_top(self):
+        # Linux has no `top -l`: without the dispatch every footprint there would be empty.
         original = park.sys.platform
         self.addCleanup(setattr, park.sys, 'platform', original)
         park.sys.platform = 'linux'
-        self.assertIsInstance(park.footprints(), dict)
+        patch(self, linux_footprints=lambda: {123: 3.0})
+        self.assertEqual(park.footprints(), {123: 3.0})
 
 
 def patch(test, **values):
