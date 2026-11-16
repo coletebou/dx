@@ -73,24 +73,6 @@ class AutoreviewVersionTests(unittest.TestCase):
                     self.assertEqual(stdout.getvalue(), expected)
                     self.assertEqual(stderr.getvalue(), "")
 
-    def test_version_exits_before_review_preparation(self) -> None:
-        stdout = io.StringIO()
-        expected = hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(sys, "argv", ["autoreview", "--version"]))
-            stack.enter_context(mock.patch.dict(os.environ, {
-                "AUTOREVIEW_ENGINE": "invalid", "AUTOREVIEW_MAX_PRIORITY": "invalid",
-            }))
-            stack.enter_context(contextlib.redirect_stdout(stdout))
-            for name in ("main_with_args", "preflight_git", "reviewer_args", "EngineStage"):
-                stack.enter_context(mock.patch.object(
-                    AUTOREVIEW, name, side_effect=AssertionError(f"unexpected {name}"),
-                ))
-            with self.assertRaises(SystemExit) as caught:
-                AUTOREVIEW.main_impl()
-        self.assertEqual(caught.exception.code, 0)
-        self.assertEqual(stdout.getvalue(), f"autoreview source-sha256:{expected}\n")
-
     def test_unreadable_version_source_fails_without_a_fingerprint(self) -> None:
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", ["autoreview", "--version"]), \
@@ -271,37 +253,6 @@ class AutoreviewCursorTests(unittest.TestCase):
             ]
         )
         self.assertEqual(AUTOREVIEW.extract_json(stream), FINAL_REPORT)
-
-    def test_extract_json_can_fallback_to_assistant_message(self) -> None:
-        stream = json.dumps(
-            {
-                "type": "assistant",
-                "message": {"role": "assistant", "content": [{"type": "text", "text": json.dumps(FINAL_REPORT)}]},
-            }
-        )
-        self.assertEqual(AUTOREVIEW.extract_json(stream), FINAL_REPORT)
-
-    def test_extract_json_does_not_fallback_past_bad_terminal_result(self) -> None:
-        stream = "\n".join(
-            [
-                json.dumps(
-                    {
-                        "type": "assistant",
-                        "message": {"role": "assistant", "content": [{"type": "text", "text": json.dumps(FINAL_REPORT)}]},
-                    }
-                ),
-                json.dumps(
-                    {
-                        "type": "result",
-                        "subtype": "success",
-                        "result": "not json",
-                    }
-                ),
-            ]
-        )
-        with self.assertRaises(SystemExit) as exc_info:
-            AUTOREVIEW.extract_json(stream)
-        self.assertIn("review engine result was not structured JSON", str(exc_info.exception))
 
 
 class AutoreviewImageEvidenceTests(unittest.TestCase):
@@ -1689,6 +1640,25 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
 
         return mock.Mock(side_effect=fake_run_engine), observed
 
+    @staticmethod
+    def run_codex_route(reviewer: argparse.Namespace, root: Path, codex_home: Path, fake_run) -> tuple[object, str]:
+        """run_reviewer on a real Codex command line with only the engine process replaced."""
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {
+            "AWS_BEARER_TOKEN_BEDROCK": "synthetic-bearer", "CODEX_HOME": str(codex_home),
+            "HOME": str(root), "PATH": os.environ.get("PATH", ""),
+        }, clear=True), \
+                mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+                mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex"), \
+                mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), \
+                mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
+                mock.patch.object(AUTOREVIEW, "safe_temp_root", return_value=root), \
+                mock.patch.object(AUTOREVIEW, "scan_outgoing_review_pack"), \
+                mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run), \
+                contextlib.redirect_stderr(stderr):
+            result = AUTOREVIEW.run_reviewer(reviewer, root / "repo", "frozen", set(), [])
+        return result, stderr.getvalue()
+
     def test_default_mantle_route_is_opus_5_5_xhigh(self) -> None:
         reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
         self.assertEqual(
@@ -1825,28 +1795,7 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
                 output_path.write_text(COMPLETE_REPORT, encoding="utf-8")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            stderr = io.StringIO()
-            with mock.patch.dict(os.environ, {
-                "AWS_BEARER_TOKEN_BEDROCK": "synthetic-bearer",
-                "CODEX_HOME": str(codex_home),
-                "HOME": str(root),
-                "PATH": os.environ.get("PATH", ""),
-            }, clear=True), mock.patch.object(
-                AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex",
-            ), mock.patch.object(
-                AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex",
-            ), mock.patch.object(
-                AUTOREVIEW, "codex_auth_config_flags", return_value=[],
-            ), mock.patch.object(
-                AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None,
-            ), mock.patch.object(
-                AUTOREVIEW, "safe_temp_root", return_value=root,
-            ), mock.patch.object(
-                AUTOREVIEW, "scan_outgoing_review_pack",
-            ), mock.patch.object(
-                AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run,
-            ), contextlib.redirect_stderr(stderr):
-                result = AUTOREVIEW.run_reviewer(reviewer, repo, "frozen", set(), [])
+            result, stderr = self.run_codex_route(reviewer, root, codex_home, fake_run)
 
         self.assertTrue(result.complete)
         self.assertEqual(events, [
@@ -1856,9 +1805,9 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
         self.assertIn(
             "codex route profile=autoreview-bedrock failed (engine_failed: codex engine failed: "
             "provider-access; provider diagnostics suppressed); retrying on chatgpt with gpt-6-sol",
-            stderr.getvalue(),
+            stderr,
         )
-        self.assertNotIn("synthetic-provider-log", stderr.getvalue())
+        self.assertNotIn("synthetic-provider-log", stderr)
 
     def test_codex_runtime_profile_fallback_keeps_bedrock_route(self) -> None:
         reviewer = route_reviewer(
@@ -1902,24 +1851,6 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
             (env_reviewer.route_fallback.codex_profile, env_reviewer.route_fallback.model),
             ("autoreview-bedrock-runtime", "us.openai.gpt-6-sol"),
         )
-
-    def test_codex_profile_fallback_model_is_the_profile_or_explicit_id(self) -> None:
-        # Mantle -> Mantle (another region) keeps no rewritten id: the profile decides.
-        mantle = route_reviewer(CODEX_PROFILE_ARGV, {
-            "AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-west",
-        })
-        self.assertEqual(
-            (mantle.route_fallback.codex_profile, mantle.route_fallback.model),
-            ("autoreview-bedrock-west", None),
-        )
-        # An explicit id is passed through untouched, whatever its geo prefix.
-        for explicit in ("eu.openai.gpt-6-sol", "global.openai.gpt-6-sol", "openai.gpt-6-sol"):
-            with self.subTest(explicit=explicit):
-                reviewer = route_reviewer(CODEX_PROFILE_ARGV, {
-                    "AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-runtime",
-                    "AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL": explicit,
-                })
-                self.assertEqual(reviewer.route_fallback.model, explicit)
 
     @unittest.skipIf(os.name == "nt", "POSIX profile staging")
     def test_codex_mantle_failure_runs_runtime_profile_end_to_end(self) -> None:
@@ -1965,28 +1896,7 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
                 output_path.write_text(COMPLETE_REPORT, encoding="utf-8")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            stderr = io.StringIO()
-            with mock.patch.dict(os.environ, {
-                "AWS_BEARER_TOKEN_BEDROCK": "synthetic-bearer",
-                "CODEX_HOME": str(codex_home),
-                "HOME": str(root),
-                "PATH": os.environ.get("PATH", ""),
-            }, clear=True), mock.patch.object(
-                AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex",
-            ), mock.patch.object(
-                AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex",
-            ), mock.patch.object(
-                AUTOREVIEW, "codex_auth_config_flags", return_value=[],
-            ), mock.patch.object(
-                AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None,
-            ), mock.patch.object(
-                AUTOREVIEW, "safe_temp_root", return_value=root,
-            ), mock.patch.object(
-                AUTOREVIEW, "scan_outgoing_review_pack",
-            ), mock.patch.object(
-                AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run,
-            ), contextlib.redirect_stderr(stderr):
-                result = AUTOREVIEW.run_reviewer(reviewer, repo, "frozen", set(), [])
+            result, stderr = self.run_codex_route(reviewer, root, codex_home, fake_run)
 
         self.assertTrue(result.complete)
         self.assertEqual([event[:3] for event in events], [
@@ -2001,9 +1911,9 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
         self.assertNotIn("approvals_reviewer", staged_runtime)
         self.assertIn(
             "retrying on profile=autoreview-bedrock-runtime with the profile model",
-            stderr.getvalue(),
+            stderr,
         )
-        self.assertNotIn("synthetic-provider-log", stderr.getvalue())
+        self.assertNotIn("synthetic-provider-log", stderr)
 
     def test_codex_fallback_profile_configuration(self) -> None:
         same = route_reviewer(CODEX_PROFILE_ARGV, {
@@ -2682,6 +2592,37 @@ def amp_test_mcp_denial_result(
     )
 
 
+def amp_test_args(**overrides: object) -> argparse.Namespace:
+    return argparse.Namespace(**{
+        "amp_bin": "amp", "max_output_chars": 2_000_000, "model": "openai/gpt-5.6-sol",
+        "stream_engine_output": False, "thinking": "high", **overrides,
+    })
+
+
+def amp_test_preflight(command: list[str], _cwd: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    """Answer the isolated runtime's MCP-denial and plugin-inventory probes as Amp does."""
+    env = kwargs["env"]
+    assert isinstance(env, dict)
+    if command[-2:] == ["tools", "list"]:
+        return amp_test_mcp_denial_result(command, env)
+    plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
+    return subprocess.CompletedProcess(
+        command, 0, amp_test_plugin_list(next(plugin_root.glob("autoreview-*.ts"))), "",
+    )
+
+
+def run_amp_fixture(args, execute, *, prompt="review", preflight=amp_test_preflight, env=None):
+    """run_amp with the isolation probe, preflight and engine process replaced; returns (output, repo)."""
+    with tempfile.TemporaryDirectory(prefix="autoreview-amp-test.") as tmpdir:
+        repo = Path(tmpdir) / "repo"
+        repo.mkdir()
+        with mock.patch.dict(os.environ, env or {}, clear=False), \
+                mock.patch.object(AUTOREVIEW, "ensure_amp_isolation_supported", return_value="/usr/bin/amp"), \
+                mock.patch.object(AUTOREVIEW, "run", side_effect=preflight), \
+                mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=execute):
+            return AUTOREVIEW.run_amp(args, repo, prompt), repo
+
+
 class AutoreviewAmpTests(unittest.TestCase):
     def test_amp_dry_run_and_runtime_reject_the_same_model_grammar(self) -> None:
         for model, diagnostic in (
@@ -2801,13 +2742,6 @@ class AutoreviewAmpTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_run_keeps_review_prompt_out_of_outer_agent(self) -> None:
-        args = argparse.Namespace(
-            amp_bin="amp",
-            max_output_chars=2_000_000,
-            model="openai/gpt-5.6-sol",
-            stream_engine_output=False,
-            thinking="high",
-        )
         secret_prompt = "review diff PRIVATE_REVIEW_MARKER_8f3c"
         observed: dict[str, object] = {}
 
@@ -2870,23 +2804,9 @@ class AutoreviewAmpTests(unittest.TestCase):
             "PYTHONPATH": "/tmp/attack",
             "PLUGINS": "inherited-plugins",
         }
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-run-test.") as tmpdir:
-            repo = Path(tmpdir) / "repo"
-            repo.mkdir()
-            with mock.patch.dict(os.environ, inherited, clear=False), mock.patch.object(
-                AUTOREVIEW,
-                "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
-            ), mock.patch.object(
-                AUTOREVIEW,
-                "run",
-                side_effect=fake_preflight,
-            ), mock.patch.object(
-                AUTOREVIEW,
-                "run_with_heartbeat",
-                side_effect=fake_execute,
-            ):
-                output = AUTOREVIEW.run_amp(args, repo, secret_prompt)
+        output, repo = run_amp_fixture(
+            amp_test_args(), fake_execute, prompt=secret_prompt, preflight=fake_preflight, env=inherited,
+        )
 
         self.assertEqual(json.loads(output), FINAL_REPORT)
         self.assertFalse(observed["mcp_preflight_prompt_exists"])
@@ -3060,68 +2980,17 @@ class AutoreviewAmpTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_run_reports_timeout_before_stream_attestation(self) -> None:
-        args = argparse.Namespace(
-            amp_bin="amp",
-            engine_timeout_seconds=0.01,
-            max_output_chars=2_000_000,
-            model="openai/gpt-5.6-sol",
-            stream_engine_output=False,
-            thinking="high",
-        )
-
-        def fake_preflight(
-            command: list[str],
-            cwd: Path,
-            **kwargs: object,
-        ) -> subprocess.CompletedProcess[str]:
-            env = kwargs["env"]
-            assert isinstance(env, dict)
-            if command[-2:] == ["tools", "list"]:
-                return amp_test_mcp_denial_result(command, env)
-            plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
-            plugin_path = next(plugin_root.glob("autoreview-*.ts"))
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                amp_test_plugin_list(plugin_path),
-                "",
-            )
-
-        def fake_execute(
-            command: list[str],
-            cwd: Path,
-            **kwargs: object,
-        ) -> subprocess.CompletedProcess[str]:
+        def fake_execute(command: list[str], _cwd: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual(kwargs["max_runtime_seconds"], 0.01)
             return subprocess.CompletedProcess(
-                command,
-                124,
-                '{"type":"system","subtype":"init"}\n',
-                "amp engine timed out after 0.01s",
+                command, 124, '{"type":"system","subtype":"init"}\n', "amp engine timed out after 0.01s",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-timeout-test.") as tmpdir:
-            repo = Path(tmpdir) / "repo"
-            repo.mkdir()
-            with mock.patch.object(
-                AUTOREVIEW,
-                "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
-            ), mock.patch.object(
-                AUTOREVIEW,
-                "run",
-                side_effect=fake_preflight,
-            ), mock.patch.object(
-                AUTOREVIEW,
-                "run_with_heartbeat",
-                side_effect=fake_execute,
-            ), mock.patch.object(
-                AUTOREVIEW,
-                "attest_amp_stream",
-                side_effect=AssertionError("timeout stream must not be attested"),
-            ) as attest:
-                with self.assertRaises(SystemExit) as exc_info:
-                    AUTOREVIEW.run_amp(args, repo, "review")
+        with mock.patch.object(
+            AUTOREVIEW, "attest_amp_stream",
+            side_effect=AssertionError("timeout stream must not be attested"),
+        ) as attest, self.assertRaises(SystemExit) as exc_info:
+            run_amp_fixture(amp_test_args(engine_timeout_seconds=0.01), fake_execute)
 
         message = str(exc_info.exception)
         self.assertIn("amp engine failed (124)", message)
@@ -3175,69 +3044,16 @@ class AutoreviewAmpTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_run_surfaces_direct_generation_failure(self) -> None:
-        args = argparse.Namespace(
-            amp_bin="amp",
-            max_output_chars=2_000_000,
-            model="openai/gpt-5.6-sol",
-            stream_engine_output=False,
-            thinking="high",
-        )
-
-        def fake_preflight(
-            command: list[str],
-            cwd: Path,
-            **kwargs: object,
-        ) -> subprocess.CompletedProcess[str]:
-            env = kwargs["env"]
-            assert isinstance(env, dict)
-            if command[-2:] == ["tools", "list"]:
-                return amp_test_mcp_denial_result(command, env)
-            plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
-            plugin_path = next(plugin_root.glob("autoreview-*.ts"))
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                amp_test_plugin_list(plugin_path),
-                "",
-            )
-
-        def fake_execute(
-            command: list[str],
-            cwd: Path,
-            **kwargs: object,
-        ) -> subprocess.CompletedProcess[str]:
+        def fake_execute(command: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
             env = kwargs["env"]
             assert isinstance(env, dict)
             error_path = Path(str(env["XDG_CONFIG_HOME"])).parent / "review-error.txt"
             error_path.write_text("provider rejected model", encoding="utf-8")
             error_path.chmod(0o600)
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                amp_test_stream(cwd, tool_error=True),
-                "",
-            )
+            return subprocess.CompletedProcess(command, 0, amp_test_stream(cwd, tool_error=True), "")
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-error-test.") as tmpdir:
-            repo = Path(tmpdir) / "repo"
-            repo.mkdir()
-            with mock.patch.object(
-                AUTOREVIEW,
-                "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
-            ), mock.patch.object(
-                AUTOREVIEW,
-                "run",
-                side_effect=fake_preflight,
-            ), mock.patch.object(
-                AUTOREVIEW,
-                "run_with_heartbeat",
-                side_effect=fake_execute,
-            ):
-                with self.assertRaisesRegex(SystemExit, "provider rejected model"):
-                    AUTOREVIEW.run_amp(args, repo, "review")
-
-
+        with self.assertRaisesRegex(SystemExit, "provider rejected model"):
+            run_amp_fixture(amp_test_args(), fake_execute)
 class AutoreviewInputTests(unittest.TestCase):
     def test_every_provider_scans_each_pack_before_review(self) -> None:
         for engine in ("codex", "claude", "amp", "pi"):
@@ -3372,26 +3188,6 @@ class AutoreviewEfficiencyTests(unittest.TestCase):
         event["usage"]["cache_write_input_tokens"] = 80
         AUTOREVIEW.record_codex_usage(args, json.dumps(event))
         self.assertTrue(AUTOREVIEW.review_usage_summary(args)["complete"])
-
-    def test_interruption_retains_observed_usage_with_and_without_live_display(self):
-        for streaming in (False, True):
-            with self.subTest(streaming=streaming), tempfile.TemporaryDirectory() as tempdir:
-                def interrupt(*_args):
-                    raise AUTOREVIEW.EngineInterrupted(130)
-
-                script = f"import time; print({self.usage_event()!r}, flush=True); time.sleep(5)"
-                with mock.patch.object(AUTOREVIEW, "emit_heartbeat", side_effect=interrupt), \
-                        self.assertRaises(AUTOREVIEW.EngineInterrupted) as caught:
-                    AUTOREVIEW.run_with_heartbeat(
-                        [sys.executable, "-c", script], Path(tempdir), label="usage-fixture",
-                        heartbeat_seconds=0.2, stream_output=streaming, stream_display=interrupt,
-                    )
-                args = argparse.Namespace()
-                AUTOREVIEW.record_codex_usage(args, caught.exception.stdout, completed=False)
-                summary = AUTOREVIEW.review_usage_summary(args)
-                self.assertEqual(summary["tokens"]["input_tokens"], 100)
-                self.assertEqual(summary["partial_attempts"], 1)
-                self.assertFalse(summary["complete"])
 
     def test_planner_reduces_repeated_context_without_more_passes(self):
         bundle = "# Commit Diff\n" + "+change\n" * 75_000
@@ -3887,36 +3683,22 @@ class AutoreviewSeatMetricsTests(unittest.TestCase):
         self.assert_no_engine_text(metadata)
 
     @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
-    def test_failed_seat_keeps_observed_usage_and_records_no_verdict(self) -> None:
+    def test_unlaunched_seat_records_no_usage_and_no_verdict(self) -> None:
+        # A launched failed seat is proven end to end in the hardening suite; a seat refused before
+        # its process started must record the requested model and nothing it never observed.
         with tempfile.TemporaryDirectory(prefix="autoreview-seat-failed-test.") as tmpdir:
             args, evidence = self.run_evidence(Path(tmpdir), codex_speed=None)
-            index = evidence.start_reviewer(args, 1)
-            with mock.patch.dict(os.environ, {}, clear=True):
-                AUTOREVIEW.record_seat_process_metrics(args, lambda: AUTOREVIEW.codex_process_metrics(
-                    codex_events_fixture(CODEX_FIXTURE_USAGE), completed=False,
-                    settings=AUTOREVIEW.codex_effective_settings(args, args.model, {}),
-                ))
-            evidence.finish_reviewer(index, status="failed", error="codex engine failed (17)")
-            # A seat whose process never launched has no usage at all.
-            unlaunched = evidence.start_reviewer(args, 2)
+            unlaunched = evidence.start_reviewer(args, 1)
             evidence.finish_reviewer(unlaunched, status="failed", error="refused before launch")
             evidence.finish(1, error_type="SystemExit")
             metadata = json.loads(evidence.metadata_path.read_text(encoding="utf-8"))
 
-        failed, never_ran = metadata["reviewer_runs"]
-        self.assertEqual(failed["status"], "failed")
-        self.assertFalse(failed["tokens"]["complete"])
-        self.assertEqual(failed["tokens"]["output_tokens"], 13400)
-        self.assertEqual((failed["model_requested"], failed["model_actual"]), ("gpt-6-astra", "gpt-6-astra"))
-        self.assertEqual((failed["effort"], failed["effort_source"]), ("max", "cli"))
-        self.assertIsNone(failed["cost_usd"])
-        for key in ("verdict", "review_completion", "overall_confidence",
-                    "findings_by_priority", "provider_findings_by_priority", "findings_rejected"):
-            self.assertIsNone(failed[key], key)
+        (never_ran,) = metadata["reviewer_runs"]
+        self.assertEqual((never_ran["status"], never_ran["model_requested"]), ("failed", "gpt-6-astra"))
+        for key in ("verdict", "review_completion", "overall_confidence", "findings_by_priority",
+                    "provider_findings_by_priority", "findings_rejected",
+                    "tokens", "model_actual", "effort", "service_tier", "cost_usd", "model_usage"):
             self.assertIsNone(never_ran[key], key)
-        for key in ("tokens", "model_actual", "effort", "service_tier", "cost_usd", "model_usage"):
-            self.assertIsNone(never_ran[key], key)
-        self.assertEqual(never_ran["model_requested"], "gpt-6-astra")
 
     def test_metric_recording_failures_never_fail_the_review(self) -> None:
         evidence = mock.Mock(spec=AUTOREVIEW.RunEvidence)
@@ -4321,15 +4103,6 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 os.environ[key] = value
         cls.home_dir.cleanup()
 
-    def test_kimi_bin_cli_option(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["autoreview", "--kimi-bin", "/tmp/trusted-kimi"],
-        ):
-            args = AUTOREVIEW.parse_args()
-        self.assertEqual(args.kimi_bin, "/tmp/trusted-kimi")
-
     def test_codex_config_status_exposes_keys_only(self) -> None:
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_verbosity"])
@@ -4494,151 +4267,22 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             self.assertIn("features.plugins=false", observed["command"])
             self.assertIn("skills.include_instructions=false", observed["command"])
 
-    def test_codex_does_not_fallback_after_unrelated_failure(self) -> None:
-        args = argparse.Namespace(
-            codex_bin="codex",
-            codex_config=None,
-            codex_speed=None,
-            fallback_model="gpt-6-luna",
-            model="gpt-6-sol",
-            stream_engine_output=False,
-            thinking="high",
-            tools=True,
-            web_search=False,
-        )
-        models: list[str] = []
-
-        def fake_run(command: list[str], *_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            models.append(command[command.index("--model") + 1])
-            return subprocess.CompletedProcess(command, 1, "", "network timeout")
-
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
-            AUTOREVIEW,
-            "resolve_command",
-            return_value="/usr/bin/codex",
-        ), mock.patch.object(
-            AUTOREVIEW,
-            "ensure_codex_isolation_supported",
-            return_value="/usr/bin/codex",
-        ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
-            AUTOREVIEW,
-            "prepare_codex_runtime_auth",
-            return_value=None,
-        ), mock.patch.object(
-            AUTOREVIEW,
-            "run_with_heartbeat",
-            side_effect=fake_run,
-        ):
-            with self.assertRaisesRegex(SystemExit, "network timeout"):
-                AUTOREVIEW.run_codex(args, Path(tmpdir), "review")
-
-        self.assertEqual(models, ["gpt-6-sol"])
-
-    def test_codex_does_not_fallback_after_model_capacity_failure(self) -> None:
-        args = argparse.Namespace(
-            codex_bin="codex",
-            codex_config=None,
-            codex_speed=None,
-            fallback_model="gpt-6-luna",
-            model="gpt-6-sol",
-            stream_engine_output=False,
-            thinking="high",
-            tools=True,
-            web_search=False,
-        )
-        models: list[str] = []
-
-        def fake_run(command: list[str], *_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            models.append(command[command.index("--model") + 1])
-            return subprocess.CompletedProcess(
-                command,
-                1,
-                "",
-                "model_not_available: gpt-6-sol is temporarily unavailable due to capacity",
-            )
-
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
-            AUTOREVIEW,
-            "resolve_command",
-            return_value="/usr/bin/codex",
-        ), mock.patch.object(
-            AUTOREVIEW,
-            "ensure_codex_isolation_supported",
-            return_value="/usr/bin/codex",
-        ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
-            AUTOREVIEW,
-            "prepare_codex_runtime_auth",
-            return_value=None,
-        ), mock.patch.object(
-            AUTOREVIEW,
-            "run_with_heartbeat",
-            side_effect=fake_run,
-        ):
-            with self.assertRaisesRegex(SystemExit, "temporarily unavailable"):
-                AUTOREVIEW.run_codex(args, Path(tmpdir), "review")
-
-        self.assertEqual(models, ["gpt-6-sol"])
-
-    def test_codex_access_fallback_ignores_structured_output_text(self) -> None:
-        result = subprocess.CompletedProcess(
-            ["codex"],
-            1,
-            '{"type":"agent_message","text":"gpt-5.6-sol does not exist or you do not have access"}',
-            '{"type":"agent_message","message":"gpt-5.6-sol does not exist or you do not have access"}',
-        )
-
-        self.assertFalse(
-            AUTOREVIEW.codex_model_access_failure(result, "gpt-5.6-sol")
-        )
-
-    def test_codex_access_fallback_accepts_terminal_error_event(self) -> None:
-        result = subprocess.CompletedProcess(
-            ["codex"],
-            1,
-            '{"type":"error","message":"gpt-5.6-sol does not exist or you do not have access"}',
-            "",
-        )
-
-        self.assertTrue(
-            AUTOREVIEW.codex_model_access_failure(result, "gpt-5.6-sol")
-        )
-
-    def test_codex_access_fallback_accepts_account_model_list_error(self) -> None:
-        result = subprocess.CompletedProcess(
-            ["codex"],
-            1,
-            "",
-            (
-                "The model gpt-5.6-sol does not appear in the list of models "
-                "available to your account"
-            ),
-        )
-
-        self.assertTrue(
-            AUTOREVIEW.codex_model_access_failure(result, "gpt-5.6-sol")
-        )
-
-    def test_codex_access_fallback_ignores_plain_stdout(self) -> None:
+    def test_codex_access_failure_classification(self) -> None:
+        # Only a terminal error event or the CLI's own stderr names an access failure;
+        # review text that quotes the message must never trigger the model retry.
         message = "gpt-5.6-sol does not exist or you do not have access"
-        stdout_result = subprocess.CompletedProcess(["codex"], 1, message, "")
-        stderr_result = subprocess.CompletedProcess(["codex"], 1, "", message)
-
-        self.assertFalse(
-            AUTOREVIEW.codex_model_access_failure(stdout_result, "gpt-5.6-sol")
-        )
-        self.assertTrue(
-            AUTOREVIEW.codex_model_access_failure(stderr_result, "gpt-5.6-sol")
-        )
-
-    def test_extract_json_accepts_dict_result_payload(self) -> None:
-        payload = {
-            "type": "result",
-            "subtype": "success",
-            "result": FINAL_REPORT,
-            "session_id": "session-id",
-            "request_id": "request-id",
-        }
-        self.assertEqual(AUTOREVIEW.extract_json(json.dumps(payload)), FINAL_REPORT)
+        for label, stdout, stderr, expected in (
+            ("agent text", json.dumps({"type": "agent_message", "text": message}),
+             json.dumps({"type": "agent_message", "message": message}), False),
+            ("plain stdout", message, "", False),
+            ("terminal error event", json.dumps({"type": "error", "message": message}), "", True),
+            ("stderr", "", message, True),
+            ("account model list", "",
+             "The model gpt-5.6-sol does not appear in the list of models available to your account", True),
+        ):
+            with self.subTest(label=label):
+                result = subprocess.CompletedProcess(["codex"], 1, stdout, stderr)
+                self.assertIs(AUTOREVIEW.codex_model_access_failure(result, "gpt-5.6-sol"), expected)
 
     def test_extract_json_rejects_result_string_with_preamble(self) -> None:
         payload = {

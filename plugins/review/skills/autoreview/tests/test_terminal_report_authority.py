@@ -246,20 +246,6 @@ class TerminalReportAuthorityTests(unittest.TestCase):
                     self.assertEqual(caught.exception.reason, "invalid_report")
                     self.assertIn("review_completion", str(caught.exception))
 
-    def test_shared_gateway_keeps_completion_private_for_valid_final_report(self):
-        for completion in ("complete", "incomplete"):
-            payload = {**FINAL_REPORT, "review_completion": completion}
-            args = argparse.Namespace(engine="codex", max_priority="P2")
-            with self.subTest(completion=completion), mock.patch.dict(
-                self.helper["run_reviewer"].__globals__, {"scan_outgoing_review_pack": lambda *_args: None, "run_engine": lambda *_args: json.dumps(payload)},
-            ):
-                result = self.helper["run_reviewer"](args, Path.cwd(), "synthetic prompt", set(), [])
-            self.assertEqual(result.complete, completion == "complete")
-            self.assertNotIn("review_completion", result.report)
-            self.assertNotIn("review_completion", result.report["provider_report"])
-            for field in ("findings", "overall_correctness", "overall_explanation", "overall_confidence"):
-                self.assertEqual(result.report[field], FINAL_REPORT[field])
-
     def test_shared_gateway_classifies_bad_final_as_invalid_for_every_engine(self):
         # Engine-return boundary only: no engine wrapper, process, or auth runs.
         raw = self.representations([

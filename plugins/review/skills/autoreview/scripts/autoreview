@@ -612,29 +612,26 @@ def run(
     args: list[str],
     cwd: Path,
     *,
-    input_text: str | None = None,
     stdin: BinaryIO | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
-    text_errors: str = SUBPROCESS_TEXT_ERRORS,
     capture_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     with contextlib.ExitStack() as stack:
         captures = [
             stack.enter_context(tempfile.TemporaryFile(
                 mode="w+", encoding=SUBPROCESS_TEXT_ENCODING,
-                errors=text_errors, dir=capture_dir,
+                errors=SUBPROCESS_TEXT_ERRORS, dir=capture_dir,
             ))
             for _ in range(2)
         ] if capture_dir is not None else []
         result = subprocess.run(
             args,
             cwd=cwd,
-            input=input_text,
             stdin=stdin,
             text=True,
             encoding=SUBPROCESS_TEXT_ENCODING,
-            errors=text_errors,
+            errors=SUBPROCESS_TEXT_ERRORS,
             stdout=captures[0] if captures else subprocess.PIPE,
             stderr=captures[1] if captures else subprocess.PIPE,
             env=env,
@@ -2094,8 +2091,8 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
     return git_result(repo, *args, check=check).stdout
 
 
-def git_path_list(repo: Path, *args: str, check: bool = True) -> list[str]:
-    return [path for path in git(repo, *args, check=check).split("\0") if path]
+def git_path_list(repo: Path, *args: str) -> list[str]:
+    return [path for path in git(repo, *args).split("\0") if path]
 
 
 def repo_root() -> Path:
@@ -7453,11 +7450,11 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
 
 
 class CodexStreamDisplay:
-    def __init__(self, *, activity_seconds: int = 20, suppress_diagnostics: bool = False, engine_stage: EngineStage | None = None) -> None:
+    def __init__(self, *, suppress_diagnostics: bool = False, engine_stage: EngineStage | None = None) -> None:
         self.engine_stage = engine_stage
         self.stage_generated = False
         self.stage_stream = "stdout"
-        self.activity_seconds = activity_seconds
+        self.activity_seconds = 20
         self.suppress_diagnostics = suppress_diagnostics
         self.hidden_events = 0
         self.last_visible = time.monotonic()
@@ -7551,8 +7548,8 @@ class CodexStreamDisplay:
 
 
 class ClaudeStreamDisplay:
-    def __init__(self, *, activity_seconds: int = 20) -> None:
-        self.activity_seconds = activity_seconds
+    def __init__(self) -> None:
+        self.activity_seconds = 20
         self.hidden_events = 0
         self.last_visible = time.monotonic()
         self.started = False
