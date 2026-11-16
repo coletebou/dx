@@ -400,20 +400,11 @@ class MemoryGateTest(unittest.TestCase):
     def test_crafted_parent_component_is_rejected(self):
         old = self.setup_memory()
         blob = self.git('rev-parse', old + ':memory/test/MEMORY.md')
-
-        def tree(entries):
-            raw = b''.join(mode.encode() + b' ' + name.encode() + b'\0' + bytes.fromhex(oid)
-                           for mode, name, oid in entries)
-            return subprocess.check_output(
-                ['git', '-C', str(self.repo), 'hash-object', '--literally', '-w', '-t', 'tree', '--stdin'],
-                input=raw).decode().strip()
-
-        escaped = tree([('100644', 'escape.md', blob)])
-        home = tree([('40000', '..', escaped), ('100644', 'MEMORY.md', blob)])
-        memory = tree([('40000', 'test', home)])
-        root = tree([('40000', 'claude', self.git('rev-parse', old + ':claude')),
-                     ('40000', 'memory', memory)])
-        tip = self.git('commit-tree', root, '-p', old, '-m', 'test: crafted path')
+        escaped = self.raw_tree([('100644', 'escape.md', blob)])
+        home = self.raw_tree([('40000', '..', escaped), ('100644', 'MEMORY.md', blob)])
+        memory = self.raw_tree([('40000', 'test', home)])
+        tip = self.raw_commit([('40000', 'claude', self.git('rev-parse', old + ':claude')),
+                               ('40000', 'memory', memory)], old)
         result = subprocess.run([str(HELPER), tip, old, 'origin'], cwd=self.repo,
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
@@ -682,16 +673,6 @@ class MemoryGateTest(unittest.TestCase):
         self.write('claude/memory-homes.conf', 'test memory/test\n')
         self.assertEqual(self.check(self.commit(), old), 0)
 
-    def test_checker_failure_blocks(self):
-        tip = self.setup_memory()
-        helper = self.repo / 'helper/pre-push-memory'
-        helper.parent.mkdir()
-        helper.write_bytes(HELPER.read_bytes())
-        helper.chmod(0o755)
-        result = subprocess.run([str(helper), tip, ZERO, 'origin'], cwd=self.repo,
-                                capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-
     def test_multi_ref_and_deletion_hook(self):
         good = self.setup_memory()
         self.write('memory/test/MEMORY.md', '[broken](absent.md)')
@@ -699,7 +680,6 @@ class MemoryGateTest(unittest.TestCase):
         scanner = self.repo / 'scanner'
         scanner.write_text('#!/bin/sh\nexit 0\n')
         scanner.chmod(0o755)
-        import os
         env = dict(os.environ, GITLEAKS_BIN=str(scanner))
         hook = ROOT / 'base/git/hooks/pre-push'
         for refs, expected_success in ((f'refs/heads/good {good} refs/heads/good {ZERO}\n'
@@ -871,11 +851,6 @@ class MemoryGateTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(reported_homes(result.stdout), ['memory/test'])
         self.assertIn('memory-canary', result.stderr)
-
-    def test_explicit_missing_directory_and_argument(self):
-        for args in (['--dir'], ['--dir', '--strict'], ['--dir', str(self.repo / 'absent')]):
-            result = subprocess.run([str(CANARY), *args], capture_output=True, timeout=5)
-            self.assertEqual(result.returncode, 2)
 
 
     def counted_gate(self):

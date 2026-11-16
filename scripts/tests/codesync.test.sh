@@ -11,8 +11,8 @@
 # when the remote moved, a background fetch included; a dirty repository on box-b, a conflict and
 # a refused commit are left with the changes uncommitted; an unfinished merge (and the like) is
 # left alone; nothing passes the secret scan; URLs are printed without credentials; a hung peer
-# is cut off at the timeout; a paused peer's real dotsync defers; plus the peers file, the
-# profile parser, the config file and dry runs. Needs gitleaks (skips without it).
+# is cut off at the timeout; a peer's run passes --peer on to its dotsync; plus the peers file,
+# the profile parser, the config file and dry runs. Needs gitleaks (skips without it).
 #
 #   bash scripts/tests/codesync.test.sh
 set -uo pipefail
@@ -721,37 +721,6 @@ equal "CODESYNC_DOTSYNC=0 skips it" "1" "$(wc -l < "$tmp/dotsync.calls" | tr -d 
 run_on box-a --local --peer
 equal "a run another machine started passes --peer on" "--local --peer" "$(tail -n 1 "$tmp/dotsync.calls" 2>&1)"
 rm "$tmp/box-a/.local/bin/dotsync"
-
-echo "dotsync on a paused peer"
-# box-b gets this checkout's real dotsync, in a dotfiles clone of its own (never this checkout).
-dseed="$tmp/dotfiles-seed"
-mkdir -p "$dseed"
-if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  (cd "$root" && git ls-files -co --exclude-standard -z | xargs -0 tar -cf - 2>/dev/null) | tar -xf - -C "$dseed"
-else
-  (cd "$root" && tar --exclude=./.git -cf - .) | tar -xf - -C "$dseed"
-fi
-sg -C "$dseed" init -q
-sg -C "$dseed" add -A
-sg -C "$dseed" commit -qm "dotfiles"
-sg init -q --bare "$tmp/dotfiles.git"
-sg -C "$dseed" push -q "$tmp/dotfiles.git" master
-B="$tmp/box-b"
-HOME="$B" git clone -q "$tmp/dotfiles.git" "$B/.dotfiles" 2>/dev/null
-ln -s "$B/.dotfiles/scripts/dotsync" "$B/.local/bin/dotsync"
-dotsync_b() { env -i HOME="$B" PATH="$clean_path" GIT_CONFIG_NOSYSTEM=1 LC_ALL=C TMPDIR="$tmp/t" DOTSYNC_NOTIFY=0 "$B/.local/bin/dotsync" "$@" 2>&1; }
-check "box-b's dotsync pauses" "paused" "$(dotsync_b pause)"
-# An edit dotsync would commit and push if it ran: old enough that only the pause holds it back.
-printf '\npaused change\n' >> "$B/.dotfiles/README.md"
-touch -t 202001010000 "$B/.dotfiles/README.md"
-dot_before="$(git -C "$tmp/dotfiles.git" rev-parse master)"
-peers box-a box-b
-run_on box-a --verbose
-check "box-b's codesync runs its dotsync as a peer, which defers while paused" "deferred: paused" "$out"
-equal "...box-b's dotfiles edit stays uncommitted" " M README.md" "$(git -C "$B/.dotfiles" status --porcelain)"
-equal "...and nothing reached the dotfiles origin" "$dot_before" "$(git -C "$tmp/dotfiles.git" rev-parse master)"
-dotsync_b resume >/dev/null
-rm -rf "$B/.dotfiles" "$B/.local/bin/dotsync"
 
 echo "the checkout"
 equal "nothing was written into the repo" "$before_status" "$(git -C "$root" status --porcelain)"

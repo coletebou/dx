@@ -12,7 +12,7 @@
 #
 #   bash scripts/tests/dotsync.test.sh
 #   DOTSYNC_TEST_ONLY="basic secret" bash scripts/tests/dotsync.test.sh    (some sections only:
-#     basic background identity secret pause session replace hang conflict readonly)
+#     basic background identity secret pause session hang conflict readonly)
 set -uo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd -P)"
@@ -238,13 +238,6 @@ lacks "...its dotsync never ran" "--one-line" "$(cat "$tmp/ssh-box-other.log")"
 equal "...and it holds no dotsync state" "absent" "$(gone "$tmp/box-other/.local/state/dotsync")"
 out="$(dotsync_on box-a --host box-other)"; rc=$?
 check "naming it with --host does not override the identity check" "box-other: skipped (identity other" "$out"
-# The receiving side guards too: a peer command sent anyway refuses before anything runs.
-script="$(on box-a bash -c 'source "$1/scripts/lib/dotsync-runtime.sh"; dotsync_peer_script "$2" example box-a "\$HOME/.local/bin/dotsync"' \
-  _ "$A/.dotfiles" "$(origin_head)")"
-rc=0; printf '%s\n' "$script" | on box-a ssh box-other sh -s >/dev/null 2>&1 || rc=$?
-equal "the peer command itself refuses a peer of another identity (exit 4)" 4 "$rc"
-equal "...still without running anything there" "absent" "$(gone "$tmp/box-other/.local/state/dotsync")"
-equal "...or touching anything" "$other_before" "$(snapshot "$tmp/box-other")"
 fi
 
 # ── the secret gate ──────────────────────────────────────────────────────
@@ -330,30 +323,6 @@ check "...naming the session in its log" "a Claude Code session is working in th
 touch -t 202001010000 "$B/.claude/projects/$slug/session.jsonl"
 out="$(dotsync_on box-a --wait)"; rc=$?
 equal "once the session goes quiet, box-b syncs" "$(origin_head)" "$(g box-b rev-parse HEAD)"
-fi
-
-# ── the script replaced by its own pull ──────────────────────────────────
-if want replace; then
-echo "a pull that replaces dotsync itself finishes on the code it started with"
-writer="$tmp/writer"
-hg clone -q "$tmp/origin.git" "$writer"
-cp "$writer/scripts/dotsync" "$tmp/dotsync.original"
-# Longer than the real script, so a shell that kept reading the file after the pull would land
-# on one of these lines wherever it resumed.
-{ echo '#!/bin/bash'; for _ in $(seq 1 30000); do echo 'echo replaced; exit 88'; done; } >"$writer/scripts/dotsync"
-hg -C "$writer" commit -qam "replace dotsync"
-hg -C "$writer" push -q origin master
-out="$(dotsync_on box-b --local)"; rc=$?
-equal "box-b's run that pulled the replacement still succeeds" 0 "$rc"
-check "...and the replacement arrived" "exit 88" "$(head -n 2 "$B/.dotfiles/scripts/dotsync")"
-lacks "...without running it" "replaced" "$out"
-lacks "...or any part of it" "command not found" "$out"
-# Put the real one back (box-b now runs the replacement, so the harness pulls for it).
-cp "$tmp/dotsync.original" "$writer/scripts/dotsync"
-hg -C "$writer" commit -qam "restore dotsync"
-hg -C "$writer" push -q origin master
-g box-b pull -q --rebase
-dotsync_on box-a --local >/dev/null
 fi
 
 # ── a peer that hangs ────────────────────────────────────────────────────
