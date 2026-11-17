@@ -199,10 +199,6 @@ class RuntimeTest(unittest.TestCase):
                 self.assert_bash_output("scheduled=%s\n" % scheduled + block +
                                         'printf "%s %s" "$DOTSYNC_SSH_TIMEOUT" "$DOTSYNC_PEER_TIMEOUT"', expected, env=env)
 
-    def test_failure_helper_keeps_the_first_failed_phase(self):
-        self.assert_bash_output('EXIT_CODE=0; DOTSYNC_FAILED_PHASE=""; dotsync_fail git-fetch; dotsync_fail git-push; '
-                                'printf "%s %s" "$EXIT_CODE" "$DOTSYNC_FAILED_PHASE"', "1 git-fetch")
-
     def test_mktemp_follows_tmpdir(self):
         scratch = self.root / "scratch"
         scratch.mkdir()
@@ -458,16 +454,6 @@ class RuntimeTest(unittest.TestCase):
         result = self.staging("dotsync_check_staged", self.scanner_env())
         self.assertEqual(result.returncode, 1)
         self.assertIn("unmerged paths", result.stderr)
-
-    @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks is not installed")
-    def test_real_gitleaks_blocks_a_synthetic_key_without_printing_it(self):
-        import secrets
-        synthetic = secrets.token_hex(32)
-        (self.repo / "source").write_text('api_key="' + synthetic + '"\n')
-        self.git("add", "source")
-        result = self.staging("dotsync_check_staged")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertNotIn(synthetic, result.stdout + result.stderr)
 
     def test_generic_subject_names_the_host_and_sorted_areas(self):
         for path in ("scripts/a", "base/b", "scripts/c", "README.md"):

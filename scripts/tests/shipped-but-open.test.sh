@@ -30,7 +30,9 @@ mkdir -p "$tmp/bin" "$fx"
 cat > "$tmp/bin/glab" <<'EOF'
 #!/usr/bin/env bash
 # Records argv (one call per line, arguments separated by " | "), then answers from $FAKE_FX.
-{ printf '%s' "$1"; for a in "${@:2}"; do printf ' | %s' "$a"; done; printf '\n'; } >> "$FAKE_CALLS"
+# One write per line: PARALLEL runs several of these at once, and separate writes interleave.
+line="$1"; for a in "${@:2}"; do line="$line | $a"; done
+printf '%s\n' "$line" >> "$FAKE_CALLS"
 if [[ "$1 ${2:-}" == "repo view" ]]; then
   [[ -z "${FAKE_NO_REPO:-}" ]] || { echo "not a git repository" >&2; exit 1; }
   echo '{"id": 1, "path_with_namespace": "acme/widgets"}'; exit 0

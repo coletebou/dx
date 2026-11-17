@@ -387,8 +387,8 @@ class CommitMessageTest(unittest.TestCase):
                              ["* " + "x" * 300, "second", "third detail", "fourth detail", "fifth detail"])
         subject, _, body = message.partition("\n\n")
         self.assertTrue(subject.startswith("chore(sync): box-a: record very"))
-        self.assertLessEqual(len(subject), cm.MAX_SUBJECT)
-        self.assertEqual(len(body.strip().splitlines()), cm.MAX_DETAILS)
+        self.assertLessEqual(len(subject), 100)
+        self.assertEqual(len(body.strip().splitlines()), 4)
         with self.assertRaises(cm.ModelError):
             cm.compose("h", "ok.", [])
 

@@ -2,6 +2,7 @@
 """Hermetic tests for scripts/reflections: a throwaway dotfiles tree, git repos,
 Codex home and index per test. Nothing under the real HOME is read or written."""
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -291,7 +292,9 @@ class ReflectionsTest(unittest.TestCase):
         with open(log, "a") as f:
             f.write("\n")
             for n in ("1111", "2222"):
-                f.write(json.dumps({"v": 1, "ts": "2026-09-29T00:00:0%sZ" % n[0], "op": "add",
+                # Seeded "now": a fixed date ages past the 30-day stale cutoff and drops out of the listing.
+                ts = (datetime.now(timezone.utc) - timedelta(seconds=int(n[0]))).strftime("%Y-%m-%dT%H:%M:%SZ")
+                f.write(json.dumps({"v": 1, "ts": ts, "op": "add",
                                     "id": "zzzz" + n, "repo": "webapp", "kind": "action",
                                     "status": "open", "title": "seeded " + n, "host": "host-a"}) + "\n")
         r = self.run_cli("done", "zzzz", check=False)

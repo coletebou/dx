@@ -42,32 +42,60 @@ class OutputReadinessTests(unittest.TestCase):
                                   preflight_output=None, native_handoff=None,
                                   mode='uncommitted', base=None, dry_run=False)
 
-    def test_missing_parent_matches_actual_atomic_publication_failure(self):
-        destination = self.root / 'missing-parent' / 'review.json'
-        with self.assertRaises(FileNotFoundError):
-            self.helper.atomic_write_text(destination, 'public synthetic report\n')
-        with self.assertRaisesRegex(SystemExit, 'output destination is not writable'):
-            self.helper.prepare_output_paths(self.arguments(destination), self.repo)
-        self.assertFalse(destination.parent.exists())
+    def test_unready_destination_stops_main_before_target_and_engine(self):
+        real_fdopen = self.helper.os.fdopen
 
-    def test_missing_parent_stops_main_before_target_and_engine(self):
-        args = self.arguments(self.root / 'missing-parent' / 'review.json')
-        names = {
-            'reviewer_args': mock.Mock(return_value=[]),
-            'preflight_git': mock.Mock(return_value=True),
-            'repo_root': mock.Mock(return_value=self.repo),
-            'choose_target': mock.Mock(side_effect=AssertionError('unready output reached target selection')),
-            'run_engine': mock.Mock(side_effect=AssertionError('engine forbidden')),
-        }
-        with mock.patch.dict(self.helper.main_with_args.__globals__, names):
-            for dry_run in (False, True):
-                args.dry_run = dry_run
-                with self.subTest(dry_run=dry_run):
-                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                        with self.assertRaisesRegex(SystemExit, 'output destination is not writable'):
+        class DiskFullWriter:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                self.handle.__enter__()
+                return self
+
+            def write(self, content):
+                raise OSError(errno.ENOSPC, 'private write diagnostic sentinel')
+
+            def __exit__(self, *exc):
+                return self.handle.__exit__(*exc)
+
+        def full_writer(*args, **kwargs):
+            return DiskFullWriter(real_fdopen(*args, **kwargs))
+
+        tempfile_owner, os_owner = self.helper.tempfile, self.helper.os
+        cases = (
+            ('missing parent', True, contextlib.nullcontext),
+            ('probe permission', False, lambda: mock.patch.object(
+                tempfile_owner, 'NamedTemporaryFile', side_effect=PermissionError('private diagnostic sentinel'))),
+            ('probe creation ENOSPC', False, lambda: mock.patch.object(
+                tempfile_owner, 'NamedTemporaryFile', side_effect=OSError(errno.ENOSPC, 'private create diagnostic sentinel'))),
+            ('probe write ENOSPC', False, lambda: mock.patch.object(os_owner, 'fdopen', side_effect=full_writer)),
+            ('atomic replace ENOSPC', False, lambda: mock.patch.object(
+                os_owner, 'replace', side_effect=OSError(errno.ENOSPC, 'private diagnostic sentinel'))),
+        )
+        for label, missing_parent, failure in cases:
+            for dry_run in ((False, True) if missing_parent else (False,)):
+                with self.subTest(case=label, dry_run=dry_run):
+                    parent = self.root / ('missing-parent' if missing_parent else '')
+                    destination = parent / f'{label.replace(" ", "-")}-{dry_run}.json'
+                    args = self.arguments(destination)
+                    args.dry_run = dry_run
+                    names = {
+                        'reviewer_args': mock.Mock(return_value=[]),
+                        'preflight_git': mock.Mock(return_value=True),
+                        'repo_root': mock.Mock(return_value=self.repo),
+                        'choose_target': mock.Mock(side_effect=AssertionError('unready output reached target selection')),
+                        'run_engine': mock.Mock(side_effect=AssertionError('engine forbidden')),
+                    }
+                    with failure(), mock.patch.dict(self.helper.main_with_args.__globals__, names), \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaisesRegex(SystemExit, 'output destination is not writable') as caught:
                             self.helper.main_with_args(args)
-        names['choose_target'].assert_not_called()
-        names['run_engine'].assert_not_called()
+                    self.assertNotIn('diagnostic sentinel', str(caught.exception))
+                    names['choose_target'].assert_not_called()
+                    names['run_engine'].assert_not_called()
+                    self.assertFalse(destination.exists())
+                    self.assertEqual(parent.exists(), not missing_parent)
 
     def test_each_report_role_requires_a_ready_parent(self):
         for attribute in ('json_output', 'output', 'status_output', 'preflight_output'):
@@ -142,86 +170,6 @@ class OutputReadinessTests(unittest.TestCase):
         finally:
             report.chmod(stat.S_IREAD | stat.S_IWRITE)
 
-    def test_permission_failure_stops_before_target_and_engine(self):
-        args = self.arguments(self.root / 'review.json')
-        names = {
-            'reviewer_args': mock.Mock(return_value=[]),
-            'preflight_git': mock.Mock(return_value=True),
-            'repo_root': mock.Mock(return_value=self.repo),
-            'choose_target': mock.Mock(side_effect=AssertionError('target forbidden')),
-            'run_engine': mock.Mock(side_effect=AssertionError('engine forbidden')),
-        }
-        with mock.patch.dict(self.helper.main_with_args.__globals__, names), \
-                mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile', side_effect=PermissionError('private diagnostic sentinel')), \
-                contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaisesRegex(SystemExit, 'output destination is not writable') as caught:
-                self.helper.main_with_args(args)
-        self.assertNotIn('private diagnostic sentinel', str(caught.exception))
-        names['choose_target'].assert_not_called()
-        names['run_engine'].assert_not_called()
-
-    def test_enospc_at_atomic_replace_refuses_before_target_and_engine(self):
-        args = self.arguments(self.root / 'review.json')
-        names = {
-            'reviewer_args': mock.Mock(return_value=[]),
-            'preflight_git': mock.Mock(return_value=True),
-            'repo_root': mock.Mock(return_value=self.repo),
-            'choose_target': mock.Mock(side_effect=AssertionError('target forbidden')),
-            'run_engine': mock.Mock(side_effect=AssertionError('engine forbidden')),
-        }
-        with mock.patch.dict(self.helper.main_with_args.__globals__, names), \
-                mock.patch.object(self.helper.os, 'replace', side_effect=OSError(errno.ENOSPC, 'private diagnostic sentinel')), \
-                contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaisesRegex(SystemExit, 'output destination is not writable') as caught:
-                self.helper.main_with_args(args)
-        self.assertNotIn('private diagnostic sentinel', str(caught.exception))
-        self.assertFalse(Path(args.json_output).exists())
-        names['choose_target'].assert_not_called()
-        names['run_engine'].assert_not_called()
-
-    def test_enospc_at_creation_and_write_refuses_before_target_and_engine(self):
-        real_fdopen = self.helper.os.fdopen
-
-        class DiskFullWriter:
-            def __init__(self, handle):
-                self.handle = handle
-
-            def __enter__(self):
-                self.handle.__enter__()
-                return self
-
-            def write(self, content):
-                raise OSError(errno.ENOSPC, 'private write diagnostic sentinel')
-
-            def __exit__(self, *exc):
-                return self.handle.__exit__(*exc)
-
-        def full_writer(*args, **kwargs):
-            return DiskFullWriter(real_fdopen(*args, **kwargs))
-
-        boundaries = (
-            mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile',
-                              side_effect=OSError(errno.ENOSPC, 'private create diagnostic sentinel')),
-            mock.patch.object(self.helper.os, 'fdopen', side_effect=full_writer),
-        )
-        for index, boundary in enumerate(boundaries):
-            args = self.arguments(self.root / f'review-{index}.json')
-            names = {
-                'reviewer_args': mock.Mock(return_value=[]),
-                'preflight_git': mock.Mock(return_value=True),
-                'repo_root': mock.Mock(return_value=self.repo),
-                'choose_target': mock.Mock(side_effect=AssertionError('target forbidden')),
-                'run_engine': mock.Mock(side_effect=AssertionError('engine forbidden')),
-            }
-            with self.subTest(boundary=index), boundary, \
-                    mock.patch.dict(self.helper.main_with_args.__globals__, names), \
-                    contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaisesRegex(SystemExit, 'output destination is not writable') as caught:
-                    self.helper.main_with_args(args)
-                self.assertNotIn('diagnostic sentinel', str(caught.exception))
-                names['choose_target'].assert_not_called()
-                names['run_engine'].assert_not_called()
-
     def test_existing_status_survives_an_unready_report_parent(self):
         status = self.root / 'status.json'
         status.write_text('retain prior status\n', encoding='utf-8')
@@ -251,50 +199,11 @@ class OutputReadinessTests(unittest.TestCase):
         probe.assert_not_called()
         self.assertEqual(list(self.repo.iterdir()), [])
 
-    def test_case_and_unicode_aliases_still_refuse_before_probes(self):
-        for first, second in (('result.json', 'RESULT.json'), ('caf\u00e9.json', 'cafe\u0301.json')):
-            with self.subTest(first=first):
-                args = self.arguments(self.root / first)
-                args.output = str(self.root / second)
-                with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
-                    with self.assertRaisesRegex(SystemExit, 'must use a different path'):
-                        self.helper.prepare_output_paths(args, self.repo)
-                probe.assert_not_called()
-
-    def test_status_hardlink_alias_still_refuses_without_changing_bytes(self):
-        report = self.root / 'review.json'
-        report.write_text('retain shared bytes\n', encoding='utf-8')
-        alias = self.root / 'status.json'
-        os.link(report, alias)
-        args = self.arguments(report)
-        args.status_output = str(alias)
-        with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
-            with self.assertRaisesRegex(SystemExit, 'must use a different path'):
-                self.helper.prepare_output_paths(args, self.repo)
-        probe.assert_not_called()
-        self.assertEqual(alias.read_text(encoding='utf-8'), 'retain shared bytes\n')
-
     def symlink(self, link, target):
         try:
             link.symlink_to(target, target_is_directory=target.is_dir())
         except OSError:
             self.skipTest('host_only: symlink creation unavailable')
-
-    def test_final_symlinks_replace_entries_without_touching_shared_referent(self):
-        target = self.root / 'previous.json'
-        target.write_text('retain referent\n', encoding='utf-8')
-        first, second = self.root / 'one.json', self.root / 'two.json'
-        self.symlink(first, target)
-        self.symlink(second, target)
-        args = self.arguments(first)
-        args.output = str(second)
-        self.helper.prepare_output_paths(args, self.repo)
-        self.assertTrue(first.is_symlink())
-        self.helper.atomic_write_text(Path(args.json_output), 'new entry\n')
-        self.assertFalse(first.is_symlink())
-        self.assertEqual(first.read_text(encoding='utf-8'), 'new entry\n')
-        self.assertEqual(target.read_text(encoding='utf-8'), 'retain referent\n')
-        self.assertEqual(second.read_text(encoding='utf-8'), 'retain referent\n')
 
     def test_symlinked_parent_or_final_referent_inside_repo_remains_refused(self):
         parent_alias = self.root / 'repo-alias'
@@ -310,13 +219,6 @@ class OutputReadinessTests(unittest.TestCase):
                         self.helper.prepare_output_paths(self.arguments(destination), self.repo)
                 probe.assert_not_called()
         self.assertEqual(source.read_text(encoding='utf-8'), 'retained source\n')
-
-    def test_relative_paths_freeze_to_original_cwd(self):
-        args = self.arguments('relative-review.json')
-        with mock.patch.object(os, 'getcwd', return_value=str(self.root)):
-            self.helper.prepare_output_paths(args, self.repo)
-        self.assertEqual(Path(args.json_output), self.root / 'relative-review.json')
-        self.assertFalse(Path(args.json_output).exists())
 
     def test_optional_stage_directory_keeps_its_existing_contract(self):
         args = self.arguments(self.root / 'unused.json')

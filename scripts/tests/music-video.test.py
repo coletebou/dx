@@ -12,6 +12,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -247,11 +248,13 @@ class MusicVideoTests(unittest.TestCase):
                         load("gen_images", self.project).MODEL, load("gen_videos", self.project).MODEL,
                         load("watch", self.project, GOOGLE_API_KEY="k").MODEL):
             self.assertIn(f"`{default}`", table)
-        score = (SCRIPTS / "score_song.py").read_text()
-        for var, default in (("SCRIBE_MODEL", "scribe_v2"), ("WHISPER_MODEL", "whisper-1")):
-            self.assertIn(f'os.environ.get("{var}", "{default}")', score)
-            self.assertIn(f"| `{var}` | `{default}` |", table)
-        self.assertIn('os.environ.get("LISTEN_MODEL", ', (SCRIPTS / "listen.py").read_text())
+        # These scripts read their model when they run, not at import: the documented default must be the
+        # one their environment lookup falls back to.
+        for var, script in (("SCRIBE_MODEL", "score_song.py"), ("WHISPER_MODEL", "score_song.py"),
+                            ("LISTEN_MODEL", "listen.py")):
+            documented = re.search(rf"^\| `{var}` \| `([^`]+)` \|", table, re.M)
+            self.assertIsNotNone(documented, f"{var} is not in the defaults table")
+            self.assertIn(f'os.environ.get("{var}", "{documented.group(1)}")', (SCRIPTS / script).read_text())
 
 
 if __name__ == "__main__":

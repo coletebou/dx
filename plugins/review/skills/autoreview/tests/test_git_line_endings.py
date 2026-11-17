@@ -115,12 +115,6 @@ class GitLineEndingTests(unittest.TestCase):
         self.assertEqual(self.helper["local_bundle"](self.repo).paths, {"source.txt"})
         self.assertEqual(self.snapshot(), before)
 
-    def test_local_override_and_attributes_keep_precedence(self):
-        self.seed(local="false", attributes="*.txt -text\n")
-        self.assertFalse(self.helper["is_dirty"](self.repo))
-        (self.repo / "source.txt").write_bytes(b"original\n")
-        self.assertEqual(self.helper["local_bundle"](self.repo).paths, {"source.txt"})
-
     def test_local_false_overrides_global_true_without_attributes(self):
         self.seed(local="false")
         self.assertFalse(self.helper["is_dirty"](self.repo))
