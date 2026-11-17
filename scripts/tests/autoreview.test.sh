@@ -35,7 +35,9 @@ if [[ -z "$py" ]] || ! new_enough "$py"; then
   echo "autoreview.test.sh: needs Python 3.10 or newer (set AUTOREVIEW_TEST_PYTHON)" >&2; exit 1
 fi
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/autoreview-test.XXXXXX")"
+# The engine stage refuses to persist under a group- or world-writable ancestor (a Linux
+# runner's /tmp is 1777), and every group's HOME lives here: AUTOREVIEW_TEST_TMPDIR moves it.
+work="$(mktemp -d "${AUTOREVIEW_TEST_TMPDIR:-${TMPDIR:-/tmp}}/autoreview-test.XXXXXX")"
 work="$(cd "$work" && pwd -P)"
 trap 'rm -rf "$work"' EXIT
 

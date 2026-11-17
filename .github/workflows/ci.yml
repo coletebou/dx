@@ -125,6 +125,8 @@ jobs:
       - name: Every suite
         env:
           RUN_ALL_LOG_DIR: ${{ runner.temp }}/suite-logs
+          # A private parent for autoreview's test HOMEs: its engine stage refuses /tmp (1777).
+          AUTOREVIEW_TEST_TMPDIR: ${{ runner.temp }}
         run: bash scripts/tests/run-all.sh
       - name: Keep the failing suites' whole output
         if: failure()
