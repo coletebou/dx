@@ -76,6 +76,9 @@ jobs:
   suites:
     name: suites (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A green run takes 9 to 14 minutes. Without a cap a hung suite holds the runner for GitHub's
+    # 6-hour limit (macOS has hung in codesync.test.sh on every master run since 2026-10-28).
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
