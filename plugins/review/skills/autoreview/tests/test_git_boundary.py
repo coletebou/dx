@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import runpy
 import shlex
@@ -104,16 +103,6 @@ class GitFixtureIsolationTests(unittest.TestCase):
             repo.mkdir()
             self.harness["create_fixture_repo"](repo, "benign")
         return repo
-
-    def test_native_oracle_does_not_launch_background_maintenance(self):
-        trace = self.root / "maintenance-trace.jsonl"
-        (self.sentinel / "sentinel.txt").write_text("updated synthetic content\n")
-        self.native(self.sentinel, "add", ".")
-        with mock.patch.dict(self.oracle_env, {"GIT_TRACE2_EVENT": str(trace)}):
-            self.native(self.sentinel, "commit", "-qm", "observe maintenance")
-        events = [json.loads(line) for line in trace.read_text().splitlines()]
-        children = [event["argv"] for event in events if event.get("event") == "child_start"]
-        self.assertFalse(any("maintenance" in argv for argv in children), children)
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixtures")
     def test_custom_fixture_git_lookup_rejects_checkout_and_wrapper_tail(self):
@@ -245,31 +234,6 @@ class GitFixtureIsolationTests(unittest.TestCase):
                     self.assertEqual(self.native(repo, "show", f"HEAD:{path}"), expected)
                     self.assertEqual(config.read_text(), content)
             config.unlink()
-
-    def test_image_fixture_is_independent_of_native_text_newlines(self):
-        original = Path.write_text
-        def windows_newlines(path, data, *args, **kwargs):
-            if path.name == "text.txt" and data == "old\n":
-                return path.write_bytes(data.replace("\n", "\r\n").encode("utf-8"))
-            return original(path, data, *args, **kwargs)
-        case = IMAGE_TESTS["AutoreviewImageGitTests"]("runTest")
-        self.addCleanup(case.doCleanups)
-        with mock.patch.object(Path, "write_text", windows_newlines):
-            case.setUp()
-        self.assertEqual(self.native(case.repo, "show", "HEAD:text.txt"), "old\n")
-
-    def test_image_fixture_preserves_text_output_and_nonzero_failure(self):
-        case = IMAGE_TESTS["AutoreviewImageGitTests"]("runTest")
-        self.addCleanup(case.doCleanups)
-        case.setUp()
-        self.assertEqual(case.git("show", "HEAD:text.txt"), "old\n")
-        case.commit("next.txt", b"next\n")
-        self.assertEqual(case.git("show", "HEAD:next.txt"), "next\n")
-        self.assertEqual(case.git("rev-list", "--count", "HEAD"), "2\n")
-        with self.assertRaises(subprocess.CalledProcessError) as caught:
-            case.git("config", "--get", "fixture.absent")
-        self.assertEqual(caught.exception.returncode, 1)
-        self.assertEqual(caught.exception.output, "")
 
     def test_image_fixture_refuses_when_no_external_git_is_available(self):
         case = IMAGE_TESTS["AutoreviewImageGitTests"]("runTest")

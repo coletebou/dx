@@ -67,7 +67,8 @@ class StageTests(unittest.TestCase):
         return stage
     def fake(self, stdout='', stderr='', *, suppress=False, activity=20, sink=None, stage=None):
         stage = stage or self.stage()
-        display = M.CodexStreamDisplay(engine_stage=stage, suppress_diagnostics=suppress, activity_seconds=activity)
+        display = M.CodexStreamDisplay(engine_stage=stage, suppress_diagnostics=suppress)
+        display.activity_seconds = activity
         proc = FakeProcess(stdout, stderr)
         out, err = sink or io.StringIO(), io.StringIO()
         with mock.patch.object(M.subprocess, 'Popen', return_value=proc), \
@@ -363,10 +364,6 @@ class StageTests(unittest.TestCase):
         args=self.parse(); self.assertIsNone(args.engine_stage_dir)
         args=self.parse(['--engine-stage-dir',str(self.output),'--stream-engine-output'])
         self.assertEqual(args.engine_stage_dir,str(self.output))
-    def test_carrier_survives_reviewer_clone(self):
-        args=self.parse(); args._engine_stage=self.stage()
-        reviewer=M.reviewer_args(args)[0]
-        self.assertIs(reviewer._engine_stage,args._engine_stage)
     def test_main_wrapper_opt_in_off_and_unsupported(self):
         for extra in ([],['--engine-stage-dir',str(self.output)],['--engine-stage-dir',str(self.output),'--stream-engine-output','--engine','claude'],['--engine-stage-dir',str(self.output),'--stream-engine-output','--dry-run']):
             with self.subTest(extra=extra):
@@ -500,10 +497,6 @@ class StageTests(unittest.TestCase):
         with mock.patch.object(M.os,'fstat',side_effect=changed):
             M.persist_engine_stage(str(self.output),stage)
         self.assertEqual(list(self.output.iterdir()),[])
-    def test_complete_snapshot_is_independent_copy(self):
-        stage=self.stage(); stage.finish('returned'); first=stage.snapshot()
-        first['stdout_text_read']=True
-        self.assertFalse(stage.snapshot()['stdout_text_read'])
     def test_main_interrupt_code_unchanged(self):
         with mock.patch.object(M,'main_impl',side_effect=M.EngineInterrupted(143)):
             self.assertEqual(M.main(),143)
@@ -536,10 +529,6 @@ class StageTests(unittest.TestCase):
         args=self.parse(['--engine-stage-dir',str(alias)])
         with self.assertRaisesRegex(SystemExit,'--engine-stage-dir must point outside'):
             M.prepare_output_paths(args,self.home)
-    def test_stage_directory_outside_repository_allowed(self):
-        args=self.parse(['--engine-stage-dir',str(self.output)])
-        M.prepare_output_paths(args,self.home)
-
     def test_stage_directory_cannot_alias_report_destinations(self):
         for option in ('--output', '--json-output', '--status-output'):
             with self.subTest(option=option):

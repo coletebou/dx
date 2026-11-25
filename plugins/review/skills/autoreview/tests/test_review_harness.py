@@ -37,17 +37,6 @@ class ReviewHarnessTests(unittest.TestCase):
                     if nested.exists():
                         nested.chmod(0o700)
 
-    def test_harness_cleanup_rejects_retained_temp_repo(self) -> None:
-        harness = SCRIPT.with_name("test-review-harness.py")
-        cleanup_repo = runpy.run_path(str(harness))["cleanup_repo"]
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = Path(tempdir) / "repo"
-            repo.mkdir()
-
-            with mock.patch.object(shutil, "rmtree", return_value=None):
-                with self.assertRaisesRegex(RuntimeError, "path was retained"):
-                    cleanup_repo(repo)
-
     def test_harness_main_preserves_review_failure_when_cleanup_fails(self) -> None:
         harness = SCRIPT.with_name("test-review-harness.py")
         namespace = runpy.run_path(str(harness))

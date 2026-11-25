@@ -171,7 +171,7 @@ out=$(render 'claude-sonnet-5' 'Sonnet' 'low')
 contains "sonnet5 with low effort" 'sonnet5·lo' "$out"
 
 out=$(render 'claude-haiku-4-5-20251001' 'Haiku' 'max')
-contains "haiku4.5 renders max effort" 'haiku4.5' "$out"
+contains "haiku4.5 renders max effort" 'haiku4.5·max' "$out"
 
 printf '\n\033[1mrender — no effort set\033[0m\n'
 out=$(render 'claude-opus-5' 'Opus' '')

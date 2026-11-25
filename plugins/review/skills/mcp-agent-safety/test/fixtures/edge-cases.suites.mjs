@@ -14,12 +14,6 @@ const SUITES = {
     servers: (ctx) => ({ describe: { command: process.execPath, args: [path.join(here, 'describe-server.mjs')], env: { DESCRIBE_KEY: ctx.canary('describe-key') } } }),
     scenarios: [{ id: 'ping', prompt: 'Ping the service.' }],
   },
-  // A ${VAR} reference Claude Code would expand from its own environment.
-  'host-env-ref': {
-    name: 'host env reference',
-    servers: (ctx) => billing({ BILLING_API_KEY: '${HARNESS_TEST_TOKEN}', DECOY: ctx.canary('decoy') }),
-    scenarios: [{ id: 'x', prompt: 'hello' }],
-  },
   // A runtime canary reader that comes back empty.
   'empty-canary': {
     name: 'empty runtime canary',

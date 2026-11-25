@@ -308,27 +308,19 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.wait_for(report), "explicit opt-in works")
         self.assertIn("ROOT CAUSE:", report.read_text())
 
-    def test_diagnostic_agent_runs_with_every_hook_guard(self):
-        env = {**self.env, "API_RECOVERY_DIAG_CMD": 'env > "$REPORT"'}
+    def test_diagnostic_agent_runs_with_every_hook_guard_and_no_session_binding(self):
+        # The hook runs inside a Claude Code session; its diagnostic agent must not inherit that session.
+        env = {**self.env, "API_RECOVERY_DIAG_CMD": 'env > "$REPORT"', "CLAUDECODE": "1",
+               "CLAUDE_CODE_SESSION_ID": "parent-session"}
         self.run_hook(self.payload(error="model_not_found", msg="bad model"), env=env)
         report = Path(self.must_state()["diag_report"])
         self.assertTrue(self.wait_for(report))
-        seen = report.read_text()
-        for guard in mod.CHILD_GUARDS:
-            self.assertIn(f"{guard}=1", seen, guard)
-
-    def test_diagnosis_child_env_drops_session_bindings(self):
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "parent"
-        os.environ["CLAUDECODE"] = "1"
-        try:
-            env = mod.child_env()
-        finally:
-            del os.environ["CLAUDE_CODE_SESSION_ID"], os.environ["CLAUDECODE"]
-        self.assertNotIn("CLAUDE_CODE_SESSION_ID", env)
-        self.assertNotIn("CLAUDECODE", env)
+        seen = report.read_text().splitlines()
         for guard in ("AGENT_HOOK_CHILD", "API_RECOVERY_DISABLE", "REFLECTOR_DISABLE", "JEV_NUDGE_DISABLE",
                       "CONTEXT_ADVISOR_DISABLE", "AGENT_NOTIFY_DISABLE"):
-            self.assertEqual(env[guard], "1", guard)
+            self.assertIn(f"{guard}=1", seen, guard)
+        for binding in ("CLAUDECODE=", "CLAUDE_CODE_SESSION_ID="):
+            self.assertFalse([line for line in seen if line.startswith(binding)], binding)
 
 
 if __name__ == "__main__":

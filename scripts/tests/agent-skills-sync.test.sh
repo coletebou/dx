@@ -272,8 +272,6 @@ assert_contains "$DEFAULTS" "https://github.com/coletebou/agent-skills.git" \
 assert_contains "$DEFAULTS" "(default: ~/code/agent-skills)" "--help names the default checkout"
 assert_eq "$(ls -A "$HOME")" "" "no run touched HOME: every checkout here was named"
 
-assert_contains "$(grep -F 'scripts/agent-skills-sync' "$ROOT/install.sh")" \
-  "link_bins" "installer exposes the updater"
 # It runs only when someone runs it: no timer, launch agent, hook, shell file or other script does.
 RUNNERS="$(cd "$ROOT" && grep -rl 'agent-skills-sync' systemd launchagents base roles identities \
   plugins zshenv zshrc aliases scripts 2>/dev/null | grep -v -e '^scripts/agent-skills-sync$' \

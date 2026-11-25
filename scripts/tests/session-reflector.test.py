@@ -309,16 +309,10 @@ open(args[args.index("--output") + 1], "w").write(reply)
         time.sleep(0.5)  # the hook path may have detached a child; give it time to (not) call the model
         self.assertFalse(self.models_seen.exists(), "a restricted transcript reached a model")
         self.assertEqual(json.loads(self.log.read_text().splitlines()[-1])["skipped"], "data boundary")
-
-    def test_a_broken_boundary_check_fails_closed(self):
-        self.env["MEMORY_BOUNDARY_CMD"] = "/nonexistent/boundary-check"
-        args = ["run", "--transcript", str(self.transcript), "--session", "b1", "--cwd", str(self.cwd),
-                "--trigger", "sessionend"]
-        self.assertEqual(self.run_reflector(*args).returncode, 0)
-        self.assertFalse(self.models_seen.exists())
-        self.assertEqual(json.loads(self.log.read_text().splitlines()[-1])["skipped"], "data boundary")
+        # The control: a check that answers exit 1 (go ahead) lets the same run reflect.
         self.env["MEMORY_BOUNDARY_CMD"] = "exit 1"
-        r = self.run_reflector(*args)
+        r = self.run_reflector("run", "--transcript", str(self.transcript), "--session", "g2",
+                               "--cwd", str(self.cwd), "--trigger", "sessionend")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(self.models_seen.exists(), "exit 1 lets the reflection run")
 

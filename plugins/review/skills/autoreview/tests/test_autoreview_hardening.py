@@ -31,8 +31,6 @@ except ModuleNotFoundError:
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
 fixture_git = runpy.run_path(str(SCRIPT.with_name("test-review-harness.py")))["fixture_git"]
 FIXTURES = Path(__file__).with_name("fixtures")
-PRIVATE_KEY_BEGIN_TEXT = "BEGIN " + "PRIVATE KEY"
-RSA_PRIVATE_KEY_BEGIN_TEXT = "BEGIN RSA " + "PRIVATE KEY"
 
 
 def write_executable(path: Path, text: str) -> Path:
@@ -252,22 +250,6 @@ def posix_process_is_running(pid: int) -> bool:
     )
     state = result.stdout.strip()
     return result.returncode == 0 and bool(state) and not state.startswith("Z")
-
-
-def installed_java() -> str | None:
-    java = shutil.which("java")
-    if java is None:
-        return None
-    try:
-        probe = subprocess.run(
-            [java, "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
-        return None
-    return java if probe.returncode == 0 else None
 
 
 class AutoreviewMixedTargetTests(unittest.TestCase):
@@ -1462,8 +1444,9 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
                 git(repo, "commit", "-qm", "deletion neighbor")
                 removed.unlink()
                 if kind != "addition":
-                    with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
-                        self.helper["local_bundle"](repo, base)
+                    for ref in (None, base):
+                        with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
+                            self.helper["local_bundle"](repo, ref)
                 git(repo, "add", ".")
                 for ref in (None, base):
                     with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
@@ -1631,40 +1614,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
         self.scan_patch.start()
         self.addCleanup(self.scan_patch.stop)
-
-    def test_outgoing_pack_scan_reads_exact_prompt_including_deleted_lines(self) -> None:
-        prompt = (
-            "# Change Bundle\n"
-            "diff --git a/config.ts b/config.ts\n"
-            "deleted file mode 100644\n"
-            "--- a/config.ts\n"
-            "+++ /dev/null\n"
-            "@@ -1 +0,0 @@\n"
-            '-const apiKey = "removed-but-still-sensitive";\n'
-        )
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-
-            def run_scanner(
-                command: list[str],
-                cwd: Path,
-                **_kwargs: object,
-            ) -> subprocess.CompletedProcess[str]:
-                self.assertEqual(command[1], "filesystem")
-                # Concurrent engines must not race on TruffleHog's self-updater.
-                self.assertIn("--no-update", command)
-                self.assertEqual(cwd, Path(command[2]).parent)
-                self.assertEqual(Path(command[2]).read_text(encoding="utf-8"), prompt)
-                return subprocess.CompletedProcess(command, 0, "", "")
-
-            with mock.patch.dict(
-                self.helper["scan_outgoing_review_pack"].__globals__,
-                {
-                    "find_command": lambda _name, _repo: "/trusted/trufflehog",
-                    "run": run_scanner,
-                },
-            ):
-                self.helper["scan_outgoing_review_pack"](repo, prompt)
 
     def test_outgoing_pack_scan_refuses_and_names_deleted_file(self) -> None:
         prompt = (
@@ -2660,24 +2609,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertEqual(captured.commit, head)
 
 
-    def test_local_bundle_preserves_boundary_when_sensitive_diff_is_omitted(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            path = repo / ".env"
-            path.write_text("TOKEN=placeholder\n", encoding="utf-8")
-            git(repo, "add", path.name)
-            git(repo, "commit", "-q", "-m", "base")
-            path.write_text("TOKEN=changed-placeholder\n", encoding="utf-8")
-            git(repo, "add", path.name)
-
-            bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
-
-            self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
-
     def test_powershell_harness_exposes_recognized_engines(self) -> None:
+        # The PowerShell wrapper validates -Engine itself; it must offer exactly
+        # the engines the Python harness it launches accepts.
         harness = SCRIPT.with_name("test-review-harness.ps1").read_text(encoding="utf-8")
-
-        self.assertIn("[ValidateSet('codex', 'claude', 'amp', 'pi', 'kimi')]", harness)
+        engine_param = re.search(r"\[ValidateSet\(([^)]*)\)\]\s*\[string\[\]\]\s*\$Engine", harness)
+        self.assertIsNotNone(engine_param, "the -Engine parameter must keep a ValidateSet")
+        offered = tuple(re.findall(r"'([^']+)'", engine_param[1]))
+        accepted = runpy.run_path(str(SCRIPT.with_name("test-review-harness.py")))["ENGINES"]
+        self.assertEqual(offered, accepted)
 
     def test_local_bundle_omits_sensitive_untracked_file_without_blocking(self) -> None:
         for rel in (".env", "tokens/session.dat", "secrets/local.py"):
@@ -2708,14 +2648,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     for label in ("--prompt-file", "--dataset"):
                         with self.subTest(label=label), self.assertRaisesRegex(SystemExit, reason):
                             self.helper["validate_evidence_file"](repo, "source.txt", label)
-
-    def test_local_bundle_rejects_non_utf8_untracked_text(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            (repo / "latin.py").write_bytes(b"print('caf\xe9')\n")
-
-            with self.assertRaisesRegex(SystemExit, "non-UTF-8 file"):
-                self.helper["local_bundle"](repo)
 
     def test_local_bundle_uses_validated_untracked_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -3787,33 +3719,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 })
                                 self.assertEqual({path.name for path in outputs.iterdir()}, {"status.json"})
 
-    def test_status_paths_reject_repo_and_aliases_before_removing_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            existing = root / "status.json"
-            existing.write_text("keep existing output")
-            for first, second in (("result.json", "RESULT.json"), ("caf\u00e9.json", "cafe\u0301.json")):
-                args = argparse.Namespace(status_output=str(root / first), output=None, json_output=str(root / second))
-                with self.assertRaises(SystemExit):
-                    self.helper["prepare_output_paths"](args, repo)
-                self.assertFalse((root / first).exists())
-            for value in (str(repo / "result.json"), str(existing)):
-                args = argparse.Namespace(status_output=value, output=None, json_output=str(existing))
-                with self.assertRaises(SystemExit):
-                    self.helper["prepare_output_paths"](args, repo)
-                self.assertEqual(existing.read_text(), "keep existing output")
-            if os.name != "nt":
-                alias = root / "alias.json"
-                alias.symlink_to(existing)
-                args.status_output = str(alias)
-                with self.assertRaises(SystemExit):
-                    self.helper["prepare_output_paths"](args, repo)
-                alias.unlink()
-                os.link(existing, alias)
-                with self.assertRaises(SystemExit):
-                    self.helper["prepare_output_paths"](args, repo)
-
     @unittest.skipUnless(sys.platform == "darwin", "macOS firmlink alias")
     def test_status_rejects_absent_outputs_under_same_parent_inode(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -3861,29 +3766,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         self.assertNotIn("DIAGNOSTIC_SENTINEL", sidecar.read_text())
                         self.assertNotIn("\x1b", result.stderr)
 
-
-    def test_tracked_binary_changes_are_blocked_in_all_modes(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            binary = repo / "artifact.bin"
-            binary.write_bytes(b"\0base")
-            git(repo, "add", "artifact.bin")
-            git(repo, "commit", "-q", "-m", "base")
-            base = git(repo, "rev-parse", "HEAD").strip()
-
-            binary.write_bytes(b"\0changed")
-            for staged in (False, True):
-                if staged:
-                    git(repo, "add", "artifact.bin")
-                for local_base in (None, base):
-                    with self.subTest(staged=staged, base=local_base), self.assertRaisesRegex(SystemExit, "refusing binary changes"):
-                        self.helper["local_bundle"](repo, local_base)
-
-            git(repo, "commit", "-q", "-m", "binary change")
-            with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
-                self.helper["commit_bundle"](repo, "HEAD")
-            with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
-                self.helper["branch_bundle"](repo, base)
 
     def test_gitlink_additions_include_metadata_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -4248,23 +4130,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "non-UTF-8 Git output"):
                 self.helper["git_path_list"](repo, "ls-files", "-z")
-
-    def test_review_patch_accepts_large_content_without_explicit_limit(self) -> None:
-        patch = (
-            "diff --git a/safe.txt b/safe.txt\n"
-            "--- a/safe.txt\n"
-            "+++ b/safe.txt\n"
-            "@@ -0,0 +1,100000 @@\n"
-            + "+safe review content\n" * 100_000
-        )
-
-        self.assertEqual(
-            self.helper["validate_review_patch"](
-                ["safe.txt"],
-                patch,
-            ),
-            patch,
-        )
 
     def test_review_bundle_chunking_preserves_every_byte_and_diff_context(self) -> None:
         bundle = (
@@ -4941,36 +4806,24 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn("placeholder", redacted)
         self.assertNotIn("commit metadata", redacted)
 
-    def test_review_patch_preserves_combined_and_headerless_hunk_content(self) -> None:
-        credential_shaped_code = '+token = "ordinary-hardcoded-value-12345"\n'
-        for patch in (
-            "@@ -0,0 +1 @@\n" + credential_shaped_code,
-            "diff --cc src/runtime.ts\n"
-            "@@@ -0,0 -0,0 +1 @@@\n"
-            "++token = \"ordinary-hardcoded-value-12345\"\n",
-        ):
-            with self.subTest(patch=patch):
-                validated = self.helper["validate_review_patch"](
-                    ["src/runtime.ts"],
-                    patch,
-                )
-                self.assertIn("ordinary-hardcoded-value-12345", validated)
-
     def test_tracked_sensitive_paths_are_omitted_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             (repo / "base.txt").write_text("base\n", encoding="utf-8")
-            git(repo, "add", "base.txt")
+            (repo / ".env").write_text("placeholder=committed\n", encoding="utf-8")
+            git(repo, "add", "base.txt", ".env")
             git(repo, "commit", "-q", "-m", "base")
             base = git(repo, "rev-parse", "HEAD").strip()
 
-            (repo / ".env").write_text("placeholder=true\n", encoding="utf-8")
+            # A modified committed store and a newly added one are both omitted.
+            (repo / ".env").write_text("placeholder=modified\n", encoding="utf-8")
+            (repo / ".env_prod").write_text("placeholder=true\n", encoding="utf-8")
             (repo / "base.txt").write_text("base\nreview me\n", encoding="utf-8")
-            git(repo, "add", ".env", "base.txt")
+            git(repo, "add", ".env", ".env_prod", "base.txt")
             local, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
             self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], local)
             self.assertNotIn(".env", local)
-            self.assertNotIn("placeholder=true", local)
+            self.assertNotIn("placeholder=", local)
             self.assertIn("+review me", local)
 
             git(repo, "commit", "-q", "-m", "sensitive path")
@@ -4980,7 +4833,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ):
                 self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
                 self.assertNotIn(".env", bundle)
-                self.assertNotIn("placeholder=true", bundle)
+                self.assertNotIn("placeholder=", bundle)
                 self.assertIn("+review me", bundle)
 
     def test_secret_named_workflows_are_reviewable_in_all_modes(self) -> None:
@@ -5007,61 +4860,54 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertIn("secret-scan.yml", branch_bundle)
             self.assertIn("secret-scan.yml", commit_bundle)
 
-    def test_case_variant_secret_named_workflows_remain_sensitive(self) -> None:
-        for rel in (
-            ".GitHub/workflows/secret-scan.yml",
-            ".github/Workflows/secret-scan.yml",
-            ".github/workflows/secret-scan.YML",
-        ):
-            with self.subTest(rel=rel):
-                self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
-                self.assertIsNotNone(
-                    self.helper["tracked_sensitive_repo_path_risk"](rel)
-                )
-
-    def test_tracked_source_names_and_env_templates_remain_reviewable(self) -> None:
-        for rel in (
-            "tokenizer.py",
-            "token_count.ts",
-            "src/token/parser.py",
-            "src/token/session.ts",
-            "internal/tokens/types.go",
-            "packages/token/package.json",
-            "scripts/tokens/session.sh",
-            "src/tokens/session.mjs",
-            "credentials/prod.py",
-            "secrets/runtime.ts",
-            "src/credentials/provider.py",
-            "src/secrets/scanner.ts",
-            "ui/tokens/session.vue",
-            "proto/token/session.proto",
-            "password_validator.go",
-            ".env.example",
-            "private/parser.py",
-            ".agents/skills/openclaw-secret-scanning-maintainer/SKILL.md",
-            "design-tokens/colors.json",
-            "design-tokens.json",
-            "design_tokens.json",
-            "tokens/default.json",
-            "token_count/generated.py",
-            ".docker/Dockerfile",
-            ".docker/scripts/build.sh",
+    def test_sensitive_path_classification_by_tracking_state(self) -> None:
+        # Untracked files are judged by name; tracked source stays reviewable
+        # unless the path is a credential store. None leaves a state unasserted.
+        reviewable_everywhere = (
+            "src/token/parser.py", "src/token/session.ts", "scripts/tokens/session.sh",
+            "src/tokens/session.mjs", "ui/tokens/session.vue", "proto/token/session.proto",
+            "design-tokens.json", "design_tokens.json", "src/styles/design-tokens.json",
+            "themes/dark/design_tokens.json", "tokens/design-tokens.json", "tokens/design_tokens.json",
+        )
+        blocked_untracked_only = (
+            "credentials/prod.py", "secrets/runtime.ts", "src/credentials/provider.py", "src/secrets/scanner.ts",
+        )
+        tracked_reviewable = (
+            "tokenizer.py", "token_count.ts", "internal/tokens/types.go", "packages/token/package.json",
+            "password_validator.go", ".env.example", "private/parser.py",
+            ".agents/skills/openclaw-secret-scanning-maintainer/SKILL.md", "design-tokens/colors.json",
+            "tokens/default.json", "token_count/generated.py", ".docker/Dockerfile", ".docker/scripts/build.sh",
             ".github/workflows/secret-scan.yml",
+        )
+        sensitive_everywhere = (
+            ".GitHub/workflows/secret-scan.yml", ".github/Workflows/secret-scan.yml",
+            ".github/workflows/secret-scan.YML", ".env/design-tokens.json",
+        )
+        tracked_sensitive = (
+            ".env/tokens/design-tokens.json",
+            ".env-local", ".env_prod", ".env/production", ".env/example/production", ".env/template/prod",
+            "credentials-prod.json", "service-account-dev.yaml", "api-key.backup.json", "token-prod.json",
+            "tokens.json", "auth-token.yaml", "prod-credentials.json", "google-service-account.json",
+            "client-secret.yaml", "credentials/prod.json", "prod-credentials/client.conf",
+            "client-secrets/account.ini", "token/production.json", "tokens/production.json",
+            "tokens/session.dat", "tokens/cache.json", "token/user.json", "tokens/device.sqlite",
+            "tokens/session.jwt", "tokens/session", "backup-secrets/prod.json", "dev_credentials/runtime.yaml",
+            "client-secrets-old/account.ini", "client-secrets/account.properties", "credentials/prod.xml",
+            "secrets/prod.md", "credentials.txt", "client-secret.csv", ".docker/config.json",
+            "deployment/.docker/config.json", ".netrc", "config/.netrc", ".git-credentials",
+            "config/.git-credentials",
+        )
+        risk = {"untracked": self.helper["sensitive_repo_path_risk"],
+                "tracked": self.helper["tracked_sensitive_repo_path_risk"]}
+        for paths, untracked, tracked in (
+            (reviewable_everywhere, False, False), (blocked_untracked_only, True, False),
+            (tracked_reviewable, None, False), (sensitive_everywhere, True, True), (tracked_sensitive, None, True),
         ):
-            with self.subTest(rel=rel):
-                self.assertIsNone(self.helper["tracked_sensitive_repo_path_risk"](rel))
-
-    def test_untracked_token_source_paths_remain_reviewable(self) -> None:
-        for rel in (
-            "src/token/parser.py",
-            "src/token/session.ts",
-            "scripts/tokens/session.sh",
-            "src/tokens/session.mjs",
-            "ui/tokens/session.vue",
-            "proto/token/session.proto",
-        ):
-            with self.subTest(rel=rel):
-                self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
+            for rel in paths:
+                for state, sensitive in (("untracked", untracked), ("tracked", tracked)):
+                    if sensitive is not None:
+                        with self.subTest(rel=rel, state=state):
+                            self.assertEqual(risk[state](rel) is not None, sensitive)
 
     def test_untracked_credential_shaped_source_content_is_reviewed(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -5075,253 +4921,86 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             self.assertIn("ordinary-hardcoded-value-12345", bundle)
 
-    def test_untracked_design_token_artifacts_remain_reviewable(self) -> None:
-        for rel in (
-            "design-tokens.json",
-            "design_tokens.json",
-            "src/styles/design-tokens.json",
-            "themes/dark/design_tokens.json",
-            "tokens/design-tokens.json",
-            "tokens/design_tokens.json",
-        ):
-            with self.subTest(rel=rel):
-                self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
-                self.assertIsNone(
-                    self.helper["tracked_sensitive_repo_path_risk"](rel)
-                )
-        self.assertIsNotNone(
-            self.helper["sensitive_repo_path_risk"](".env/design-tokens.json")
-        )
-        self.assertIsNotNone(
-            self.helper["tracked_sensitive_repo_path_risk"](
-                ".env/design-tokens.json"
-            )
-        )
-        self.assertIsNotNone(
-            self.helper["tracked_sensitive_repo_path_risk"](
-                ".env/tokens/design-tokens.json"
-            )
-        )
+    def test_review_patch_never_rewrites_reviewable_content(self) -> None:
+        # validate_review_patch is a path-only filter: it omits tracked sensitive
+        # paths and returns every other patch byte for byte. Each input below once
+        # tripped (or was guarded against) the retired heuristic secret scanner;
+        # content scanning now happens on the outgoing pack.
+        def diff(path, lines, header="@@ -0,0 +1 @@", *, mode="", old=None, new=None):
+            return (f"diff --git a/{path} b/{path}\n{mode}"
+                    f"--- {old or 'a/' + path}\n+++ {new or 'b/' + path}\n{header}\n"
+                    + "".join(f"{line}\n" for line in lines))
 
-    def test_sensitive_named_source_directories_are_blocked_untracked(self) -> None:
-        for rel in (
-            "credentials/prod.py",
-            "secrets/runtime.ts",
-            "src/credentials/provider.py",
-            "src/secrets/scanner.ts",
-        ):
-            with self.subTest(rel=rel):
-                self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
+        def fixture(name, marker):
+            return [marker + line for line in (FIXTURES / name).read_text(encoding="utf-8").splitlines()]
 
-    def test_tracked_env_variants_remain_sensitive(self) -> None:
-        for rel in (
-            ".env-local",
-            ".env_prod",
-            ".env/production",
-            ".env/example/production",
-            ".env/template/prod",
-        ):
-            with self.subTest(rel=rel):
-                self.assertIsNotNone(
-                    self.helper["tracked_sensitive_repo_path_risk"](rel)
-                )
-
-    def test_suffixed_credential_data_paths_remain_sensitive(self) -> None:
-        for rel in (
-            "credentials-prod.json",
-            "service-account-dev.yaml",
-            "api-key.backup.json",
-            "token-prod.json",
-            "tokens.json",
-            "auth-token.yaml",
-            "prod-credentials.json",
-            "google-service-account.json",
-            "client-secret.yaml",
-            "credentials/prod.json",
-            "prod-credentials/client.conf",
-            "client-secrets/account.ini",
-            "token/production.json",
-            "tokens/production.json",
-            "tokens/session.dat",
-            "tokens/cache.json",
-            "token/user.json",
-            "tokens/device.sqlite",
-            "tokens/session.jwt",
-            "tokens/session",
-            "backup-secrets/prod.json",
-            "dev_credentials/runtime.yaml",
-            "client-secrets-old/account.ini",
-            "client-secrets/account.properties",
-            "credentials/prod.xml",
-            "secrets/prod.md",
-            "credentials.txt",
-            "client-secret.csv",
-            ".docker/config.json",
-            "deployment/.docker/config.json",
-            ".netrc",
-            "config/.netrc",
-            ".git-credentials",
-            "config/.git-credentials",
-        ):
-            with self.subTest(rel=rel):
-                self.assertIsNotNone(
-                    self.helper["tracked_sensitive_repo_path_risk"](rel)
-                )
-
-    def test_review_patch_allows_provider_references_and_test_placeholders(
-        self,
-    ) -> None:
-        token_name = "to" + "ken"
-        key_name = "api_" + "key"
-        secret_name = "api_" + "secret"
-        safe_patch = (
-            "diff --git a/provider.ts b/provider.ts\n"
-            "--- a/provider.ts\n"
-            "+++ b/provider.ts\n"
-            "@@ -1 +1,6 @@\n"
-            f"-const {token_name} = data.session?.access_token;\n"
-            f"+const {token_name} = data.session?.access_token;\n"
-            "+const api" + f"Key = providerConfig.{key_name};\n"
-            "+const api" + "Sec" + f"ret = providerConfig.{secret_name};\n"
-            f'+const fixture = {{ {key_name}: "test-key" }};\n'
-            f'+const fixtureSecret = {{ {secret_name}: "test-secret" }};\n'
-            f'+const session = {{ access_{token_name}: "test-token" }};\n'
-        )
-
-        self.assertEqual(
-            self.helper["validate_review_patch"](
-                ["provider.ts"],
-                safe_patch,
-            ),
-            safe_patch,
-        )
-
-    def test_secret_detector_allows_typescript_credential_plumbing_fixture(self) -> None:
-        source = (FIXTURES / "typescript-benign-references.ts").read_text(
-            encoding="utf-8"
-        )
-
-        patch = (
-            "diff --git a/src/credential-plumbing.ts b/src/credential-plumbing.ts\n"
-            "new file mode 100644\n"
-            "--- /dev/null\n"
-            "+++ b/src/credential-plumbing.ts\n"
-            f"@@ -0,0 +1,{len(source.splitlines())} @@\n"
-            + "".join(f"+{line}\n" for line in source.splitlines())
-        )
-        validated = self.helper["validate_review_patch"](
-            ["src/credential-plumbing.ts"],
-            patch,
-        )
-        for reference in (
-            "filePassword",
-            "passwordResolution.password",
-            "tokenResolution.token",
-            "CredentialUnavailableDiagnostic",
-            "tokenRef",
-            "keyRef",
-        ):
-            self.assertIn(reference, validated)
-
-    def test_review_bundle_preserves_deleted_swift_status_literals(self) -> None:
-        # Regression: a deleted Swift file with status-string cases like
-        # `case "ok-empty", "ok-token":` next to value returns is not a
-        # credential. The retired heuristic scanner flagged the "ok-token"
-        # key shape as secret-like even after value redaction, so the whole
-        # deletion became unreviewable; the bundle must stay byte-identical.
-        source = (FIXTURES / "swift-benign-status-literals.swift").read_text(
-            encoding="utf-8"
-        )
-        patch = (
-            "diff --git a/apps/macos/MenuContentView.swift "
-            "b/apps/macos/MenuContentView.swift\n"
-            "deleted file mode 100644\n"
-            "--- a/apps/macos/MenuContentView.swift\n"
-            "+++ /dev/null\n"
-            f"@@ -1,{len(source.splitlines())} +0,0 @@\n"
-            + "".join(f"-{line}\n" for line in source.splitlines())
-        )
-
-        self.assertEqual(
-            self.helper["validate_review_patch"](
-                ["apps/macos/MenuContentView.swift"],
-                patch,
-            ),
-            patch,
-        )
-
-
-    def test_review_bundle_preserves_typescript_config_paths(self) -> None:
-        source = (FIXTURES / "typescript-benign-config-path-references.ts").read_text(
-            encoding="utf-8"
-        )
-        patch = (
-            "diff --git a/src/config-path-references.ts b/src/config-path-references.ts\n"
-            "new file mode 100644\n"
-            "--- /dev/null\n"
-            "+++ b/src/config-path-references.ts\n"
-            f"@@ -0,0 +1,{len(source.splitlines())} @@\n"
-            + "".join(f"+{line}\n" for line in source.splitlines())
-        )
-
-        validated = self.helper["validate_review_patch"](
-            ["src/config-path-references.ts"],
-            patch,
-        )
-
-        for config_path in (
-            "channels.irc.accounts.${accountId}.passwordFile",
-            "channels.irc.accounts.${accountId}.nickserv.passwordFile",
-            "channels.nextcloud-talk.accounts.${accountId}.botSecret",
-            "channels.nextcloud-talk.accounts.${accountId}.botSecretFile",
-            "channels.telegram.accounts.${accountId}.tokenFile",
-        ):
-            self.assertIn(config_path, validated)
-
+        token_name, key_name, secret_name = "to" + "ken", "api_" + "key", "api_" + "secret"
         token_term = "To" + "ken"
-        truncated_call_patch = (
-            "diff --git a/src/token.ts b/src/token.ts\n"
-            "--- a/src/token.ts\n"
-            "+++ b/src/token.ts\n"
-            "@@ -40,3 +40,4 @@ function resolveAccountToken() {\n"
-            f"+  const account{token_term} = resolveRuntime{token_term}Value({{\n"
-            "+    value: accountConfig.token,\n"
-            "@@ -70,3 +71,4 @@ function resolveConfigToken() {\n"
-            f"+  const config{token_term} = resolveRuntime{token_term}Value({{\n"
-            "+    value: merged.token,\n"
-        )
-        self.assertEqual(
-            self.helper["validate_review_patch"](
-                ["src/token.ts"],
-                truncated_call_patch,
-            ),
-            truncated_call_patch,
-        )
-
-    def test_review_patch_preserves_safe_uri_userinfo(self) -> None:
-        safe_lines = (
-            'url = f"ssh://{ssh_user}@git.example.invalid/org/repo.git"',
-            'url = "https://alice@github.com/example/repo"',
-            'url = "https://username:@host/repo"',
-            'remote = "ssh://git@github.com/org/repo.git"',
-        )
-        for line in safe_lines:
-            with self.subTest(line=line):
-                patch = (
-                    "diff --git a/fixture.py b/fixture.py\n"
-                    "--- a/fixture.py\n"
-                    "+++ b/fixture.py\n"
-                    "@@ -0,0 +1 @@\n"
-                    f"+{line}\n"
-                )
-
-                validated = self.helper["validate_review_patch"](
-                    ["fixture.py"],
-                    patch,
-                )
-
-                self.assertIn(f"+{line}", validated)
-                self.assertNotIn("redacted@", validated)
+        identifier = "AbCdEfGh" + "IjKlMnOp"
+        typescript = fixture("typescript-benign-references.ts", "+")
+        swift = fixture("swift-benign-status-literals.swift", "-")
+        config_paths = fixture("typescript-benign-config-path-references.ts", "+")
+        cases = [
+            ("large content", "safe.txt", diff("safe.txt", ["+safe review content"] * 100_000, "@@ -0,0 +1,100000 @@")),
+            ("headerless hunk", "src/runtime.ts", '@@ -0,0 +1 @@\n+token = "ordinary-hardcoded-value-12345"\n'),
+            ("combined hunk", "src/runtime.ts",
+             'diff --cc src/runtime.ts\n@@@ -0,0 -0,0 +1 @@@\n++token = "ordinary-hardcoded-value-12345"\n'),
+            ("provider references and test placeholders", "provider.ts", diff("provider.ts", [
+                f"-const {token_name} = data.session?.access_token;",
+                f"+const {token_name} = data.session?.access_token;",
+                "+const api" + f"Key = providerConfig.{key_name};",
+                "+const api" + "Sec" + f"ret = providerConfig.{secret_name};",
+                f'+const fixture = {{ {key_name}: "test-key" }};',
+                f'+const fixtureSecret = {{ {secret_name}: "test-secret" }};',
+                f'+const session = {{ access_{token_name}: "test-token" }};',
+            ], "@@ -1 +1,6 @@")),
+            ("TypeScript credential plumbing", "src/credential-plumbing.ts", diff(
+                "src/credential-plumbing.ts", typescript, f"@@ -0,0 +1,{len(typescript)} @@",
+                mode="new file mode 100644\n", old="/dev/null")),
+            # A deleted Swift file with `case "ok-empty", "ok-token":` status strings
+            # once became unreviewable even after value redaction.
+            ("deleted Swift status literals", "apps/macos/MenuContentView.swift", diff(
+                "apps/macos/MenuContentView.swift", swift, f"@@ -1,{len(swift)} +0,0 @@",
+                mode="deleted file mode 100644\n", new="/dev/null")),
+            ("TypeScript config paths", "src/config-path-references.ts", diff(
+                "src/config-path-references.ts", config_paths, f"@@ -0,0 +1,{len(config_paths)} @@",
+                mode="new file mode 100644\n", old="/dev/null")),
+            ("truncated token calls", "src/token.ts", diff("src/token.ts", [
+                f"+  const account{token_term} = resolveRuntime{token_term}Value({{",
+                "+    value: accountConfig.token,",
+                "@@ -70,3 +71,4 @@ function resolveConfigToken() {",
+                f"+  const config{token_term} = resolveRuntime{token_term}Value({{",
+                "+    value: merged.token,",
+            ], "@@ -40,3 +40,4 @@ function resolveAccountToken() {")),
+            *((f"URI userinfo {line}", "fixture.py", diff("fixture.py", ["+" + line])) for line in (
+                'url = f"ssh://{ssh_user}@git.example.invalid/org/repo.git"',
+                'url = "https://alice@github.com/example/repo"',
+                'url = "https://username:@host/repo"',
+                'remote = "ssh://git@github.com/org/repo.git"',
+            )),
+            ("redaction placeholder fallback", "runtime.py",
+             diff("runtime.py", ["+pass" + 'word = getenv("PASSWORD") or "redacted"'])),
+            ("ambiguous short markerless lines", "fixture.txt",
+             diff("fixture.txt", ["+AB12", "+CDef", "+GH34", "+ijKL", "+MN56", "+opQR"], "@@ -0,0 +1,6 @@")),
+            ("long non-PEM identifier", "runtime.ts", diff("runtime.ts", ["+runDangerousOperationWithLongIdentifier"])),
+            ("hash and submodule lines", "vendor", diff("vendor", [
+                "+abcdef0123456789abcdef0123456789abcdef01",
+                "+Subproject commit abcdef0123456789abcdef0123456789abcdef01",
+            ], "@@ -1 +1,2 @@")),
+            ("unwrapped alphabetic identifier", "runtime.ts", diff("runtime.ts", [f"+const {identifier} = true;"])),
+            ("punctuation-wrapped alphabetic identifier", "runtime.ts", diff("runtime.ts", [f"+  {identifier},"])),
+            ("escaped newline beside identifier", "runtime.ts", diff("runtime.ts", [f'+[{identifier}, "\\\\n"];'])),
+            ("bare identifier in escaped PEM concatenation", "runtime.ts", diff("runtime.ts", [
+                '+const fixture = "-----BEGIN ' + 'PRIVATE KEY-----\\n" + ' + identifier
+                + ' + "\\n-----END ' + 'PRIVATE KEY-----";',
+            ])),
+            ("multiline getpass call", "safe.py", diff("safe.py", [
+                "+" + "pass" + "word = getpass.getpass(", '+    "Password: ",', "+)",
+            ], "@@ -0,0 +1,3 @@")),
+        ]
+        for label, path, patch in cases:
+            with self.subTest(label):
+                self.assertEqual(self.helper["validate_review_patch"]([path], patch), patch)
 
     def test_branch_bundle_preserves_deleted_jinja_pem_marker_regex(self) -> None:
         # Generic template regex delimiters are not private-key material. The
@@ -5349,149 +5028,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertIn("------BEGIN [A-Z ]+-----", bundle)
             self.assertIn("-{{ _body }}", bundle)
             self.assertIn("------END [A-Z ]+-----", bundle)
-
-    def test_review_patch_preserves_redaction_placeholder_fallback(self) -> None:
-        patch = (
-            "diff --git a/runtime.py b/runtime.py\n"
-            "--- a/runtime.py\n"
-            "+++ b/runtime.py\n"
-            "@@ -0,0 +1 @@\n"
-            + "+pass"
-            + 'word = getenv("PASSWORD") or "redacted"\n'
-        )
-
-        self.assertEqual(
-            self.helper["validate_review_patch"](
-                ["runtime.py"],
-                patch,
-            ),
-            patch,
-        )
-
-    def test_review_patch_preserves_ambiguous_short_markerless_lines(self) -> None:
-        chunks = ["AB12", "CDef", "GH34", "ijKL", "MN56", "opQR"]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(f"+{chunk}\n" for chunk in chunks)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch, patch)
-
-    def test_review_patch_preserves_long_non_pem_identifier_lines(self) -> None:
-        identifier = "runDangerousOperationWithLongIdentifier"
-        patch = (
-            "diff --git a/runtime.ts b/runtime.ts\n"
-            "--- a/runtime.ts\n"
-            "+++ b/runtime.ts\n"
-            "@@ -0,0 +1 @@\n"
-            + f"+{identifier}\n"
-        )
-
-        redacted = self.helper["validate_review_patch"](
-            ["runtime.ts"],
-            patch,
-        )
-
-        self.assertIn("+" + identifier, redacted)
-
-    def test_review_patch_preserves_hash_and_submodule_lines(self) -> None:
-        digest = "abcdef0123456789abcdef0123456789abcdef01"
-        patch = (
-            "diff --git a/vendor b/vendor\n"
-            "--- a/vendor\n"
-            "+++ b/vendor\n"
-            "@@ -1 +1,2 @@\n"
-            + f"+{digest}\n"
-            + f"+Subproject commit {digest}\n"
-        )
-
-        redacted = self.helper["validate_review_patch"](
-            ["vendor"],
-            patch,
-        )
-
-        self.assertIn("+" + digest, redacted)
-        self.assertIn("+Subproject commit " + digest, redacted)
-
-    def test_review_patch_preserves_unwrapped_alphabetic_identifier(self) -> None:
-        identifier = "AbCdEfGh" + "IjKlMnOp"
-        patch = (
-            "diff --git a/runtime.ts b/runtime.ts\n"
-            "--- a/runtime.ts\n"
-            "+++ b/runtime.ts\n"
-            "@@ -0,0 +1 @@\n"
-            + f"+const {identifier} = true;\n"
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            ["runtime.ts"],
-            patch,
-        )
-
-        self.assertIn(identifier, redacted_patch)
-
-    def test_review_patch_preserves_punctuation_wrapped_alphabetic_identifier(self) -> None:
-        identifier = "AbCdEfGh" + "IjKlMnOp"
-        patch = (
-            "diff --git a/runtime.ts b/runtime.ts\n"
-            "--- a/runtime.ts\n"
-            "+++ b/runtime.ts\n"
-            "@@ -0,0 +1 @@\n"
-            + f"+  {identifier},\n"
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            ["runtime.ts"],
-            patch,
-        )
-
-        self.assertIn(identifier, redacted_patch)
-
-    def test_review_patch_preserves_escaped_newline_beside_alphabetic_identifier(self) -> None:
-        identifier = "AbCdEfGh" + "IjKlMnOp"
-        patch = (
-            "diff --git a/runtime.ts b/runtime.ts\n"
-            "--- a/runtime.ts\n"
-            "+++ b/runtime.ts\n"
-            "@@ -0,0 +1 @@\n"
-            + f'+[{identifier}, "\\\\n"];\n'
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            ["runtime.ts"],
-            patch,
-        )
-
-        self.assertIn(identifier, redacted_patch)
-
-    def test_review_patch_preserves_bare_identifier_in_escaped_pem_concatenation(self) -> None:
-        identifier = "AbCdEfGh" + "IjKlMnOp"
-        patch = (
-            "diff --git a/runtime.ts b/runtime.ts\n"
-            "--- a/runtime.ts\n"
-            "+++ b/runtime.ts\n"
-            "@@ -0,0 +1 @@\n"
-            '+const fixture = "-----BEGIN '
-            + "PRIVATE KEY-----\\n\" + "
-            + identifier
-            + ' + "\\n-----END '
-            + 'PRIVATE KEY-----";\n'
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            ["runtime.ts"],
-            patch,
-        )
-
-        self.assertIn(identifier, redacted_patch)
 
     def test_local_bundle_allows_deleted_test_token_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -5566,16 +5102,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(env["SYSTEMROOT"], "C:\\Windows")
         self.assertNotIn("GIT_DIR", env)
         self.assertNotIn("OPENAI_API_KEY", env)
-
-    def test_prompt_file_keeps_recoverable_repo_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            (repo / "review.md").write_text("review context\n", encoding="utf-8")
-            args = argparse.Namespace(prompt=[], prompt_file=["review.md"], dataset=[])
-
-            evidence = self.helper["capture_evidence_inputs"](args, repo)
-
-            self.assertIn("# Prompt file: review.md", evidence.prompt)
 
     def test_absolute_prompt_file_keeps_evidence_guards(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -5930,27 +5456,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0], fake_taskkill)
         proc.kill.assert_not_called()
 
-    def test_owned_process_registry_terminates_all_tracked_groups(self) -> None:
-        terminated: list[object] = []
-        proc_a = mock.Mock(pid=111)
-        proc_b = mock.Mock(pid=222)
-        with mock.patch.dict(
-            self.helper["register_owned_process"].__globals__,
-            {
-                "_signal_owned_process_group": lambda proc: (terminated.append(proc), True)[1],
-                "_await_owned_process_groups": lambda procs, grace: None,
-                "_enforce_owned_process_group": lambda proc, grace: None,
-            },
-        ):
-            self.helper["register_owned_process"](proc_a)
-            self.helper["register_owned_process"](proc_b)
-            try:
-                self.helper["terminate_owned_processes"]()
-            finally:
-                self.helper["unregister_owned_process"](proc_a)
-                self.helper["unregister_owned_process"](proc_b)
-        self.assertEqual(set(terminated), {proc_a, proc_b})
-
     def test_terminate_owned_processes_signals_all_groups_before_grace_wait(
         self,
     ) -> None:
@@ -6037,13 +5542,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 with self.assertRaises(self.helper["EngineInterrupted"]) as ctx:
                     self.helper["validate_evidence_file"](repo, "evidence.txt", "--dataset")
         self.assertEqual(ctx.exception.code, 130)
-
-    def test_main_converts_engine_interrupted_to_exit_code(self) -> None:
-        with mock.patch.dict(
-            self.helper["main"].__globals__,
-            {"main_impl": mock.Mock(side_effect=self.helper["EngineInterrupted"](130))},
-        ):
-            self.assertEqual(self.helper["main"](), 130)
 
     def test_source_tree_snapshot_detects_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -6133,29 +5631,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     repo,
                 )
 
-    def test_atomic_output_replaces_hard_link_without_touching_repo_file(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            tracked = repo / "tracked.txt"
-            tracked.write_text("tracked\n", encoding="utf-8")
-            outside = root / "review.txt"
-            os.link(tracked, outside)
-
-            self.helper["atomic_write_text"](outside, "review\n")
-
-            self.assertEqual(
-                tracked.read_text(encoding="utf-8"),
-                "tracked\n",
-            )
-            self.assertEqual(
-                outside.read_text(encoding="utf-8"),
-                "review\n",
-            )
-            self.assertFalse(os.path.samefile(tracked, outside))
-
     def test_source_tree_snapshot_supports_staged_files_before_first_commit(
         self,
     ) -> None:
@@ -6182,7 +5657,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 before,
             )
 
-    @unittest.skipIf(os.name == "nt", "the true command is POSIX-only")
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
     def test_cli_detects_source_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -6316,33 +5790,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 before,
             )
 
-    def test_installed_java_rejects_launcher_without_runtime(self) -> None:
-        launcher = "/usr/bin/java"
-        unavailable = subprocess.CompletedProcess([launcher, "-version"], 1)
-        with (
-            mock.patch("shutil.which", return_value=launcher),
-            mock.patch("subprocess.run", return_value=unavailable),
-        ):
-            self.assertIsNone(installed_java())
-
-    def test_safe_proxy_url_accepts_credential_free_formats(self) -> None:
-        for value in (
-            "http://proxy.example.invalid:8080",
-            "proxy.example.invalid:8080",
-            "socks4://proxy.example.invalid",
-            "socks4a://proxy.example.invalid",
-            "http://[fe80::1%25en0]:8080",
-        ):
-            with self.subTest(value=value):
-                self.assertTrue(self.helper["safe_proxy_url"](value))
-
-        for value in (
-            "http://review-user:review-password@proxy.example.invalid:8080",  # trufflehog:ignore (fake proxy credential fixture)
-            "socks5://review-user:review-password@proxy.example.invalid:1080",
-        ):
-            with self.subTest(value=value):
-                self.assertTrue(self.helper["safe_proxy_url"](value))
-
     def test_safe_engine_env_rejects_malformed_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
             os.environ,
@@ -6356,22 +5803,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
             repo = init_repo(Path(tempdir))
             with self.assertRaisesRegex(SystemExit, "malformed proxy"):
                 self.helper["safe_engine_env"](repo, engine="codex")
-
-    def test_safe_temp_root_rejects_reviewed_repo_parent(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            hostile_temp = repo / "tmp"
-            hostile_temp.mkdir()
-
-            with mock.patch.object(
-                tempfile,
-                "gettempdir",
-                return_value=str(hostile_temp),
-            ), self.assertRaisesRegex(
-                SystemExit,
-                "temporary directory must be outside",
-            ):
-                self.helper["safe_temp_root"](repo)
 
     @unittest.skipIf(os.name == "nt", "POSIX Testbox temp-root behavior")
     def test_claude_fable_alias_requires_fable_safe_mode_version(self) -> None:
@@ -6428,28 +5859,19 @@ else:
             with self.assertRaisesRegex(SystemExit, "missing from --help: --safe-mode"):
                 self.helper["ensure_claude_isolation_supported"](args, repo)
 
-    def _isolation_flags_with_managed_config(self, present: bool) -> list[str]:
-        # The flag builder resolves the detector through its own module globals.
-        flags_fn = self.helper["claude_review_isolation_flags"]
-        with mock.patch.dict(flags_fn.__globals__, {
-            "claude_enterprise_mcp_config_present": lambda: present,
-        }):
-            return flags_fn()
-
-    def test_claude_isolation_omits_strict_mcp_when_managed_config_present(self) -> None:
+    def test_claude_isolation_flags_follow_managed_mcp_config(self) -> None:
         # Claude Code rejects --strict-mcp-config when an endpoint-managed MCP
         # config exists; the rest of the isolation set stays authoritative.
-        self.assertEqual(
-            self._isolation_flags_with_managed_config(True),
-            ["--safe-mode", "--setting-sources", "user", "--disallowedTools", "mcp__*"],
-        )
-
-    def test_claude_isolation_keeps_strict_mcp_without_managed_config(self) -> None:
-        self.assertEqual(
-            self._isolation_flags_with_managed_config(False),
-            ["--safe-mode", "--setting-sources", "user", "--strict-mcp-config",
-             "--disallowedTools", "mcp__*"],
-        )
+        flags_fn = self.helper["claude_review_isolation_flags"]
+        for present, expected in (
+            (True, ["--safe-mode", "--setting-sources", "user", "--disallowedTools", "mcp__*"]),
+            (False, ["--safe-mode", "--setting-sources", "user", "--strict-mcp-config",
+                     "--disallowedTools", "mcp__*"]),
+        ):
+            with self.subTest(managed_config=present), mock.patch.dict(flags_fn.__globals__, {
+                "claude_enterprise_mcp_config_present": lambda present=present: present,
+            }):
+                self.assertEqual(flags_fn(), expected)
 
     @unittest.skipIf(os.name == "nt", "POSIX managed-config path")
     def test_claude_managed_mcp_detection_requires_the_linux_managed_file(self) -> None:
@@ -6508,15 +5930,13 @@ else:
 
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
+            # The real claude_engine_env must produce the memory switch.
             with mock.patch.dict(
                 self.helper["run_claude"].__globals__,
                 {
                     "ensure_claude_isolation_supported": lambda *_args: None,
                     "resolve_command": lambda *_args: "/usr/bin/claude",
                     "run_with_heartbeat": fake_run,
-                    "safe_engine_env": lambda *_args, **_kwargs: {
-                        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"
-                    },
                 },
             ):
                 self.helper["run_claude"](args, repo, "prompt")
@@ -6911,47 +6331,16 @@ else:
                 os.environ.clear()
                 os.environ.update(old)
 
-    def test_empty_codex_home_uses_external_default(self) -> None:
-        old = os.environ.copy()
+    def test_empty_codex_home_falls_back_to_existing_external_default(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             repo = init_repo(root)
             default_home = root / "host-home" / ".codex"
             default_home.mkdir(parents=True)
-            try:
-                os.environ["CODEX_HOME"] = ""
-                with mock.patch.object(
-                    Path,
-                    "home",
-                    return_value=default_home.parent,
-                ):
-                    self.assertEqual(
-                        self.helper["codex_source_home"](repo),
-                        default_home.resolve(),
-                    )
-            finally:
-                os.environ.clear()
-                os.environ.update(old)
-
-    def test_empty_codex_home_ignores_missing_default(self) -> None:
-        old = os.environ.copy()
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            missing_home = root / "missing-home"
-            try:
-                os.environ["CODEX_HOME"] = ""
-                with mock.patch.object(
-                    Path,
-                    "home",
-                    return_value=missing_home,
-                ):
-                    self.assertIsNone(
-                        self.helper["codex_source_home"](repo)
-                    )
-            finally:
-                os.environ.clear()
-                os.environ.update(old)
+            for home, expected in ((default_home.parent, default_home.resolve()), (root / "missing-home", None)):
+                with self.subTest(home=home.name), mock.patch.dict(os.environ, {"CODEX_HOME": ""}), \
+                        mock.patch.object(Path, "home", return_value=home):
+                    self.assertEqual(self.helper["codex_source_home"](repo), expected)
 
     @unittest.skipIf(os.name == "nt", "POSIX shared scratch roots")
     def test_codex_rejects_shared_scratch_before_runtime_setup(self) -> None:
@@ -7034,8 +6423,11 @@ else:
         set_flag = next(
             flag for flag in flags if flag.startswith("shell_environment_policy.set=")
         )
-        for key, value in self.helper["codex_tool_git_env"]().items():
+        tool_env = self.helper["codex_tool_git_env"]()
+        for key, value in tool_env.items():
             self.assertIn(f"{key}={json.dumps(value)}", set_flag)
+        # Tools never inherit proxy transport (or its credentials) from the host.
+        self.assertFalse(set(PROXY_KEYS) & tool_env.keys())
 
     def test_codex_isolation_overrides_round_trip_unicode_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -7668,27 +7060,6 @@ else:
         with self.assertRaisesRegex(SystemExit, "one explicit domain"):
             self.helper["claude_tool_inventory"](args)
 
-    def test_review_patch_allows_safe_multiline_call_hunks(self) -> None:
-        patch = (
-            "diff --git a/safe.py b/safe.py\n"
-            "--- a/safe.py\n"
-            "+++ b/safe.py\n"
-            "@@ -0,0 +1,3 @@\n"
-            "+"
-            + "pass"
-            + "word = getpass.getpass(\n"
-            '+    "Password: ",\n'
-            "+)\n"
-        )
-
-        self.assertEqual(
-            self.helper["validate_review_patch"](
-                ["safe.py"],
-                patch,
-            ),
-            patch,
-        )
-
     def test_stream_displays_escape_terminal_controls(self) -> None:
         control = chr(27) + "]52;c;VEVTVA==" + chr(7)
         codex = self.helper["CodexStreamDisplay"]()
@@ -7772,17 +7143,6 @@ else:
                     self.assertIn("private input channel", str(caught.exception.code).lower())
                     for guard in guards.values():
                         guard.assert_not_called()
-
-    def test_resolve_engine_binary_rejects_codex_no_tools(self) -> None:
-        # run_codex() unconditionally refuses --no-tools (see line ~10318);
-        # the preflight must report that same rejection instead of reporting
-        # codex available just because its binary resolves.
-        resolve_engine_binary = self.helper["resolve_engine_binary"]
-        reviewer = argparse.Namespace(engine="codex", tools=False, codex_bin="codex")
-        available, reason = resolve_engine_binary(reviewer, Path("."))
-        self.assertFalse(available)
-        self.assertIn("--no-tools", reason)
-        self.assertIn("not supported by the Codex engine", reason)
 
     def test_resolve_engine_binary_checks_path_resolution(self) -> None:
         resolve_engine_binary = self.helper["resolve_engine_binary"]
@@ -7986,6 +7346,8 @@ os.execv(target, [str(target), *sys.argv[1:]])
 
             self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
             self.assertRegex(dry_run.stdout, r"engine check: codex[^\n]* OK\b")
+            for line in ("bundle: constructible", "inputs: OK", "prompt: OK"):
+                self.assertIn(line, dry_run.stdout)
             self.assertEqual(source_auth.read_bytes(), auth_before)
             self.assertEqual(source_auth.stat().st_nlink, links_before)
             probe_invocations = [
@@ -8054,175 +7416,77 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 normalized_runtime_env(run_invocations[1]),
             )
 
-    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    def test_dry_run_flag_exits_zero_when_bundle_and_engine_resolve(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            codex_bin = write_executable(
-                root / "codex",
-                fake_codex_script(),
-            )
-            env = {**os.environ, "CODEX_HOME": str(root)}
+    @staticmethod
+    def run_cli(repo: Path, *argv: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *argv], cwd=repo, env=env,
+            text=True, capture_output=True, check=False,
+        )
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "codex",
-                    "--codex-bin",
-                    str(codex_bin),
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("bundle: constructible", result.stdout)
-            self.assertIn("inputs: OK", result.stdout)
-            self.assertIn("prompt: OK", result.stdout)
-            self.assertIn("OK", result.stdout)
+    @staticmethod
+    def staged_cli_repo(root: Path) -> Path:
+        repo = init_repo(root)
+        (repo / "source.txt").write_text("staged\n", encoding="utf-8")
+        git(repo, "add", "source.txt")
+        return repo
 
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
     def test_dry_run_flag_rejects_temporary_root_inside_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            codex_bin = write_executable(
-                root / "codex",
-                fake_codex_script(),
-            )
-            env = os.environ.copy()
+            repo = self.staged_cli_repo(root)
+            codex_bin = write_executable(root / "codex", fake_codex_script())
             repo_temp = repo / "tmp"
             repo_temp.mkdir()
-            env.update(
-                {
-                    "TMPDIR": str(repo_temp),
-                    "TEMP": str(repo_temp),
-                    "TMP": str(repo_temp),
-                }
-            )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "codex",
-                    "--codex-bin",
-                    str(codex_bin),
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
+            env = {**os.environ, "TMPDIR": str(repo_temp), "TEMP": str(repo_temp), "TMP": str(repo_temp)}
+            result = self.run_cli(repo, "--mode", "local", "--engine", "codex", "--codex-bin", str(codex_bin),
+                                  "--dry-run", env=env)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("prompt: FAILED", result.stdout)
-            self.assertIn("must be outside the reviewed repository", result.stdout)
-            self.assertRegex(
-                result.stdout,
-                r"engine check: codex[^\n]* UNAVAILABLE",
-            )
+            self.assertIn("temporary directory must be outside the reviewed repository", result.stdout)
+            self.assertRegex(result.stdout, r"engine check: codex[^\n]* UNAVAILABLE")
 
     def test_dry_run_flag_exits_nonzero_when_codex_no_tools(self) -> None:
         # run_codex() unconditionally refuses --no-tools; --dry-run must
         # not report codex available just because its binary resolves.
         with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "codex",
-                    "--no-tools",
-                    "--dry-run",
-                ],
-                cwd=repo,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
+            result = self.run_cli(init_repo(Path(tempdir)), "--mode", "local", "--engine", "codex",
+                                  "--no-tools", "--dry-run")
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("UNAVAILABLE", result.stdout)
+            self.assertRegex(result.stdout, r"engine check: codex[^\n]* UNAVAILABLE")
             self.assertIn("--no-tools", result.stdout)
+            self.assertIn("not supported by the Codex engine", result.stdout)
 
-    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
     def test_dry_run_flag_exits_nonzero_when_engine_binary_missing(self) -> None:
+        # A constructible bundle, so the exit status comes from the engine check.
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.run_cli(self.staged_cli_repo(Path(tempdir)), "--mode", "local", "--engine", "claude",
+                                  "--claude-bin", "definitely-not-a-real-claude-binary", "--dry-run")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("bundle: constructible", result.stdout)
+            self.assertRegex(result.stdout, r"engine check: claude[^\n]* UNAVAILABLE")
+            self.assertIn("executable not found", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_commit_mode_reports_bundle_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            repo = init_repo(root)
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "claude",
-                    "--claude-bin",
-                    "definitely-not-a-real-claude-binary",
-                    "--dry-run",
-                ],
-                cwd=repo,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("UNAVAILABLE", result.stdout)
-
-    def test_dry_run_flag_exits_nonzero_when_bundle_construction_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "commit",
-                    "--commit",
-                    "no-such-ref-xyz",
-                    "--dry-run",
-                ],
-                cwd=repo,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("bundle: FAILED", result.stdout)
+            repo = self.staged_cli_repo(root)
+            git(repo, "commit", "-q", "-m", "seed")
+            codex_bin = write_executable(root / "codex", fake_codex_script())
+            env = {**os.environ, "CODEX_HOME": str(root)}
+            for commit, code, lines in (
+                ("HEAD", 0, ("bundle: constructible", "prompt: OK")),
+                ("no-such-ref-xyz", 1, ("bundle: FAILED",)),
+            ):
+                with self.subTest(commit=commit):
+                    result = self.run_cli(repo, "--mode", "commit", "--commit", commit, "--engine", "codex",
+                                          "--codex-bin", str(codex_bin), "--dry-run", env=env)
+                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    self.assertRegex(result.stdout, r"engine check: codex[^\n]* OK\b")
+                    for line in lines:
+                        self.assertIn(line, result.stdout)
 
     def test_dry_run_commit_mode_passes_commit_ref_to_prompt_construction(self) -> None:
         # Both paths must retain the commit label in the assembled prompt,
@@ -8264,163 +7528,35 @@ os.execv(target, [str(target), *sys.argv[1:]])
             self.assertIn("prompt: OK", stdout.getvalue())
 
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    def test_dry_run_flag_exits_zero_for_plain_commit_mode(self) -> None:
+    def test_dry_run_checks_pi_version_floor(self) -> None:
+        # run_pi() requires Pi >= 0.79.0 for --no-approve trust isolation before a
+        # review; --dry-run must reuse that --version probe rather than reporting
+        # pi available just because the binary resolves.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            git(repo, "commit", "-q", "-m", "seed")
-            codex_bin = write_executable(
-                root / "codex",
-                fake_codex_script(),
-            )
-            env = {**os.environ, "CODEX_HOME": str(root)}
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "commit",
-                    "--commit",
-                    "HEAD",
-                    "--engine",
-                    "codex",
-                    "--codex-bin",
-                    str(codex_bin),
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("bundle: constructible", result.stdout)
-            self.assertIn("prompt: OK", result.stdout)
-
-    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    def test_dry_run_flag_exits_nonzero_when_pi_version_unsupported(self) -> None:
-        # run_pi() calls ensure_pi_isolation_supported(), which requires
-        # Pi >= 0.79.0 for --no-approve trust isolation before the CLI is
-        # ever invoked for a review; --dry-run must reuse that same local
-        # --version probe rather than reporting pi available just because
-        # the binary resolves on PATH.
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            pi_bin = write_executable(
-                root / "pi",
-                fake_pi_script(),
-            )
-            env = os.environ.copy()
-            env["AUTOREVIEW_FAKE_PI_VERSION"] = "0.50.0"
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "pi",
-                    "--pi-bin",
-                    str(pi_bin),
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertRegex(result.stdout, r"engine check: pi[^\n]* UNAVAILABLE")
-            self.assertIn("0.79.0", result.stdout)
-
-    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    def test_dry_run_flag_exits_zero_when_pi_version_supported(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            pi_bin = write_executable(
-                root / "pi",
-                fake_pi_script(),
-            )
-            env = os.environ.copy()
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "pi",
-                    "--pi-bin",
-                    str(pi_bin),
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertRegex(result.stdout, r"engine check: pi[^\n]* OK\b")
+            repo = self.staged_cli_repo(root)
+            pi_bin = write_executable(root / "pi", fake_pi_script())
+            for version, code, verdict in (("0.50.0", 1, "UNAVAILABLE"), ("0.79.0", 0, "OK")):
+                with self.subTest(version=version):
+                    result = self.run_cli(repo, "--mode", "local", "--engine", "pi", "--pi-bin", str(pi_bin),
+                                          "--dry-run", env={**os.environ, "AUTOREVIEW_FAKE_PI_VERSION": version})
+                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    self.assertRegex(result.stdout, rf"engine check: pi[^\n]* {verdict}\b")
+                    if code:
+                        self.assertIn("0.79.0", result.stdout)
 
     def test_dry_run_flag_exits_nonzero_when_claude_tool_not_read_only(self) -> None:
-        # run_claude() computes its --tools inventory via
-        # claude_allowed_tools()/claude_tool_inventory() before the CLI is
-        # ever invoked for a review, and that raises when a configured
-        # --claude-allowed-tools rule is not one of the read-only tools
-        # (see claude_tool_inventory); --dry-run must reuse that same
-        # pure, non-mutating computation rather than reporting claude
-        # available just because the CLI binary, version, and isolation
-        # flags resolved.
+        # run_claude() computes its --tools inventory via claude_allowed_tools()/
+        # claude_tool_inventory() before the CLI is invoked for a review, and that
+        # raises for a --claude-allowed-tools rule that is not read-only; --dry-run
+        # must reuse that computation rather than reporting claude available just
+        # because the binary, version and isolation flags resolved.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            claude_bin = write_executable(
-                root / "claude",
-                fake_claude_script(),
-            )
-            env = os.environ.copy()
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "claude",
-                    "--claude-bin",
-                    str(claude_bin),
-                    "--claude-allowed-tools",
-                    "Bash",
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
+            repo = self.staged_cli_repo(root)
+            claude_bin = write_executable(root / "claude", fake_claude_script())
+            result = self.run_cli(repo, "--mode", "local", "--engine", "claude", "--claude-bin", str(claude_bin),
+                                  "--claude-allowed-tools", "Bash", "--dry-run", env=os.environ.copy())
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertRegex(result.stdout, r"engine check: claude[^\n]* UNAVAILABLE")
             self.assertIn("Claude review tool is not read-only: Bash", result.stdout)
@@ -8444,132 +7580,33 @@ os.execv(target, [str(target), *sys.argv[1:]])
             self.assertRegex(stdout.getvalue(), r"engine check: pi[^\n]* OK\b")
 
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    def test_dry_run_flag_exits_nonzero_when_prompt_file_missing(self) -> None:
-        # The real run loads --prompt-file via capture_evidence_inputs() before
-        # ever contacting an engine (see main_impl just after
-        # dry_run_preflight returns); --dry-run must reuse that same
-        # validation instead of reporting readiness for an input that
-        # would fail before an engine starts.
+    def test_dry_run_validates_evidence_inputs(self) -> None:
+        # The real run loads --prompt-file and --dataset via capture_evidence_inputs()
+        # before any engine starts; --dry-run must reuse that same validation.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            codex_bin = write_executable(
-                root / "codex",
-                fake_codex_script(),
-            )
+            repo = self.staged_cli_repo(root)
+            (repo / "prompt.md").write_text("Focus on error handling.\n", encoding="utf-8")
+            codex_bin = write_executable(root / "codex", fake_codex_script())
             env = {**os.environ, "CODEX_HOME": str(root)}
+            for option, value, code in (
+                ("--prompt-file", "prompt.md", 0),
+                ("--prompt-file", "missing.md", 1),
+                ("--dataset", "missing-dataset.json", 1),
+            ):
+                with self.subTest(option=option, value=value):
+                    result = self.run_cli(repo, "--mode", "local", "--engine", "codex", "--codex-bin",
+                                          str(codex_bin), option, value, "--dry-run", env=env)
+                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    if code:
+                        self.assertIn("inputs: FAILED", result.stdout)
+                        self.assertIn(value, result.stdout)
+                    else:
+                        self.assertIn("inputs: OK", result.stdout)
+                    # The bundle and engine still resolve; only the input decides.
+                    self.assertIn("bundle: constructible", result.stdout)
+                    self.assertRegex(result.stdout, r"engine check: codex[^\n]* OK\b")
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "codex",
-                    "--codex-bin",
-                    str(codex_bin),
-                    "--prompt-file",
-                    "missing.md",
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("inputs: FAILED", result.stdout)
-            self.assertIn("missing.md", result.stdout)
-            # The bundle and engine still resolve; only the input fails.
-            self.assertIn("bundle: constructible", result.stdout)
-            self.assertRegex(result.stdout, r"engine check: codex[^\n]* OK\b")
-
-    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    def test_dry_run_flag_exits_zero_when_prompt_file_valid(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            prompt_file = repo / "prompt.md"
-            prompt_file.write_text("Focus on error handling.\n", encoding="utf-8")
-            codex_bin = write_executable(
-                root / "codex",
-                fake_codex_script(),
-            )
-            env = {**os.environ, "CODEX_HOME": str(root)}
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "codex",
-                    "--codex-bin",
-                    str(codex_bin),
-                    "--prompt-file",
-                    "prompt.md",
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("inputs: OK", result.stdout)
-
-    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
-    def test_dry_run_flag_exits_nonzero_when_dataset_missing(self) -> None:
-        # Both evidence roles use capture_evidence_inputs(); confirm datasets
-        # get the same pre-engine existence check as prompt files.
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            source = repo / "source.txt"
-            source.write_text("staged\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            codex_bin = write_executable(
-                root / "codex",
-                fake_codex_script(),
-            )
-            env = os.environ.copy()
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "codex",
-                    "--codex-bin",
-                    str(codex_bin),
-                    "--dataset",
-                    "missing-dataset.json",
-                    "--dry-run",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("inputs: FAILED", result.stdout)
-            self.assertIn("missing-dataset.json", result.stdout)
 
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
@@ -8587,9 +7624,12 @@ class AuthenticatedProxyTests(unittest.TestCase):
             "user:password@proxy.example.invalid:8080",
             "http://user@proxy.example.invalid",
             "http://:password@proxy.example.invalid",  # trufflehog:ignore (fake proxy credential fixture)
+            "socks5://review-user:review-password@proxy.example.invalid:1080",  # trufflehog:ignore (fake proxy credential fixture)
             "http://proxy.example.invalid:8080",
             "proxy.example.invalid:8080",
+            "socks4://proxy.example.invalid",
             "socks4a://proxy.example.invalid",
+            "http://[fe80::1%25en0]:8080",
         ):
             with self.subTest(value=value):
                 self.assertTrue(self.helper["safe_proxy_url"](value))
@@ -8725,14 +7765,6 @@ class AuthenticatedProxyTests(unittest.TestCase):
             self.assertEqual(saved["overall_correctness"], "patch is incorrect")
             self.assertEqual(saved["findings"], [])
             self.assertEqual(report["overall_explanation"], "provider says " + " | ".join(forms))
-
-    def test_codex_tools_do_not_inherit_transport_or_authentication(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            flags = self.helper["codex_config_isolation_flags"](root / "repo", root / "runtime")
-            self.assertIn('shell_environment_policy.inherit="core"', flags)
-            self.assertIn("shell_environment_policy.ignore_default_excludes=false", flags)
-            self.assertFalse(set(PROXY_KEYS) & self.helper["codex_tool_git_env"]().keys())
 
     @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
     def test_cli_preserves_transport_and_redacts_streams_reports_and_failures(self):

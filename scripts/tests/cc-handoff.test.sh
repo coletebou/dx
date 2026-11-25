@@ -532,7 +532,6 @@ check "prompt points at brief 2" "The brief is the source of truth: $chainA/gen-
 equal "statusline marker: generation 3" '{"gen":3,' "$(head -c 9 "$HOME/.claude/state/handoff-chain/$sid3.json")"
 until_true 15 window_gone "$pane2"
 if window_gone "$pane2"; then ok "generation 2's window closed"; else bad "gen 2 closed" "gone" "still there"; fi
-out="$(python3 "$LIB" history "$chainA" 4 2>&1 || true)"
 lacks "a brief's secret is redacted in the echo" "abcdefghijkl""12345" "$(python3 "$LIB" history "$chainA" 3)"
 
 printf 'background jobs hold the passer until they finish or the successor adopts them\n'
